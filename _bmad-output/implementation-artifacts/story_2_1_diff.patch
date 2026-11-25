@@ -1,0 +1,1403 @@
+diff --git a/backend/app/api/v1/__init__.py b/backend/app/api/v1/__init__.py
+new file mode 100644
+index 0000000..2b5dc03
+--- /dev/null
++++ b/backend/app/api/v1/__init__.py
+@@ -0,0 +1,11 @@
++from fastapi import APIRouter
++from app.api.v1.public.territory import router as territory_router
++from app.api.v1.auth import router as auth_router
++from app.api.v1.admin.base import router as admin_router
++from app.api.v1.admin.photos import router as photos_admin_router
++
++api_v1_router = APIRouter(prefix="/api/v1")
++api_v1_router.include_router(territory_router)
++api_v1_router.include_router(auth_router)
++api_v1_router.include_router(admin_router)
++api_v1_router.include_router(photos_admin_router)
+diff --git a/backend/app/api/v1/admin/photos.py b/backend/app/api/v1/admin/photos.py
+new file mode 100644
+index 0000000..1b25d00
+--- /dev/null
++++ b/backend/app/api/v1/admin/photos.py
+@@ -0,0 +1,347 @@
++import logging
++import math
++import uuid
++from datetime import datetime, timezone
++from typing import Annotated
++from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from geoalchemy2.elements import WKTElement
++
++from app.core.database import get_db
++from app.core.auth import get_current_active_user
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.schemas.photo import (
++    PhotoCreate,
++    PhotoUpdate,
++    PhotoRead,
++    PhotoListResponse,
++)
++from app.services.storage import get_storage_driver
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/admin/photos", tags=["Administration Photos"])
++
++
++@router.post(
++    "",
++    response_model=PhotoRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Créer une nouvelle fiche photo historique",
++)
++async def create_photo(
++    photo_in: PhotoCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Crée une nouvelle fiche photo rattachée au territoire du contributeur.
++    En mode 'draft', les coordonnées GPS sont optionnelles.
++    En mode 'published', les coordonnées GPS (latitude et longitude) sont obligatoires.
++    """
++    # Résolution du territoire : strict pour les contributeurs
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = photo_in.territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour créer une photo.",
++                    }
++                },
++            )
++
++    # Construction de la géométrie PostGIS si coordonnées fournies
++    location_geom = None
++    if photo_in.latitude is not None and photo_in.longitude is not None:
++        location_geom = WKTElement(
++            f"POINT({photo_in.longitude} {photo_in.latitude})",
++            srid=4326,
++        )
++
++    new_photo = Photo(
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        title=photo_in.title,
++        description=photo_in.description,
++        photographer=photo_in.photographer,
++        year_taken=photo_in.year_taken,
++        date_exact=photo_in.date_exact,
++        period_label=photo_in.period_label,
++        archive_source=photo_in.archive_source,
++        archive_ref=photo_in.archive_ref,
++        original_source_url=photo_in.original_source_url,
++        license=photo_in.license,
++        latitude=photo_in.latitude,
++        longitude=photo_in.longitude,
++        location=location_geom,
++        bearing=photo_in.bearing,
++        field_of_view=photo_in.field_of_view,
++        file_original_path=photo_in.file_original_path,
++        file_display_path=photo_in.file_display_path,
++        file_thumb_path=photo_in.file_thumb_path,
++        status=photo_in.status,
++    )
++
++    db.add(new_photo)
++    await db.commit()
++    await db.refresh(new_photo)
++    return new_photo
++
++
++@router.get(
++    "",
++    response_model=PhotoListResponse,
++    summary="Lister les photos historiques du territoire actif",
++)
++async def list_photos(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    status_filter: PhotoStatus | None = Query(None, alias="status", description="Filtrer par statut"),
++    search: str | None = Query(None, description="Recherche textuelle sur le titre"),
++    territory_id: uuid.UUID | None = Query(None, description="Filtre territoire réservé aux superadmins"),
++):
++    """Retourne la liste paginée des photographies historiques.
++    Les contributeurs ne reçoivent strictement que les photos de leur propre territoire.
++    """
++    base_query = select(Photo)
++
++    # Cloisonnement multi-territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++    else:
++        if territory_id:
++            base_query = base_query.where(Photo.territory_id == territory_id)
++        elif current_user.territory_id:
++            base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++
++    if status_filter:
++        base_query = base_query.where(Photo.status == status_filter)
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Photo.title.ilike(term) | Photo.description.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri chronologique inversé
++    paginated_query = (
++        base_query.order_by(Photo.created_at.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return PhotoListResponse(
++        items=items,
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.get(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Consulter le détail d'une fiche photo",
++)
++async def get_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Récupère une photo par son identifiant unique.
++    Renvoie 404 si la photo n'existe pas ou appartient à un autre territoire.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    return photo
++
++
++@router.patch(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour partiellement une fiche photo",
++)
++@router.put(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour une fiche photo",
++)
++async def update_photo(
++    photo_id: uuid.UUID,
++    photo_in: PhotoUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Met à jour une fiche photo existante.
++    Vérifie le cloisonnement territorial et impose la présence de coordonnées GPS si le statut est 'published'.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    update_data = photo_in.model_dump(exclude_unset=True)
++
++    # Calcul des coordonnées et du statut résultants
++    target_status = update_data.get("status", photo.status)
++    target_lat = update_data.get("latitude", photo.latitude)
++    target_lng = update_data.get("longitude", photo.longitude)
++
++    if target_status == PhotoStatus.PUBLISHED:
++        if target_lat is None or target_lng is None:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "COORDINATES_REQUIRED",
++                        "message": "Les coordonnées géographiques (latitude et longitude) sont obligatoires pour publier une photo.",
++                    }
++                },
++            )
++
++    # Mise à jour des attributs du modèle
++    for field, value in update_data.items():
++        if field in ("latitude", "longitude"):
++            continue
++        elif field in ("year", "year_taken"):
++            photo.year_taken = value
++        elif field in ("archive_ref", "archive_reference"):
++            photo.archive_ref = value
++        elif field in ("source_url", "original_source_url"):
++            photo.original_source_url = value
++        elif field in ("image_original_path", "file_original_path"):
++            photo.file_original_path = value
++        elif field in ("image_display_path", "file_display_path"):
++            photo.file_display_path = value
++        elif field in ("image_thumb_path", "file_thumb_path"):
++            photo.file_thumb_path = value
++        elif field == "territory_id":
++            if current_user.role == UserRole.SUPERADMIN and value is not None:
++                photo.territory_id = value
++        elif hasattr(photo, field):
++            setattr(photo, field, value)
++
++    # Mise à jour des coordonnées et de la géométrie PostGIS
++    if "latitude" in update_data or "longitude" in update_data:
++        photo.latitude = target_lat
++        photo.longitude = target_lng
++        if target_lat is not None and target_lng is not None:
++            photo.location = WKTElement(f"POINT({target_lng} target_lat)", srid=4326)
++            photo.location = WKTElement(f"POINT({target_lng} {target_lat})", srid=4326)
++        else:
++            photo.location = None
++
++    photo.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(photo)
++    return photo
++
++
++@router.delete(
++    "/{photo_id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une fiche photo et ses fichiers médias associés",
++)
++async def delete_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Supprime définitivement la fiche photo de la base de données
++    et nettoie physiquement tous les fichiers médias associés via le StorageDriver.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    # Nettoyage des fichiers physiques via le StorageDriver
++    storage = get_storage_driver()
++    media_paths = [
++        photo.file_original_path,
++        photo.file_display_path,
++        photo.file_thumb_path,
++    ]
++    for path in media_paths:
++        if path:
++            try:
++                await storage.delete(path)
++                logger.info(f"Fichier média supprimé : {path}")
++            except Exception as e:
++                logger.warning(
++                    f"Erreur lors de la suppression du média '{path}' via StorageDriver: {e}"
++                )
++
++    await db.delete(photo)
++    await db.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff --git a/backend/app/core/init_db.py b/backend/app/core/init_db.py
+new file mode 100644
+index 0000000..1aa5d21
+--- /dev/null
++++ b/backend/app/core/init_db.py
+@@ -0,0 +1,70 @@
++import logging
++from sqlalchemy import text, select
++from app.core.database import engine, AsyncSessionLocal, Base
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.core.security import hash_password
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++async def init_db() -> None:
++    """Initialise l'extension PostGIS, crée les tables et le territoire initial + superadmin si besoin."""
++    async with engine.begin() as conn:
++        try:
++            # Active l'extension PostGIS
++            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
++            logger.info("Extension PostGIS vérifiée / activée avec succès.")
++        except Exception as e:
++            logger.warning(f"Note sur l'activation PostGIS: {e}")
++
++        # Crée toutes les tables déclarées (territories, users, etc.) si elles n'existent pas
++        await conn.run_sync(Base.metadata.create_all)
++        logger.info("Schéma des tables de la base de données synchronisé.")
++
++    # Vérification et initialisation des données de base
++    async with AsyncSessionLocal() as session:
++        # 1. Territoire pilote
++        result_territory = await session.execute(
++            select(Territory).where(Territory.slug == settings.DEFAULT_TERRITORY_SLUG)
++        )
++        existing_territory = result_territory.scalar_one_or_none()
++
++        if not existing_territory:
++            default_territory = Territory(
++                slug=settings.DEFAULT_TERRITORY_SLUG,
++                name="Territoire Pilote",
++                center_lat=43.1242,
++                center_lng=5.9280,
++                default_zoom=13,
++            )
++            session.add(default_territory)
++            await session.commit()
++            await session.refresh(default_territory)
++            existing_territory = default_territory
++            logger.info(f"Territoire par défaut créé: '{settings.DEFAULT_TERRITORY_SLUG}'.")
++        else:
++            logger.info(f"Territoire '{settings.DEFAULT_TERRITORY_SLUG}' déjà existant.")
++
++        # 2. Compte Superadmin initial
++        result_user = await session.execute(
++            select(User).where(User.email == settings.ADMIN_EMAIL)
++        )
++        existing_admin = result_user.scalar_one_or_none()
++
++        if not existing_admin:
++            admin_user = User(
++                email=settings.ADMIN_EMAIL,
++                password_hash=hash_password(settings.ADMIN_PASSWORD),
++                full_name=settings.ADMIN_FULL_NAME,
++                role=UserRole.SUPERADMIN,
++                territory_id=existing_territory.id,
++                is_active=True,
++            )
++            session.add(admin_user)
++            await session.commit()
++            logger.info(f"Compte Superadmin initial créé: '{settings.ADMIN_EMAIL}'.")
++        else:
++            logger.info(f"Compte Superadmin '{settings.ADMIN_EMAIL}' déjà existant.")
+diff --git a/backend/app/main.py b/backend/app/main.py
+new file mode 100644
+index 0000000..9c96e4b
+--- /dev/null
++++ b/backend/app/main.py
+@@ -0,0 +1,137 @@
++import logging
++from contextlib import asynccontextmanager
++from fastapi import FastAPI, Request, HTTPException, status
++from fastapi.exceptions import RequestValidationError
++from fastapi.encoders import jsonable_encoder
++from fastapi.responses import JSONResponse
++from fastapi.staticfiles import StaticFiles
++from fastapi.middleware.cors import CORSMiddleware
++from pathlib import Path
++from app.config import settings
++from app.core.database import check_db_connection, engine
++from app.core.init_db import init_db
++from app.core.territory import TerritoryMiddleware
++from app.api.v1 import api_v1_router
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++
++@asynccontextmanager
++async def lifespan(app: FastAPI):
++    # Startup: initialisation de la base de données et du territoire par défaut
++    logger.info("Démarrage de l'API HierIci...")
++    try:
++        await init_db()
++    except Exception as e:
++        logger.error(f"Erreur lors de l'initialisation de la BDD : {e}")
++    yield
++    # Shutdown: fermeture propre des connexions
++    logger.info("Arrêt de l'API HierIci...")
++    await engine.dispose()
++
++
++app = FastAPI(
++    title=settings.PROJECT_NAME,
++    description="API REST & Géospatiale pour la plateforme HierIci",
++    version="0.1.0",
++    lifespan=lifespan,
++)
++
++# Configuration CORS
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=settings.CORS_ORIGINS,
++    allow_credentials=True,
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++# Middleware de contexte territorial multi-tenant
++app.add_middleware(TerritoryMiddleware)
++
++
++@app.exception_handler(RequestValidationError)
++async def validation_exception_handler(request: Request, exc: RequestValidationError):
++    """Enveloppe standardisée RFC 7807 Problem Details pour les erreurs de validation de schéma."""
++    encoded_errors = jsonable_encoder(exc.errors())
++    return JSONResponse(
++        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++        content={
++            "type": "https://hierici.local/errors/unprocessable_entity",
++            "title": "UNPROCESSABLE_ENTITY",
++            "status": 422,
++            "detail": encoded_errors,
++            "instance": str(request.url.path),
++            "error": {
++                "code": "VALIDATION_ERROR",
++                "message": "Erreur de validation des données transmises.",
++                "details": encoded_errors,
++            },
++        },
++    )
++
++
++@app.exception_handler(HTTPException)
++async def custom_http_exception_handler(request: Request, exc: HTTPException):
++    """Enveloppe standardisée RFC 7807 Problem Details pour les erreurs HTTP de l'API."""
++    if isinstance(exc.detail, dict) and "error" in exc.detail:
++        error_info = exc.detail["error"]
++        return JSONResponse(
++            status_code=exc.status_code,
++            content={
++                "type": f"https://hierici.local/errors/{error_info.get('code', 'HTTP_ERROR').lower()}",
++                "title": error_info.get("code", "HTTP_ERROR"),
++                "status": exc.status_code,
++                "detail": error_info.get("message", ""),
++                "instance": str(request.url.path),
++                "error": error_info,
++            },
++            headers=getattr(exc, "headers", None),
++        )
++    return JSONResponse(
++        status_code=exc.status_code,
++        content={"detail": exc.detail},
++        headers=getattr(exc, "headers", None),
++    )
++
++# Inclusion des routes v1
++app.include_router(api_v1_router)
++
++# Montage du stockage local pour servir les médias statiques
++if settings.STORAGE_DRIVER == "local":
++    upload_path = Path(settings.LOCAL_STORAGE_PATH)
++    upload_path.mkdir(parents=True, exist_ok=True)
++    app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
++
++
++
++@app.get("/api/health", tags=["Système"])
++async def health_check():
++    """Vérification de l'état de l'API et de la connexion à la base de données."""
++    is_db_connected = await check_db_connection()
++    if is_db_connected:
++        return {
++            "status": "ok",
++            "database": "connected",
++            "environment": settings.ENVIRONMENT,
++            "default_territory": settings.DEFAULT_TERRITORY_SLUG,
++        }
++    else:
++        return JSONResponse(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            content={
++                "status": "error",
++                "database": "disconnected",
++                "environment": settings.ENVIRONMENT,
++            },
++        )
++
++
++@app.get("/", tags=["Racine"])
++async def root():
++    return {
++        "message": f"Bienvenue sur l'API {settings.PROJECT_NAME}",
++        "docs_url": "/docs",
++        "health_check": "/api/health",
++        "territory_current": "/api/v1/territory/current",
++    }
+diff --git a/backend/app/models/photo.py b/backend/app/models/photo.py
+new file mode 100644
+index 0000000..bf346fc
+--- /dev/null
++++ b/backend/app/models/photo.py
+@@ -0,0 +1,152 @@
++import uuid
++from datetime import datetime, timezone
++import enum
++from typing import Any
++from sqlalchemy import String, Text, Integer, Float, DateTime, Enum, ForeignKey
++from sqlalchemy.dialects.postgresql import UUID
++from sqlalchemy.orm import Mapped, mapped_column, relationship, synonym
++from geoalchemy2 import Geometry
++from app.core.database import Base
++
++
++class PhotoStatus(str, enum.Enum):
++    DRAFT = "draft"
++    PUBLISHED = "published"
++
++
++class Photo(Base):
++    __tablename__ = "photos"
++
++    id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        primary_key=True,
++        default=uuid.uuid4,
++    )
++    territory_id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("territories.id", ondelete="CASCADE"),
++        nullable=False,
++        index=True,
++    )
++    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("users.id", ondelete="SET NULL"),
++        nullable=True,
++        index=True,
++    )
++
++    title: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    description: Mapped[str | None] = mapped_column(
++        Text,
++        nullable=True,
++    )
++    photographer: Mapped[str | None] = mapped_column(
++        String(255),
++        nullable=True,
++    )
++    year_taken: Mapped[int | None] = mapped_column(
++        Integer,
++        nullable=True,
++    )
++    date_exact: Mapped[str | None] = mapped_column(
++        String(50),
++        nullable=True,
++    )
++    period_label: Mapped[str | None] = mapped_column(
++        String(100),
++        nullable=True,
++    )
++    archive_source: Mapped[str | None] = mapped_column(
++        String(255),
++        nullable=True,
++    )
++    archive_ref: Mapped[str | None] = mapped_column(
++        String(100),
++        nullable=True,
++    )
++    original_source_url: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++    license: Mapped[str | None] = mapped_column(
++        String(255),
++        nullable=True,
++        default="Domaine Public",
++    )
++
++    # Coordonnées géographiques WGS84 (EPSG:4326)
++    latitude: Mapped[float | None] = mapped_column(
++        Float,
++        nullable=True,
++    )
++    longitude: Mapped[float | None] = mapped_column(
++        Float,
++        nullable=True,
++    )
++    location: Mapped[Any] = mapped_column(
++        Geometry(geometry_type="POINT", srid=4326),
++        nullable=True,
++    )
++
++    # Orientation et champ de vision
++    bearing: Mapped[int | None] = mapped_column(
++        Integer,
++        nullable=True,
++    )
++    field_of_view: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        default=60,
++    )
++
++    # Fichiers médias gérés via StorageDriver
++    file_original_path: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++    file_display_path: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++    file_thumb_path: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++
++    status: Mapped[PhotoStatus] = mapped_column(
++        Enum(PhotoStatus, name="photo_status_enum"),
++        default=PhotoStatus.DRAFT,
++        nullable=False,
++    )
++
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        onupdate=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++
++    # Alias & synonymes pour compatibilité documentaire
++    created_by_id = synonym("author_user_id")
++    year = synonym("year_taken")
++    archive_reference = synonym("archive_ref")
++    source_url = synonym("original_source_url")
++    location_geom = synonym("location")
++    image_original_path = synonym("file_original_path")
++    image_display_path = synonym("file_display_path")
++    image_thumb_path = synonym("file_thumb_path")
++
++    # Relations
++    territory = relationship("Territory", backref="photos", lazy="selectin")
++    author = relationship("User", backref="photos", lazy="selectin")
++
++    def __repr__(self) -> str:
++        return f"<Photo(id='{self.id}', title='{self.title}', status='{self.status}')>"
+diff --git a/backend/app/schemas/photo.py b/backend/app/schemas/photo.py
+new file mode 100644
+index 0000000..f154b80
+--- /dev/null
++++ b/backend/app/schemas/photo.py
+@@ -0,0 +1,187 @@
++import uuid
++from datetime import datetime
++from pydantic import BaseModel, Field, ConfigDict, computed_field, model_validator
++from app.models.photo import PhotoStatus
++
++
++class PhotoBase(BaseModel):
++    title: str = Field(..., min_length=1, description="Titre de la photographie")
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    year: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    archive_reference: str | None = None
++    original_source_url: str | None = None
++    source_url: str | None = None
++    license: str | None = "Domaine Public"
++    latitude: float | None = Field(None, ge=-90.0, le=90.0)
++    longitude: float | None = Field(None, ge=-180.0, le=180.0)
++    bearing: int | None = Field(None, ge=0, le=359, description="Azimut en degrés (0-359)")
++    field_of_view: int = Field(60, ge=1, le=180, description="Champ de vision en degrés")
++    file_original_path: str | None = None
++    image_original_path: str | None = None
++    file_display_path: str | None = None
++    image_display_path: str | None = None
++    file_thumb_path: str | None = None
++    image_thumb_path: str | None = None
++    status: PhotoStatus = PhotoStatus.DRAFT
++    territory_id: uuid.UUID | None = None
++
++
++class PhotoCreate(PhotoBase):
++    @model_validator(mode="after")
++    def validate_rules(self) -> "PhotoCreate":
++        # Synchronisation des alias
++        if self.year is not None and self.year_taken is None:
++            self.year_taken = self.year
++        if self.archive_reference is not None and self.archive_ref is None:
++            self.archive_ref = self.archive_reference
++        if self.source_url is not None and self.original_source_url is None:
++            self.original_source_url = self.source_url
++        if self.image_original_path is not None and self.file_original_path is None:
++            self.file_original_path = self.image_original_path
++        if self.image_display_path is not None and self.file_display_path is None:
++            self.file_display_path = self.image_display_path
++        if self.image_thumb_path is not None and self.file_thumb_path is None:
++            self.file_thumb_path = self.image_thumb_path
++
++        # Si l'une des coordonnées est fournie, l'autre doit l'être
++        if (self.latitude is not None and self.longitude is None) or (
++            self.latitude is None and self.longitude is not None
++        ):
++            raise ValueError("Latitude et longitude doivent être renseignées ensemble.")
++
++        # Si publié, les coordonnées géographiques sont obligatoires
++        if self.status == PhotoStatus.PUBLISHED:
++            if self.latitude is None or self.longitude is None:
++                raise ValueError(
++                    "Les coordonnées géographiques (latitude et longitude) sont obligatoires pour la publication d'une photo."
++                )
++
++        return self
++
++
++class PhotoUpdate(BaseModel):
++    title: str | None = Field(None, min_length=1)
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    year: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    archive_reference: str | None = None
++    original_source_url: str | None = None
++    source_url: str | None = None
++    license: str | None = None
++    latitude: float | None = Field(None, ge=-90.0, le=90.0)
++    longitude: float | None = Field(None, ge=-180.0, le=180.0)
++    bearing: int | None = Field(None, ge=0, le=359)
++    field_of_view: int | None = Field(None, ge=1, le=180)
++    file_original_path: str | None = None
++    image_original_path: str | None = None
++    file_display_path: str | None = None
++    image_display_path: str | None = None
++    file_thumb_path: str | None = None
++    image_thumb_path: str | None = None
++    status: PhotoStatus | None = None
++    territory_id: uuid.UUID | None = None
++
++    @model_validator(mode="after")
++    def validate_rules(self) -> "PhotoUpdate":
++        if self.year is not None and self.year_taken is None:
++            self.year_taken = self.year
++        if self.archive_reference is not None and self.archive_ref is None:
++            self.archive_ref = self.archive_reference
++        if self.source_url is not None and self.original_source_url is None:
++            self.original_source_url = self.source_url
++        if self.image_original_path is not None and self.file_original_path is None:
++            self.file_original_path = self.image_original_path
++        if self.image_display_path is not None and self.file_display_path is None:
++            self.file_display_path = self.image_display_path
++        if self.image_thumb_path is not None and self.file_thumb_path is None:
++            self.file_thumb_path = self.image_thumb_path
++        return self
++
++
++class PhotoRead(BaseModel):
++    id: uuid.UUID
++    territory_id: uuid.UUID
++    author_user_id: uuid.UUID | None = None
++    title: str
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    original_source_url: str | None = None
++    license: str | None = None
++    latitude: float | None = None
++    longitude: float | None = None
++    bearing: int | None = None
++    field_of_view: int = 60
++    file_original_path: str | None = None
++    file_display_path: str | None = None
++    file_thumb_path: str | None = None
++    status: PhotoStatus
++    created_at: datetime
++    updated_at: datetime
++
++    model_config = ConfigDict(from_attributes=True)
++
++    @computed_field
++    @property
++    def year(self) -> int | None:
++        return self.year_taken
++
++    @computed_field
++    @property
++    def archive_reference(self) -> str | None:
++        return self.archive_ref
++
++    @computed_field
++    @property
++    def source_url(self) -> str | None:
++        return self.original_source_url
++
++    @computed_field
++    @property
++    def created_by_id(self) -> uuid.UUID | None:
++        return self.author_user_id
++
++    @computed_field
++    @property
++    def image_original_path(self) -> str | None:
++        return self.file_original_path
++
++    @computed_field
++    @property
++    def image_display_path(self) -> str | None:
++        return self.file_display_path
++
++    @computed_field
++    @property
++    def image_thumb_path(self) -> str | None:
++        return self.file_thumb_path
++
++    @computed_field
++    @property
++    def location(self) -> dict | None:
++        if self.longitude is not None and self.latitude is not None:
++            return {"type": "Point", "coordinates": [self.longitude, self.latitude]}
++        return None
++
++
++class PhotoListResponse(BaseModel):
++    items: list[PhotoRead]
++    total: int
++    page: int
++    page_size: int
++    pages: int
+diff --git a/backend/tests/test_photos_admin.py b/backend/tests/test_photos_admin.py
+new file mode 100644
+index 0000000..166e9ef
+--- /dev/null
++++ b/backend/tests/test_photos_admin.py
+@@ -0,0 +1,457 @@
++import uuid
++from unittest.mock import AsyncMock, patch
++import pytest
++from httpx import AsyncClient, ASGITransport
++from sqlalchemy import select, delete
++
++from app.main import app
++from app.core.database import AsyncSessionLocal
++from app.core.auth import get_current_active_user
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.services.storage.base import StorageDriver
++
++
++@pytest.fixture
++async def setup_test_data():
++    """Prépare deux territoires et deux contributeurs pour tester l'API et le cloisonnement."""
++    async with AsyncSessionLocal() as session:
++        t_a = Territory(
++            id=uuid.uuid4(),
++            slug=f"toulon-{uuid.uuid4().hex[:6]}",
++            name="Toulon Test",
++            center_lat=43.12,
++            center_lng=5.93,
++            default_zoom=13,
++        )
++        t_b = Territory(
++            id=uuid.uuid4(),
++            slug=f"marseille-{uuid.uuid4().hex[:6]}",
++            name="Marseille Test",
++            center_lat=43.29,
++            center_lng=5.37,
++            default_zoom=13,
++        )
++        session.add_all([t_a, t_b])
++        await session.commit()
++        await session.refresh(t_a)
++        await session.refresh(t_b)
++
++        u_a = User(
++            id=uuid.uuid4(),
++            email=f"contrib_a_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Jean Toulon",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        u_b = User(
++            id=uuid.uuid4(),
++            email=f"contrib_b_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Claire Marseille",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_b.id,
++            is_active=True,
++        )
++        session.add_all([u_a, u_b])
++        await session.commit()
++        await session.refresh(u_a)
++        await session.refresh(u_b)
++
++    yield {
++        "t_a": t_a,
++        "t_b": t_b,
++        "u_a": u_a,
++        "u_b": u_b,
++    }
++
++    async with AsyncSessionLocal() as session:
++        await session.execute(
++            delete(Photo).where(Photo.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(User).where(User.id.in_([u_a.id, u_b.id]))
++        )
++        await session.execute(
++            delete(Territory).where(Territory.id.in_([t_a.id, t_b.id]))
++        )
++        await session.commit()
++
++
++async def test_unauthenticated_request_rejected():
++    """Vérifie que l'accès sans authentification est rejeté avec un code 401."""
++    async with AsyncClient(
++        transport=ASGITransport(app=app), base_url="http://test"
++    ) as ac:
++        response = await ac.get("/api/v1/admin/photos")
++        assert response.status_code == 401
++
++
++async def test_create_draft_photo_without_gps(setup_test_data):
++    """Scénario 1: Création d'une photo 'draft' sans coordonnées GPS."""
++    u_a = setup_test_data["u_a"]
++    t_a = setup_test_data["t_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            payload = {
++                "title": "Photo Port Toulon 1900",
++                "description": "Vue sur la darse historique",
++                "status": "draft",
++                "year": 1900,
++                "archive_reference": "10Fi123",
++            }
++            response = await ac.post("/api/v1/admin/photos", json=payload)
++            assert response.status_code == 201
++            data = response.json()
++
++            assert data["title"] == "Photo Port Toulon 1900"
++            assert data["status"] == "draft"
++            assert data["territory_id"] == str(t_a.id)
++            assert data["latitude"] is None
++            assert data["longitude"] is None
++            assert data["location"] is None
++            assert data["year"] == 1900
++            assert data["archive_reference"] == "10Fi123"
++            assert data["field_of_view"] == 60
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_create_published_photo_with_gps(setup_test_data):
++    """Scénario 2: Publication d'une photo avec coordonnées GPS valides et azimut."""
++    u_a = setup_test_data["u_a"]
++    t_a = setup_test_data["t_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            payload = {
++                "title": "Fort Saint-Louis 1912",
++                "status": "published",
++                "latitude": 43.12,
++                "longitude": 5.93,
++                "bearing": 180,
++                "field_of_view": 70,
++            }
++            response = await ac.post("/api/v1/admin/photos", json=payload)
++            assert response.status_code == 201
++            data = response.json()
++
++            assert data["title"] == "Fort Saint-Louis 1912"
++            assert data["status"] == "published"
++            assert data["territory_id"] == str(t_a.id)
++            assert data["latitude"] == 43.12
++            assert data["longitude"] == 5.93
++            assert data["bearing"] == 180
++            assert data["field_of_view"] == 70
++            assert data["location"] == {
++                "type": "Point",
++                "coordinates": [5.93, 43.12],
++            }
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_create_published_photo_without_gps_rejected(setup_test_data):
++    """Scénario 3: Tentative de publication sans coordonnées GPS -> HTTP 422."""
++    u_a = setup_test_data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            payload = {
++                "title": "Photo sans GPS publiée",
++                "status": "published",
++            }
++            response = await ac.post("/api/v1/admin/photos", json=payload)
++            assert response.status_code == 422
++            data = response.json()
++            assert "error" in data or "detail" in data
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_bearing_bounds_validation(setup_test_data):
++    """Scénario 4: Azimut hors limites (<0 ou >=360) -> HTTP 422."""
++    u_a = setup_test_data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            # 365°
++            res1 = await ac.post(
++                "/api/v1/admin/photos",
++                json={"title": "Test 365", "bearing": 365},
++            )
++            assert res1.status_code == 422
++
++            # -5°
++            res2 = await ac.post(
++                "/api/v1/admin/photos",
++                json={"title": "Test -5", "bearing": -5},
++            )
++            assert res2.status_code == 422
++
++            # 0° valide
++            res3 = await ac.post(
++                "/api/v1/admin/photos",
++                json={"title": "Test 0", "bearing": 0},
++            )
++            assert res3.status_code == 201
++            assert res3.json()["bearing"] == 0
++
++            # 359° valide
++            res4 = await ac.post(
++                "/api/v1/admin/photos",
++                json={"title": "Test 359", "bearing": 359},
++            )
++            assert res4.status_code == 201
++            assert res4.json()["bearing"] == 359
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_list_photos_filtered_by_territory(setup_test_data):
++    """Scénario 5: Un contributeur ne liste que les photos de son propre territoire."""
++    u_a = setup_test_data["u_a"]
++    u_b = setup_test_data["u_b"]
++    t_a = setup_test_data["t_a"]
++    t_b = setup_test_data["t_b"]
++
++    async with AsyncSessionLocal() as session:
++        p_a1 = Photo(
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo A1 Toulon",
++            status=PhotoStatus.DRAFT,
++        )
++        p_a2 = Photo(
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo A2 Toulon",
++            status=PhotoStatus.DRAFT,
++        )
++        p_b1 = Photo(
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo B1 Marseille",
++            status=PhotoStatus.DRAFT,
++        )
++        session.add_all([p_a1, p_a2, p_b1])
++        await session.commit()
++
++    # Appel en tant que contributeur A
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            res_a = await ac.get("/api/v1/admin/photos")
++            assert res_a.status_code == 200
++            data_a = res_a.json()
++            titles = [p["title"] for p in data_a["items"]]
++            assert "Photo A1 Toulon" in titles
++            assert "Photo A2 Toulon" in titles
++            assert "Photo B1 Marseille" not in titles
++            assert all(p["territory_id"] == str(t_a.id) for p in data_a["items"])
++    finally:
++        app.dependency_overrides.clear()
++
++    # Appel en tant que contributeur B
++    app.dependency_overrides[get_current_active_user] = lambda: u_b
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            res_b = await ac.get("/api/v1/admin/photos")
++            assert res_b.status_code == 200
++            data_b = res_b.json()
++            titles_b = [p["title"] for p in data_b["items"]]
++            assert "Photo B1 Marseille" in titles_b
++            assert "Photo A1 Toulon" not in titles_b
++            assert "Photo A2 Toulon" not in titles_b
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_access_photo_of_another_territory_returns_404_rfc7807(setup_test_data):
++    """Scénario 6: Accès à la fiche d'un autre territoire -> 404 RFC 7807 PHOTO_NOT_FOUND."""
++    u_a = setup_test_data["u_a"]
++    u_b = setup_test_data["u_b"]
++    t_b = setup_test_data["t_b"]
++
++    async with AsyncSessionLocal() as session:
++        photo = Photo(
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo Privée Marseille",
++            status=PhotoStatus.DRAFT,
++        )
++        session.add(photo)
++        await session.commit()
++        await session.refresh(photo)
++        photo_b_id = photo.id
++
++    # Utilisateur A essaie d'accéder à la photo de B
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            res = await ac.get(f"/api/v1/admin/photos/{photo_b_id}")
++            assert res.status_code == 404
++            data = res.json()
++            assert "error" in data
++            assert data["error"]["code"] == "PHOTO_NOT_FOUND"
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_update_photo_and_published_validation(setup_test_data):
++    """Mise à jour d'une photo et vérification de la règle de publication."""
++    u_a = setup_test_data["u_a"]
++    t_a = setup_test_data["t_a"]
++
++    async with AsyncSessionLocal() as session:
++        photo = Photo(
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Brouillon Modifiable",
++            status=PhotoStatus.DRAFT,
++        )
++        session.add(photo)
++        await session.commit()
++        await session.refresh(photo)
++        photo_id = photo.id
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            # 1. Tentative de basculer en published sans coordonnées -> 422
++            res1 = await ac.patch(
++                f"/api/v1/admin/photos/{photo_id}",
++                json={"status": "published"},
++            )
++            assert res1.status_code == 422
++
++            # 2. Mise à jour avec coordonnées et statut published -> 200
++            res2 = await ac.patch(
++                f"/api/v1/admin/photos/{photo_id}",
++                json={
++                    "title": "Titre Modifié",
++                    "status": "published",
++                    "latitude": 43.1205,
++                    "longitude": 5.9288,
++                    "bearing": 90,
++                },
++            )
++            assert res2.status_code == 200
++            updated = res2.json()
++            assert updated["title"] == "Titre Modifié"
++            assert updated["status"] == "published"
++            assert updated["latitude"] == 43.1205
++            assert updated["longitude"] == 5.9288
++            assert updated["bearing"] == 90
++            assert updated["location"] == {
++                "type": "Point",
++                "coordinates": [5.9288, 43.1205],
++            }
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_delete_photo_cleans_up_media_files(setup_test_data):
++    """Scénario 7: Suppression d'une photo et nettoyage physique des fichiers via StorageDriver."""
++    u_a = setup_test_data["u_a"]
++    t_a = setup_test_data["t_a"]
++
++    async with AsyncSessionLocal() as session:
++        photo = Photo(
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo avec Fichiers",
++            status=PhotoStatus.DRAFT,
++            file_original_path="uploads/toulon/original_123.jpg",
++            file_display_path="uploads/toulon/display_123.webp",
++            file_thumb_path="uploads/toulon/thumb_123.webp",
++        )
++        session.add(photo)
++        await session.commit()
++        await session.refresh(photo)
++        photo_id = photo.id
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        mock_storage = AsyncMock(spec=StorageDriver)
++        mock_storage.delete.return_value = True
++
++        with patch("app.api.v1.admin.photos.get_storage_driver", return_value=mock_storage):
++            async with AsyncClient(
++                transport=ASGITransport(app=app), base_url="http://test"
++            ) as ac:
++                res = await ac.delete(f"/api/v1/admin/photos/{photo_id}")
++                assert res.status_code == 204
++
++        # Vérification des appels à delete pour chaque fichier média
++        deleted_paths = [call.args[0] for call in mock_storage.delete.call_args_list]
++        assert "uploads/toulon/original_123.jpg" in deleted_paths
++        assert "uploads/toulon/display_123.webp" in deleted_paths
++        assert "uploads/toulon/thumb_123.webp" in deleted_paths
++        assert mock_storage.delete.call_count == 3
++
++        # Vérification en base que la photo n'existe plus
++        async with AsyncSessionLocal() as session:
++            check = await session.execute(select(Photo).where(Photo.id == photo_id))
++            assert check.scalar_one_or_none() is None
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_delete_photo_from_another_territory_fails(setup_test_data):
++    """Tentative de suppression d'une photo d'un autre territoire -> 404 & conservée en base."""
++    u_a = setup_test_data["u_a"]
++    u_b = setup_test_data["u_b"]
++    t_b = setup_test_data["t_b"]
++
++    async with AsyncSessionLocal() as session:
++        photo = Photo(
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo B Protégée",
++            status=PhotoStatus.DRAFT,
++        )
++        session.add(photo)
++        await session.commit()
++        await session.refresh(photo)
++        photo_b_id = photo.id
++
++    # Utilisateur A essaie de supprimer la photo de B
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            res = await ac.delete(f"/api/v1/admin/photos/{photo_b_id}")
++            assert res.status_code == 404
++
++        # Vérifier que la photo existe toujours en base
++        async with AsyncSessionLocal() as session:
++            check = await session.execute(select(Photo).where(Photo.id == photo_b_id))
++            assert check.scalar_one_or_none() is not None
++    finally:
++        app.dependency_overrides.clear()

@@ -1,0 +1,2324 @@
+--- /dev/null
++++ b/frontend/src/utils/photoViewer.ts
+@@ -0,0 +1,97 @@
++/**
++ * Utilitaires partagés pour la fiche détaillée et la visionneuse plein écran (Story 3.3)
++ */
++
++/**
++ * Extrait l'identifiant photo d'un query string d'URL (ou de window.location.search par défaut)
++ */
++export function getUrlPhotoId(searchString?: string): string | null {
++  const query =
++    searchString !== undefined
++      ? searchString
++      : typeof window !== 'undefined'
++        ? window.location.search
++        : ''
++  const params = new URLSearchParams(query)
++  return params.get('photo')
++}
++
++/**
++ * Calcule la nouvelle URL avec ou sans le paramètre photo
++ */
++export function computePhotoUrl(currentUrlStr: string, photoId: string | null): string {
++  const url = new URL(currentUrlStr)
++  if (photoId) {
++    url.searchParams.set('photo', photoId)
++  } else {
++    url.searchParams.delete('photo')
++  }
++  return url.pathname + (url.search ? url.search : '') + url.hash
++}
++
++/**
++ * Contraint une valeur de zoom entre les bornes autorisées
++ */
++export function clampZoom(val: number, min = 0.5, max = 6.0): number {
++  return Math.min(Math.max(val, min), max)
++}
++
++/**
++ * Calcule le nouveau zoom et les translations de pan pour centrer le zoom sur le curseur
++ */
++export function calculateZoomToCursor(
++  currentZoom: number,
++  factor: number,
++  mouseX: number,
++  mouseY: number,
++  currentPanX: number,
++  currentPanY: number,
++  min = 0.5,
++  max = 6.0
++): { zoom: number; panX: number; panY: number } {
++  const newZoom = clampZoom(currentZoom * factor, min, max)
++  if (newZoom === currentZoom) {
++    return { zoom: currentZoom, panX: currentPanX, panY: currentPanY }
++  }
++  const ratio = newZoom / currentZoom
++  const newPanX = mouseX - (mouseX - currentPanX) * ratio
++  const newPanY = mouseY - (mouseY - currentPanY) * ratio
++  return {
++    zoom: Number(newZoom.toFixed(3)),
++    panX: Number(newPanX.toFixed(2)),
++    panY: Number(newPanY.toFixed(2)),
++  }
++}
++
++/**
++ * Résout l'URL de l'image optimisée pour le volet (display en priorité, fallback sur thumb)
++ */
++export function resolveDisplayImageUrl(photo: any): string | null {
++  if (!photo) return null
++  return (
++    photo.image_display_url ||
++    photo.display_url ||
++    photo.image_thumb_url ||
++    photo.thumb_url ||
++    photo.image_original_url ||
++    photo.original_url ||
++    null
++  )
++}
++
++/**
++ * Résout l'URL de l'image haute définition pour la visionneuse plein écran
++ * (original en priorité, fallback sur display puis thumb)
++ */
++export function resolveLightboxImageUrl(photo: any): string {
++  if (!photo) return ''
++  return (
++    photo.image_original_url ||
++    photo.original_url ||
++    photo.image_display_url ||
++    photo.display_url ||
++    photo.image_thumb_url ||
++    photo.thumb_url ||
++    ''
++  )
++}
+--- /dev/null
++++ b/frontend/src/components/public/PhotoDetailDrawer.vue
+@@ -0,0 +1,352 @@
++<script setup lang="ts">
++import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
++import type { PhotoGeoJsonProperties, Photo } from '@/types/photo'
++import { resolveDisplayImageUrl } from '@/utils/photoViewer'
++
++// On accepte soit une PhotoGeoJsonProperties, soit une entité Photo
++const props = withDefaults(
++  defineProps<{
++    isOpen: boolean
++    photo: PhotoGeoJsonProperties | Photo | null
++    coordinates?: [number, number] | null
++    isLightboxOpen?: boolean
++  }>(),
++  {
++    photo: null,
++    coordinates: null,
++    isLightboxOpen: false,
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'close'): void
++  (e: 'open-lightbox'): void
++  (e: 'center-map', coordinates: [number, number]): void
++}>()
++
++const copyFeedback = ref(false)
++let copyTimer: ReturnType<typeof setTimeout> | null = null
++
++// Résolution unifiée des propriétés
++const title = computed(() => props.photo?.title ?? 'Photographie historique')
++const description = computed(() => props.photo?.description ?? null)
++const photographer = computed(() => props.photo?.photographer ?? null)
++const yearTaken = computed(() => (props.photo as any)?.year_taken ?? (props.photo as any)?.year ?? null)
++const dateExact = computed(() => props.photo?.date_exact ?? null)
++const periodLabel = computed(() => props.photo?.period_label ?? null)
++const archiveSource = computed(() => props.photo?.archive_source ?? null)
++const archiveRef = computed(() => props.photo?.archive_ref ?? (props.photo as any)?.archive_reference ?? null)
++const originalSourceUrl = computed(() => props.photo?.original_source_url ?? (props.photo as any)?.source_url ?? null)
++const license = computed(() => props.photo?.license ?? 'Domaine Public')
++const bearing = computed(() => props.photo?.bearing ?? null)
++const fieldOfView = computed(() => props.photo?.field_of_view ?? 60)
++
++const displayImageUrl = computed(() => resolveDisplayImageUrl(props.photo))
++
++const resolvedCoordinates = computed<[number, number] | null>(() => {
++  if (props.coordinates) return props.coordinates
++  if (!props.photo) return null
++  const p = props.photo as any
++  if (p.longitude != null && p.latitude != null) {
++    return [p.longitude, p.latitude]
++  }
++  if (p.location?.coordinates) {
++    return p.location.coordinates
++  }
++  return null
++})
++
++/**
++ * Copie dans le presse-papiers le lien direct de partage (?photo=id)
++ */
++async function copyShareLink() {
++  if (!props.photo?.id) return
++
++  const url = new URL(window.location.href)
++  url.searchParams.set('photo', props.photo.id)
++
++  try {
++    if (navigator.clipboard && navigator.clipboard.writeText) {
++      await navigator.clipboard.writeText(url.toString())
++    } else {
++      // Fallback si l'API clipboard n'est pas autorisée
++      const input = document.createElement('input')
++      input.value = url.toString()
++      document.body.appendChild(input)
++      input.select()
++      document.execCommand('copy')
++      document.body.removeChild(input)
++    }
++
++    copyFeedback.value = true
++    if (copyTimer) clearTimeout(copyTimer)
++    copyTimer = setTimeout(() => {
++      copyFeedback.value = false
++    }, 2500)
++  } catch (err) {
++    console.warn('Impossible de copier dans le presse-papiers:', err)
++  }
++}
++
++function handleCenterMap() {
++  if (resolvedCoordinates.value) {
++    emit('center-map', resolvedCoordinates.value)
++  }
++}
++
++function handleKeyDown(e: KeyboardEvent) {
++  if (props.isOpen && !props.isLightboxOpen && e.key === 'Escape') {
++    emit('close')
++  }
++}
++
++watch(
++  () => props.isOpen,
++  (open) => {
++    if (open) {
++      window.addEventListener('keydown', handleKeyDown)
++    } else {
++      window.removeEventListener('keydown', handleKeyDown)
++    }
++  }
++)
++
++onMounted(() => {
++  if (props.isOpen) {
++    window.addEventListener('keydown', handleKeyDown)
++  }
++})
++
++onUnmounted(() => {
++  window.removeEventListener('keydown', handleKeyDown)
++  if (copyTimer) clearTimeout(copyTimer)
++})
++</script>
++
++<template>
++  <div v-if="isOpen && photo" class="relative z-30">
++    <!-- Backdrop assombri uniquement sur mobile -->
++    <div
++      class="fixed inset-0 bg-slate-950/60 backdrop-blur-xs md:hidden z-30 transition-opacity"
++      @click="emit('close')"
++    ></div>
++
++    <!-- Tiroir / Bottom Sheet -->
++    <aside
++      class="fixed md:absolute z-40 transition-all duration-300 ease-out
++             bottom-0 inset-x-0 md:inset-x-auto md:right-0 md:top-0 md:bottom-0
++             w-full md:w-[420px] max-h-[85vh] md:max-h-full h-auto md:h-full
++             bg-slate-900/95 backdrop-blur-md border-t md:border-t-0 md:border-l border-slate-700/80
++             shadow-2xl flex flex-col rounded-t-2xl md:rounded-none overflow-hidden text-slate-100"
++      role="dialog"
++      aria-modal="true"
++      :aria-label="`Fiche patrimoniale : ${title}`"
++    >
++      <!-- Poignée de glissement tactile pour mobile -->
++      <div class="md:hidden pt-3 pb-1 flex justify-center cursor-pointer" @click="emit('close')">
++        <div class="w-12 h-1.5 bg-slate-600 rounded-full"></div>
++      </div>
++
++      <!-- En-tête du volet -->
++      <header class="px-5 py-3.5 border-b border-slate-800 flex items-start justify-between gap-3 shrink-0">
++        <div class="min-w-0">
++          <div class="flex flex-wrap items-center gap-1.5 mb-1 text-[11px]">
++            <span
++              v-if="yearTaken || periodLabel"
++              class="px-2 py-0.5 rounded font-medium bg-sky-950 text-sky-300 border border-sky-800"
++            >
++              📅 {{ [yearTaken, periodLabel].filter(Boolean).join(' • ') }}
++            </span>
++            <span
++              v-if="photographer"
++              class="px-2 py-0.5 rounded bg-slate-800 text-slate-300 border border-slate-700 truncate max-w-[180px]"
++              :title="photographer"
++            >
++              👤 {{ photographer }}
++            </span>
++          </div>
++          <h2 class="text-base font-bold text-white leading-snug line-clamp-2">
++            {{ title }}
++          </h2>
++        </div>
++
++        <button
++          type="button"
++          class="p-1.5 text-slate-400 hover:text-white hover:bg-slate-800 rounded-lg transition-colors shrink-0"
++          title="Fermer la fiche (Échap)"
++          @click="emit('close')"
++        >
++          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++          </svg>
++        </button>
++      </header>
++
++      <!-- Corps défilant du volet -->
++      <div class="flex-1 overflow-y-auto px-5 py-4 space-y-5 text-xs">
++        <!-- Aperçu de l'image avec déclencheur Lightbox -->
++        <div
++          v-if="displayImageUrl"
++          class="relative group rounded-xl overflow-hidden border border-slate-700/80 bg-slate-950 shadow-md cursor-pointer aspect-4/3 flex items-center justify-center"
++          @click="emit('open-lightbox')"
++        >
++          <img
++            :src="displayImageUrl"
++            :alt="title"
++            class="w-full h-full object-cover transition-transform duration-300 group-hover:scale-105"
++            loading="lazy"
++          />
++
++          <!-- Superposition hover invitant à la visionneuse HD -->
++          <div class="absolute inset-0 bg-slate-950/50 opacity-0 group-hover:opacity-100 transition-opacity flex flex-col items-center justify-center gap-1.5 text-white p-3 text-center">
++            <span class="text-2xl drop-shadow">🔍</span>
++            <span class="font-semibold text-xs drop-shadow">Explorer en plein écran HD</span>
++            <span class="text-[10px] text-slate-300">Zoom et déplacement détaillés</span>
++          </div>
++
++          <!-- Badge discret en bas à droite -->
++          <div class="absolute bottom-2 right-2 px-2 py-1 rounded bg-slate-900/80 backdrop-blur-xs text-[10px] font-medium text-slate-300 border border-slate-700/80 flex items-center gap-1 group-hover:hidden">
++            <span>🔍 Plein écran</span>
++          </div>
++        </div>
++
++        <!-- Boutons d'Action Rapide (Partager, Plein écran, Centrer) -->
++        <div class="grid grid-cols-2 gap-2">
++          <!-- Bouton Partager le lien direct -->
++          <button
++            type="button"
++            class="px-3 py-2 rounded-xl border border-slate-700 bg-slate-800/80 hover:bg-slate-700 text-slate-200 hover:text-white font-medium transition-colors flex items-center justify-center gap-1.5 relative"
++            @click="copyShareLink"
++          >
++            <span v-if="!copyFeedback">🔗 Partager la vue</span>
++            <span v-else class="text-emerald-400 font-semibold flex items-center gap-1">
++              ✓ Lien copié !
++            </span>
++          </button>
++
++          <!-- Bouton Plein écran -->
++          <button
++            type="button"
++            class="px-3 py-2 rounded-xl border border-sky-700/60 bg-sky-900/40 hover:bg-sky-800/60 text-sky-200 hover:text-white font-medium transition-colors flex items-center justify-center gap-1.5"
++            @click="emit('open-lightbox')"
++          >
++            <span>⛶ Visionneuse HD</span>
++          </button>
++        </div>
++
++        <!-- Description Historique si disponible -->
++        <section v-if="description" class="space-y-1.5 bg-slate-950/60 p-3.5 rounded-xl border border-slate-800">
++          <h3 class="font-bold text-slate-300 uppercase tracking-wider text-[10px]">
++            Contexte historique & description
++          </h3>
++          <p class="text-slate-300 leading-relaxed whitespace-pre-line text-xs">
++            {{ description }}
++          </p>
++        </section>
++
++        <!-- Métadonnées d'Archives & Patrimoniales (Obligatoires selon NFR-4) -->
++        <section class="space-y-3 bg-slate-950/60 p-3.5 rounded-xl border border-slate-800">
++          <h3 class="font-bold text-slate-300 uppercase tracking-wider text-[10px] flex items-center gap-1.5">
++            <span>🏛️ Métadonnées d'archives</span>
++          </h3>
++
++          <div class="space-y-2 text-xs">
++            <!-- Fonds d'archives -->
++            <div class="flex items-start justify-between gap-2 border-b border-slate-800/80 pb-2">
++              <span class="text-slate-400">Fonds d'archives</span>
++              <span class="font-medium text-white text-right">
++                {{ archiveSource || 'Non spécifié' }}
++              </span>
++            </div>
++
++            <!-- Cote d'archive -->
++            <div class="flex items-start justify-between gap-2 border-b border-slate-800/80 pb-2">
++              <span class="text-slate-400">Cote / Référence</span>
++              <span class="font-mono font-bold text-sky-400 text-right">
++                {{ archiveRef || 'Non coté' }}
++              </span>
++            </div>
++
++            <!-- Photographe -->
++            <div v-if="photographer" class="flex items-start justify-between gap-2 border-b border-slate-800/80 pb-2">
++              <span class="text-slate-400">Photographe / Auteur</span>
++              <span class="font-medium text-white text-right">
++                {{ photographer }}
++              </span>
++            </div>
++
++            <!-- Date / Époque -->
++            <div class="flex items-start justify-between gap-2 border-b border-slate-800/80 pb-2">
++              <span class="text-slate-400">Date ou période</span>
++              <span class="font-medium text-white text-right">
++                {{ dateExact || yearTaken || periodLabel || 'Inconnue' }}
++              </span>
++            </div>
++
++            <!-- Licence patrimoniale (NFR-4) -->
++            <div class="flex items-start justify-between gap-2 border-b border-slate-800/80 pb-2">
++              <span class="text-slate-400">Licence patrimoniale</span>
++              <span class="px-2 py-0.5 rounded font-medium text-[11px] bg-slate-800 text-slate-200 border border-slate-700 text-right">
++                {{ license }}
++              </span>
++            </div>
++
++            <!-- Lien vers la notice originale d'archives -->
++            <div v-if="originalSourceUrl" class="pt-1 flex items-center justify-between">
++              <span class="text-slate-400">Notice originale</span>
++              <a
++                :href="originalSourceUrl"
++                target="_blank"
++                rel="noopener noreferrer"
++                class="text-sky-400 hover:text-sky-300 underline font-medium flex items-center gap-1 text-right"
++              >
++                <span>Consulter la notice d'origine</span>
++                <span class="text-[10px]">↗</span>
++              </a>
++            </div>
++          </div>
++        </section>
++
++        <!-- Données Géographiques & Prise de Vue -->
++        <section class="space-y-3 bg-slate-950/60 p-3.5 rounded-xl border border-slate-800">
++          <h3 class="font-bold text-slate-300 uppercase tracking-wider text-[10px] flex items-center gap-1.5">
++            <span>🧭 Prise de vue & orientation</span>
++          </h3>
++
++          <div class="grid grid-cols-2 gap-2 text-xs">
++            <!-- Azimut (Direction) -->
++            <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
++              <div class="text-[10px] text-slate-400">Azimut (Regard)</div>
++              <div class="font-bold text-sky-400 font-mono mt-0.5">
++                {{ bearing != null ? `${bearing}°` : 'Non orienté' }}
++              </div>
++            </div>
++
++            <!-- Champ de vision -->
++            <div class="p-2.5 rounded-lg bg-slate-900 border border-slate-800">
++              <div class="text-[10px] text-slate-400">Champ angulaire</div>
++              <div class="font-bold text-slate-200 font-mono mt-0.5">
++                {{ fieldOfView }}°
++              </div>
++            </div>
++          </div>
++
++          <!-- Coordonnées géographiques -->
++          <div v-if="resolvedCoordinates" class="flex items-center justify-between text-xs pt-1">
++            <span class="text-slate-400 font-mono text-[11px]">
++              GPS : {{ resolvedCoordinates[1].toFixed(5) }}, {{ resolvedCoordinates[0].toFixed(5) }}
++            </span>
++            <button
++              type="button"
++              class="text-sky-400 hover:text-sky-300 font-medium flex items-center gap-1"
++              @click="handleCenterMap"
++            >
++              <span>Centrer</span>
++              <span>🎯</span>
++            </button>
++          </div>
++        </section>
++      </div>
++    </aside>
++  </div>
++</template>
+--- /dev/null
++++ b/frontend/src/components/public/PhotoLightbox.vue
+@@ -0,0 +1,415 @@
++<script setup lang="ts">
++import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
++import { clampZoom, calculateZoomToCursor } from '@/utils/photoViewer'
++
++const props = withDefaults(
++  defineProps<{
++    isOpen: boolean
++    imageUrl: string
++    title: string
++    photographer?: string | null
++    year?: number | null
++    periodLabel?: string | null
++    archiveSource?: string | null
++    archiveRef?: string | null
++    license?: string | null
++  }>(),
++  {
++    photographer: null,
++    year: null,
++    periodLabel: null,
++    archiveSource: null,
++    archiveRef: null,
++    license: null,
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'close'): void
++}>()
++
++const containerRef = ref<HTMLDivElement | null>(null)
++const imageRef = ref<HTMLImageElement | null>(null)
++
++// État de transformation : zoom & déplacement
++const zoom = ref(1)
++const panX = ref(0)
++const panY = ref(0)
++const isDragging = ref(false)
++const isWheelZooming = ref(false)
++const isImageLoaded = ref(false)
++const hasLoadError = ref(false)
++const showInfo = ref(true)
++let wheelTimer: ReturnType<typeof setTimeout> | null = null
++
++// Gestion du glissement (pointer events)
++let dragStartX = 0
++let dragStartY = 0
++let initialPinchDistance = 0
++let initialPinchZoom = 1
++
++const minZoom = 0.5
++const maxZoom = 6
++
++const transformStyle = computed(() => ({
++  transform: `translate3d(${panX.value}px, ${panY.value}px, 0) scale(${zoom.value})`,
++  transformOrigin: 'center center',
++  transition: isDragging.value || isWheelZooming.value ? 'none' : 'transform 0.15s ease-out',
++}))
++
++function resetView() {
++  zoom.value = 1
++  panX.value = 0
++  panY.value = 0
++}
++
++function handleZoomIn() {
++  zoom.value = Number(clampZoom(zoom.value * 1.35, minZoom, maxZoom).toFixed(2))
++}
++
++function handleZoomOut() {
++  zoom.value = Number(clampZoom(zoom.value / 1.35, minZoom, maxZoom).toFixed(2))
++}
++
++/**
++ * Zoom centré sur la position du curseur
++ */
++function handleWheel(e: WheelEvent) {
++  e.preventDefault()
++  if (!containerRef.value) return
++
++  isWheelZooming.value = true
++  if (wheelTimer) clearTimeout(wheelTimer)
++  wheelTimer = setTimeout(() => {
++    isWheelZooming.value = false
++  }, 100)
++
++  const rect = containerRef.value.getBoundingClientRect()
++  const mouseX = e.clientX - rect.left - rect.width / 2
++  const mouseY = e.clientY - rect.top - rect.height / 2
++  const factor = e.deltaY < 0 ? 1.2 : 0.833
++
++  const result = calculateZoomToCursor(
++    zoom.value,
++    factor,
++    mouseX,
++    mouseY,
++    panX.value,
++    panY.value,
++    minZoom,
++    maxZoom
++  )
++  zoom.value = result.zoom
++  panX.value = result.panX
++  panY.value = result.panY
++}
++
++/**
++ * Double clic / double tap : bascule entre 1x et 2.5x
++ */
++function handleDoubleClick(e: MouseEvent) {
++  if (!containerRef.value) return
++  if (zoom.value > 1.1) {
++    resetView()
++  } else {
++    const rect = containerRef.value.getBoundingClientRect()
++    const mouseX = e.clientX - rect.left - rect.width / 2
++    const mouseY = e.clientY - rect.top - rect.height / 2
++    const targetZoom = 2.5
++    const ratio = targetZoom / zoom.value
++    panX.value = mouseX - (mouseX - panX.value) * ratio
++    panY.value = mouseY - (mouseY - panY.value) * ratio
++    zoom.value = targetZoom
++  }
++}
++
++/**
++ * Gestion du pan par Pointer Events
++ */
++function handlePointerDown(e: PointerEvent) {
++  // Éviter que les points tactiles secondaires ne perturbent le glissement
++  if (e.pointerType === 'touch' && !e.isPrimary) return
++  // Clic gauche uniquement
++  if (e.button !== 0) return
++  isDragging.value = true
++  dragStartX = e.clientX - panX.value
++  dragStartY = e.clientY - panY.value
++
++  const el = containerRef.value
++  if (el) {
++    el.setPointerCapture(e.pointerId)
++  }
++}
++
++function handlePointerMove(e: PointerEvent) {
++  if (!isDragging.value) return
++  panX.value = e.clientX - dragStartX
++  panY.value = e.clientY - dragStartY
++}
++
++function handlePointerUp(e: PointerEvent) {
++  if (!isDragging.value) return
++  isDragging.value = false
++  const el = containerRef.value
++  if (el && el.hasPointerCapture(e.pointerId)) {
++    el.releasePointerCapture(e.pointerId)
++  }
++}
++
++/**
++ * Support tactile multipoint (Pinch-to-zoom)
++ */
++function handleTouchStart(e: TouchEvent) {
++  if (e.touches.length === 2) {
++    const t1 = e.touches[0]
++    const t2 = e.touches[1]
++    initialPinchDistance = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
++    initialPinchZoom = zoom.value
++  }
++}
++
++function handleTouchMove(e: TouchEvent) {
++  if (e.touches.length === 2 && initialPinchDistance > 0) {
++    e.preventDefault()
++    const t1 = e.touches[0]
++    const t2 = e.touches[1]
++    const currentDistance = Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY)
++    const factor = currentDistance / initialPinchDistance
++    const newZoom = Math.min(Math.max(initialPinchZoom * factor, minZoom), maxZoom)
++    zoom.value = Number(newZoom.toFixed(2))
++  }
++}
++
++function handleKeyDown(e: KeyboardEvent) {
++  if (!props.isOpen) return
++  if (e.key === 'Escape') {
++    e.stopImmediatePropagation()
++    e.preventDefault()
++    emit('close')
++  } else if (e.key === '+' || e.key === '=') {
++    handleZoomIn()
++  } else if (e.key === '-' || e.key === '_') {
++    handleZoomOut()
++  } else if (e.key === '0' || e.key.toLowerCase() === 'r') {
++    resetView()
++  }
++}
++
++watch(
++  () => props.imageUrl,
++  () => {
++    resetView()
++    isImageLoaded.value = false
++    hasLoadError.value = false
++  }
++)
++
++watch(
++  () => props.isOpen,
++  (open) => {
++    if (open) {
++      resetView()
++      isImageLoaded.value = false
++      hasLoadError.value = false
++      window.addEventListener('keydown', handleKeyDown)
++      document.body.style.overflow = 'hidden'
++    } else {
++      window.removeEventListener('keydown', handleKeyDown)
++      document.body.style.overflow = ''
++    }
++  },
++  { immediate: true }
++)
++
++onMounted(() => {
++  if (props.isOpen) {
++    window.addEventListener('keydown', handleKeyDown)
++  }
++})
++
++onUnmounted(() => {
++  window.removeEventListener('keydown', handleKeyDown)
++  document.body.style.overflow = ''
++  if (wheelTimer) {
++    clearTimeout(wheelTimer)
++    wheelTimer = null
++  }
++})
++</script>
++
++<template>
++  <Teleport to="body">
++    <Transition
++      enter-active-class="transition duration-200 ease-out"
++      enter-from-class="opacity-0"
++      enter-to-class="opacity-100"
++      leave-active-class="transition duration-150 ease-in"
++      leave-from-class="opacity-100"
++      leave-to-class="opacity-0"
++    >
++      <div
++        v-if="isOpen"
++        class="fixed inset-0 z-50 flex flex-col bg-slate-950/95 backdrop-blur-md select-none overflow-hidden"
++        role="dialog"
++        aria-modal="true"
++        :aria-label="`Visionneuse plein écran : ${title}`"
++      >
++        <!-- Barre Supérieure d'En-tête et Contrôles -->
++        <header class="relative z-20 flex items-center justify-between px-4 py-3 bg-slate-900/80 border-b border-slate-800 text-white shadow-lg">
++          <div class="flex items-center space-x-3 min-w-0 pr-4">
++            <span class="text-xl">🔍</span>
++            <div class="min-w-0">
++              <h2 class="text-sm sm:text-base font-bold truncate leading-tight">
++                {{ title }}
++              </h2>
++              <p class="text-xs text-slate-400 truncate flex items-center gap-2">
++                <span v-if="year || periodLabel">
++                  📅 {{ [year, periodLabel].filter(Boolean).join(' • ') }}
++                </span>
++                <span v-if="photographer" class="truncate">
++                  👤 {{ photographer }}
++                </span>
++                <span v-if="archiveRef" class="truncate font-mono text-[11px] text-sky-400">
++                  📁 {{ archiveRef }}
++                </span>
++              </p>
++            </div>
++          </div>
++
++          <!-- Boutons d'Action & Zoom -->
++          <div class="flex items-center space-x-1 sm:space-x-2 shrink-0">
++            <!-- Niveau de Zoom Actuel -->
++            <span class="hidden sm:inline-block px-2 py-1 rounded bg-slate-800 text-[11px] font-mono text-slate-300">
++              {{ Math.round(zoom * 100) }}%
++            </span>
++
++            <button
++              type="button"
++              class="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
++              title="Zoom arrière (-)"
++              @click="handleZoomOut"
++            >
++              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M20 12H4" />
++              </svg>
++            </button>
++
++            <button
++              type="button"
++              class="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors"
++              title="Zoom avant (+)"
++              @click="handleZoomIn"
++            >
++              <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
++              </svg>
++            </button>
++
++            <button
++              type="button"
++              class="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors text-xs font-semibold"
++              title="Réinitialiser la vue (100% / R)"
++              @click="resetView"
++            >
++              1:1
++            </button>
++
++            <button
++              type="button"
++              class="p-2 text-slate-300 hover:text-white hover:bg-slate-800 rounded-lg transition-colors text-xs"
++              :title="showInfo ? 'Masquer la légende' : 'Afficher la légende'"
++              @click="showInfo = !showInfo"
++            >
++              ℹ️
++            </button>
++
++            <div class="h-6 w-px bg-slate-700 mx-1"></div>
++
++            <button
++              type="button"
++              class="p-2 text-slate-300 hover:text-white hover:bg-rose-900/60 rounded-lg transition-colors"
++              title="Fermer la visionneuse (Échap)"
++              @click="emit('close')"
++            >
++              <svg class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++              </svg>
++            </button>
++          </div>
++        </header>
++
++        <!-- Zone Interactive Principale (Pan & Zoom) -->
++        <main
++          ref="containerRef"
++          class="relative flex-1 w-full h-full flex items-center justify-center overflow-hidden touch-none"
++          :class="isDragging ? 'cursor-grabbing' : (zoom > 1 ? 'cursor-grab' : 'cursor-default')"
++          @wheel="handleWheel"
++          @dblclick="handleDoubleClick"
++          @pointerdown="handlePointerDown"
++          @pointermove="handlePointerMove"
++          @pointerup="handlePointerUp"
++          @pointercancel="handlePointerUp"
++          @touchstart="handleTouchStart"
++          @touchmove="handleTouchMove"
++        >
++          <!-- Indicateur de Chargement -->
++          <div
++            v-if="!isImageLoaded && !hasLoadError"
++            class="absolute inset-0 flex flex-col items-center justify-center gap-3 text-sky-400 z-10"
++          >
++            <svg class="animate-spin w-8 h-8" viewBox="0 0 24 24" fill="none">
++              <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
++              <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
++            </svg>
++            <span class="text-xs text-slate-300">Chargement de l'image haute définition...</span>
++          </div>
++
++          <!-- Message d'erreur de chargement -->
++          <div
++            v-if="hasLoadError"
++            class="text-rose-400 text-sm p-4 bg-rose-950/80 rounded-xl border border-rose-800 text-center max-w-md"
++          >
++            <p class="font-bold">Impossible de charger l'image haute définition.</p>
++            <p class="text-xs text-slate-400 mt-1">Le fichier d'archives est indisponible ou inaccessible.</p>
++          </div>
++
++          <!-- Image Haute Définition -->
++          <img
++            v-show="!hasLoadError"
++            ref="imageRef"
++            :src="imageUrl"
++            :alt="title"
++            class="max-w-[90vw] max-h-[85vh] object-contain select-none pointer-events-none drop-shadow-2xl transition-opacity duration-300"
++            :class="isImageLoaded ? 'opacity-100' : 'opacity-0'"
++            :style="transformStyle"
++            draggable="false"
++            @load="isImageLoaded = true"
++            @error="hasLoadError = true"
++          />
++        </main>
++
++        <!-- Bandeau Inférieur d'Informations & Aide -->
++        <footer
++          v-if="showInfo"
++          class="relative z-20 px-4 py-2.5 bg-slate-900/85 border-t border-slate-800 text-xs text-slate-300 flex flex-wrap items-center justify-between gap-2 shadow-lg"
++        >
++          <div class="flex items-center gap-3">
++            <span v-if="archiveSource" class="text-slate-400">
++              Fonds : <strong class="text-slate-200">{{ archiveSource }}</strong>
++            </span>
++            <span v-if="license" class="px-2 py-0.5 rounded bg-slate-800 text-[10px] text-slate-300 border border-slate-700">
++              {{ license }}
++            </span>
++          </div>
++
++          <div class="text-[11px] text-slate-400 hidden md:flex items-center gap-3">
++            <span>🖱️ Molette : Zoom</span>
++            <span>👆 Glisser : Panoramique</span>
++            <span>✨ Double-clic : Zoom rapide</span>
++            <span>⌨️ Échap : Fermer</span>
++          </div>
++        </footer>
++      </div>
++    </Transition>
++  </Teleport>
++</template>
+--- /dev/null
++++ b/frontend/src/components/public/PublicMapViewer.vue
+@@ -0,0 +1,1032 @@
++<script setup lang="ts">
++import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
++import maplibregl from 'maplibre-gl'
++import 'maplibre-gl/dist/maplibre-gl.css'
++import { photoApi } from '@/services/api'
++import { createViewConePolygon, createEmptyFeatureCollection } from '@/utils/geo'
++import type { PhotoGeoJsonFeatureCollection, PhotoGeoJsonFeature } from '@/types/photo'
++import { getUrlPhotoId, computePhotoUrl, resolveLightboxImageUrl } from '@/utils/photoViewer'
++import PhotoDetailDrawer from './PhotoDetailDrawer.vue'
++import PhotoLightbox from './PhotoLightbox.vue'
++
++const props = withDefaults(
++  defineProps<{
++    territoryCenter?: [number, number] // [lng, lat]
++    defaultZoom?: number
++    territoryName?: string
++  }>(),
++  {
++    territoryCenter: () => [5.93, 43.12],
++    defaultZoom: 13,
++    territoryName: 'Territoire',
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'select-photo', photoId: string, feature: PhotoGeoJsonFeature): void
++}>()
++
++const mapContainer = ref<HTMLDivElement | null>(null)
++let map: maplibregl.Map | null = null
++let resizeObserver: ResizeObserver | null = null
++let isMounted = false
++let currentAbortController: AbortController | null = null
++let activePopup: maplibregl.Popup | null = null
++let currentHoveredPhotoId: string | null = null
++
++const loading = ref(true)
++const error = ref<string | null>(null)
++const photosData = ref<PhotoGeoJsonFeatureCollection | null>(null)
++const totalPublishedCount = ref(0)
++const selectedPhotoId = ref<string | null>(null)
++
++// Story 3.3 : Volet détaillé et Visionneuse HD
++const isDrawerOpen = ref(false)
++const isLightboxOpen = ref(false)
++const activePhotoFeature = ref<PhotoGeoJsonFeature | null>(null)
++const notFoundToast = ref<string | null>(null)
++let toastTimer: ReturnType<typeof setTimeout> | null = null
++let pendingInitialPhotoId: string | null = null
++
++const lightboxImageUrl = computed(() => {
++  return resolveLightboxImageUrl(activePhotoFeature.value?.properties)
++})
++
++/**
++ * Utilitaires de synchronisation URL sans rechargement
++ */
++function setUrlPhotoId(id: string | null, push = false) {
++  const currentPhoto = getUrlPhotoId(window.location.search)
++  if (currentPhoto === id) return
++  const target = computePhotoUrl(window.location.href, id)
++  if (push) {
++    window.history.pushState(null, '', target)
++  } else {
++    window.history.replaceState(null, '', target)
++  }
++}
++
++function showNotFoundToast(message = 'Photographie introuvable ou non publiée.') {
++  notFoundToast.value = message
++  if (toastTimer) clearTimeout(toastTimer)
++  toastTimer = setTimeout(() => {
++    notFoundToast.value = null
++  }, 4000)
++}
++
++// Filtres
++const searchQuery = ref('')
++const filterYearMin = ref<number | undefined>(undefined)
++const filterYearMax = ref<number | undefined>(undefined)
++
++// Style raster OSM libre et sans clé API
++const mapStyle: maplibregl.StyleSpecification = {
++  version: 8,
++  sources: {
++    'osm-tiles': {
++      type: 'raster',
++      tiles: [
++        'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
++        'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
++        'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
++      ],
++      tileSize: 256,
++      attribution:
++        '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributeurs',
++      maxzoom: 19,
++    },
++  },
++  layers: [
++    {
++      id: 'osm-tiles-layer',
++      type: 'raster',
++      source: 'osm-tiles',
++      minzoom: 0,
++      maxzoom: 19,
++    },
++  ],
++}
++
++/**
++ * Génère une icône Canvas 2D nette et vectorielle pour les marqueurs MapLibre
++ * avec pointe directionnelle orientée (hasArrow = true) ou pastille neutre
++ * Centrée strictement sur le centre (28, 28) pour éliminer tout déport orbital lors des rotations
++ */
++function createOrientedMarkerImage(hasArrow: boolean): ImageData {
++  const size = 56
++  const canvas = document.createElement('canvas')
++  canvas.width = size
++  canvas.height = size
++  const ctx = canvas.getContext('2d')
++  if (!ctx) {
++    return new ImageData(size, size)
++  }
++
++  const cx = size / 2
++  const cy = size / 2
++  const radius = 16
++
++  // Ombre portée douce
++  ctx.shadowColor = 'rgba(0, 0, 0, 0.45)'
++  ctx.shadowBlur = 6
++  ctx.shadowOffsetY = 2
++
++  // Si marqueur orienté : pointe directionnelle vers le haut (0° = Nord)
++  if (hasArrow) {
++    ctx.beginPath()
++    ctx.moveTo(cx - 9, cy - radius + 2)
++    ctx.lineTo(cx, cy - radius - 11)
++    ctx.lineTo(cx + 9, cy - radius + 2)
++    ctx.closePath()
++    ctx.fillStyle = '#0284c7'
++    ctx.fill()
++    ctx.lineWidth = 2.5
++    ctx.strokeStyle = '#ffffff'
++    ctx.stroke()
++  }
++
++  // Cercle principal
++  ctx.beginPath()
++  ctx.arc(cx, cy, radius, 0, Math.PI * 2)
++  ctx.fillStyle = '#0284c7'
++  ctx.fill()
++  ctx.lineWidth = 2.5
++  ctx.strokeStyle = '#ffffff'
++  ctx.stroke()
++
++  // Reset shadow for inner icon
++  ctx.shadowColor = 'transparent'
++
++  // Icône appareil photo au centre
++  ctx.fillStyle = '#ffffff'
++  ctx.beginPath()
++  if (ctx.roundRect) {
++    ctx.roundRect(cx - 8, cy - 5, 16, 11, 2)
++  } else {
++    ctx.rect(cx - 8, cy - 5, 16, 11)
++  }
++  ctx.fill()
++
++  // Viseur
++  ctx.fillRect(cx - 4, cy - 8, 6, 3)
++
++  // Objectif
++  ctx.beginPath()
++  ctx.arc(cx, cy + 1, 3.8, 0, Math.PI * 2)
++  ctx.fillStyle = '#0284c7'
++  ctx.fill()
++  ctx.beginPath()
++  ctx.arc(cx, cy + 1, 1.6, 0, Math.PI * 2)
++  ctx.fillStyle = '#ffffff'
++  ctx.fill()
++
++  return ctx.getImageData(0, 0, size, size)
++}
++
++/**
++ * Met à jour le polygone vectoriel du cône de vue WebGL sur la carte
++ */
++function updateViewCone(feature: PhotoGeoJsonFeature | null) {
++  if (!map || !map.isStyleLoaded()) return
++  const source = map.getSource('view-cone-source') as maplibregl.GeoJSONSource | undefined
++  if (!source) return
++
++  // Si un cliché spécifique est survolé, on utilise celui-ci ; sinon la photo activement sélectionnée
++  const target =
++    feature ||
++    (selectedPhotoId.value
++      ? (activePhotoFeature.value || photosData.value?.features.find((f) => f.properties.id === selectedPhotoId.value))
++      : null)
++
++  if (
++    target &&
++    target.properties?.bearing !== null &&
++    target.properties?.bearing !== undefined
++  ) {
++    const coords = target.geometry.coordinates
++    const polygon = createViewConePolygon(
++      coords[0],
++      coords[1],
++      target.properties.bearing,
++      target.properties.field_of_view || 60,
++      160, // Portée visuelle standard de 160 mètres à l'échelle
++      2
++    )
++    source.setData(polygon)
++  } else {
++    source.setData(createEmptyFeatureCollection())
++  }
++}
++
++/**
++ * Charge les données GeoJSON depuis l'API publique avec annulation des requêtes précédentes
++ */
++async function loadGeoJsonData() {
++  if (currentAbortController) {
++    currentAbortController.abort()
++  }
++  currentAbortController = new AbortController()
++
++  loading.value = true
++  error.value = null
++
++  try {
++    const data = await photoApi.getPublicPhotos(
++      {
++        search: searchQuery.value.trim() || undefined,
++        year_min: filterYearMin.value,
++        year_max: filterYearMax.value,
++      },
++      currentAbortController.signal
++    )
++
++    if (!isMounted) return
++
++    photosData.value = data
++    totalPublishedCount.value = data.features.length
++
++    // Si la photo actuellement sélectionnée n'est plus dans les filtres, on réinitialise volet et URL
++    if (
++      selectedPhotoId.value &&
++      !data.features.some((f) => f.properties.id === selectedPhotoId.value)
++    ) {
++      closeDrawer({ updateUrl: true, pushHistory: false })
++    }
++
++    if (map && map.isStyleLoaded()) {
++      const source = map.getSource('photos') as maplibregl.GeoJSONSource | undefined
++      if (source) {
++        source.setData(data as any)
++      }
++    }
++  } catch (err: any) {
++    if (err.name === 'AbortError') {
++      // Annulation normale par frappe ultérieure
++      return
++    }
++    console.error('Erreur lors du chargement des données GeoJSON:', err)
++    error.value = err.message || 'Impossible de charger les données photographiques.'
++  } finally {
++    if (isMounted) {
++      loading.value = false
++    }
++  }
++}
++
++/**
++ * Affiche une popup descriptive sur un point individuel sélectionné
++ * Utilise setDOMContent() synchrone pour garantir un attachement d'événement sans délai
++ */
++function showPhotoPopup(feature: PhotoGeoJsonFeature, lngLat: [number, number]) {
++  if (!map) return
++
++  // Fermeture propre de l'ancienne popup sans déclencher l'annulation de la nouvelle sélection
++  if (activePopup) {
++    const old = activePopup
++    activePopup = null
++    old.remove()
++  }
++
++  const p = feature.properties
++  const popupEl = document.createElement('div')
++  popupEl.className = 'p-2 space-y-2 max-w-[240px] font-sans text-slate-100'
++  popupEl.innerHTML = `
++    ${
++      p.image_thumb_url
++        ? `<img src="${p.image_thumb_url}" alt="${p.title}" class="w-full h-28 object-cover rounded-lg border border-slate-700 shadow-md" />`
++        : ''
++    }
++    <div>
++      <h4 class="font-bold text-xs text-white line-clamp-2 leading-tight">${p.title}</h4>
++      <div class="flex items-center gap-2 mt-1 text-[11px] text-slate-400">
++        ${p.year_taken ? `<span>📅 ${p.year_taken}</span>` : ''}
++        ${p.photographer ? `<span class="truncate">👤 ${p.photographer}</span>` : ''}
++      </div>
++      ${
++        p.bearing !== null && p.bearing !== undefined
++          ? `<div class="text-[10px] text-sky-400 mt-1 font-mono">🧭 Azimut : ${p.bearing}° | Champ : ${p.field_of_view}°</div>`
++          : ''
++      }
++    </div>
++    <button
++      type="button"
++      class="hierici-popup-btn w-full py-1 px-2 mt-1 bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold rounded transition-colors text-center"
++    >
++      Consulter la fiche
++    </button>
++  `
++
++  const actionBtn = popupEl.querySelector('.hierici-popup-btn') as HTMLButtonElement | null
++  if (actionBtn) {
++    actionBtn.onclick = () => {
++      selectPhotoById(p.id, { flyTo: false, updateUrl: true, pushHistory: true })
++    }
++  }
++
++  const newPopup = new maplibregl.Popup({
++    closeButton: true,
++    closeOnClick: true,
++    offset: 14,
++    className: 'hierici-map-popup',
++  })
++    .setLngLat(lngLat)
++    .setDOMContent(popupEl)
++    .addTo(map)
++
++  newPopup.on('close', () => {
++    // Si cette popup était bien la popup active courante, on réinitialise l'état
++    if (activePopup === newPopup) {
++      closeDrawer({ updateUrl: true, pushHistory: true })
++    }
++  })
++
++  activePopup = newPopup
++}
++
++/**
++ * Sélectionne une photo par son identifiant : met à jour le marqueur actif,
++ * le cône de vue, l'infobulle, le volet détaillé et l'URL (?photo=uuid)
++ */
++async function selectPhotoById(
++  id: string,
++  options: { flyTo?: boolean; updateUrl?: boolean; pushHistory?: boolean } = {}
++) {
++  const { flyTo = true, updateUrl = true, pushHistory = true } = options
++  selectedPhotoId.value = id
++
++  // 1. Recherche dans les entités déjà chargées
++  let feature = photosData.value?.features.find((f) => f.properties.id === id)
++
++  // 2. Si absente (ex: accès direct via URL avec filtres ou hors emprise), tentative de récupération API
++  if (!feature) {
++    try {
++      const photo = await photoApi.getPublicPhoto(id)
++      // Garde anti race-condition si une autre photo a été sélectionnée entre-temps ou démontage
++      if (selectedPhotoId.value !== id || !isMounted) return
++
++      if (photo && photo.latitude != null && photo.longitude != null) {
++        feature = {
++          type: 'Feature',
++          id: photo.id,
++          geometry: {
++            type: 'Point',
++            coordinates: [photo.longitude, photo.latitude],
++          },
++          properties: {
++            id: photo.id,
++            title: photo.title,
++            description: photo.description,
++            photographer: photo.photographer,
++            year_taken: photo.year_taken ?? photo.year,
++            date_exact: photo.date_exact,
++            period_label: photo.period_label,
++            archive_source: photo.archive_source,
++            archive_ref: photo.archive_ref ?? photo.archive_reference,
++            original_source_url: photo.original_source_url ?? photo.source_url,
++            license: photo.license,
++            bearing: photo.bearing,
++            field_of_view: photo.field_of_view ?? 60,
++            image_thumb_url: photo.image_thumb_url ?? photo.thumb_url,
++            image_display_url: photo.image_display_url ?? photo.display_url,
++            image_original_url: photo.image_original_url ?? photo.original_url,
++            created_at: photo.created_at,
++            updated_at: photo.updated_at,
++          },
++        }
++      }
++    } catch {
++      if (selectedPhotoId.value !== id || !isMounted) return
++      showNotFoundToast('Photographie introuvable ou non publiée.')
++      closeDrawer({ updateUrl: true, pushHistory: false })
++      resetTerritoryView()
++      return
++    }
++  }
++
++  if (selectedPhotoId.value !== id || !isMounted) return
++
++  if (!feature) {
++    showNotFoundToast('Photographie introuvable ou non publiée.')
++    closeDrawer({ updateUrl: true, pushHistory: false })
++    resetTerritoryView()
++    return
++  }
++
++  activePhotoFeature.value = feature
++  isDrawerOpen.value = true
++
++  const coords = feature.geometry.coordinates
++
++  if (map && map.isStyleLoaded()) {
++    updateViewCone(feature)
++    showPhotoPopup(feature, coords)
++    if (flyTo) {
++      map.flyTo({
++        center: coords,
++        zoom: Math.max(map.getZoom(), 15),
++        duration: 800,
++        essential: true,
++      })
++    }
++  }
++
++  if (updateUrl) {
++    setUrlPhotoId(id, pushHistory)
++  }
++
++  emit('select-photo', id, feature)
++}
++
++/**
++ * Ferme le volet détaillé et la lightbox, retire le paramètre ?photo de l'URL
++ */
++function closeDrawer(options: { updateUrl?: boolean; pushHistory?: boolean } = {}) {
++  const { updateUrl = true, pushHistory = false } = options
++  isDrawerOpen.value = false
++  isLightboxOpen.value = false
++  selectedPhotoId.value = null
++  activePhotoFeature.value = null
++  updateViewCone(null)
++
++  if (activePopup) {
++    const old = activePopup
++    activePopup = null
++    old.remove()
++  }
++
++  if (updateUrl) {
++    setUrlPhotoId(null, pushHistory)
++  }
++}
++
++function handleCenterMap(coords: [number, number]) {
++  if (!map) return
++  map.flyTo({
++    center: coords,
++    zoom: Math.max(map.getZoom(), 15),
++    duration: 600,
++    essential: true,
++  })
++}
++
++function handlePopState() {
++  const photoId = getUrlPhotoId(window.location.search)
++  if (photoId) {
++    if (selectedPhotoId.value !== photoId) {
++      selectPhotoById(photoId, { flyTo: true, updateUrl: false })
++    }
++  } else {
++    if (selectedPhotoId.value || isDrawerOpen.value) {
++      closeDrawer({ updateUrl: false })
++    }
++  }
++}
++
++/**
++ * Initialise l'instance MapLibre GL et les couches vectorielles de clustering et d'azimut
++ */
++function initMap() {
++  if (!mapContainer.value || !isMounted) return
++
++  map = new maplibregl.Map({
++    container: mapContainer.value,
++    style: mapStyle,
++    center: props.territoryCenter,
++    zoom: props.defaultZoom,
++    maxZoom: 18,
++    minZoom: 4,
++    attributionControl: false,
++  })
++
++  // Contrôles de navigation et attribution
++  map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right')
++  map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
++
++  map.on('load', () => {
++    if (!map || !isMounted) return
++
++    // Enregistrement des icônes vectorielles personnalisées (avec et sans flèche d'orientation)
++    map.addImage('marker-oriented', createOrientedMarkerImage(true), { pixelRatio: 2 })
++    map.addImage('marker-neutral', createOrientedMarkerImage(false), { pixelRatio: 2 })
++
++    // 1. Source et couches du cône de vue vectoriel WebGL (Story 3.2)
++    // Placée en-dessous des marqueurs pour une lisibilité optimale
++    map.addSource('view-cone-source', {
++      type: 'geojson',
++      data: createEmptyFeatureCollection(),
++    })
++
++    map.addLayer({
++      id: 'view-cone-fill',
++      type: 'fill',
++      source: 'view-cone-source',
++      paint: {
++        'fill-color': '#0284c7',
++        'fill-opacity': 0.28,
++      },
++    })
++
++    map.addLayer({
++      id: 'view-cone-stroke',
++      type: 'line',
++      source: 'view-cone-source',
++      paint: {
++        'line-color': '#0284c7',
++        'line-width': 2,
++        'line-opacity': 0.85,
++        'line-dasharray': [2, 2],
++      },
++    })
++
++    // 2. Source GeoJSON des photos avec clustering activé côté client
++    map.addSource('photos', {
++      type: 'geojson',
++      data: (photosData.value as any) || { type: 'FeatureCollection', features: [] },
++      cluster: true,
++      clusterMaxZoom: 14, // Au-delà du zoom 14, les points individuels sont toujours affichés
++      clusterRadius: 50,  // Rayon de regroupement en pixels
++    })
++
++    // 3. Couche des cercles de clusters (taille et palette selon densité)
++    map.addLayer({
++      id: 'clusters',
++      type: 'circle',
++      source: 'photos',
++      filter: ['has', 'point_count'],
++      paint: {
++        'circle-color': [
++          'step',
++          ['get', 'point_count'],
++          '#0284c7', // < 10 clichés : sky-600
++          10,
++          '#0d9488', // 10 - 24 : teal-600
++          25,
++          '#d97706', // 25 - 49 : amber-600
++          50,
++          '#e11d48', // >= 50 : rose-600
++        ],
++        'circle-radius': [
++          'step',
++          ['get', 'point_count'],
++          18,
++          10,
++          24,
++          25,
++          30,
++          50,
++          36,
++        ],
++        'circle-stroke-width': 3,
++        'circle-stroke-color': '#ffffff',
++        'circle-opacity': 0.92,
++      },
++    })
++
++    // 4. Couche du décompte textuel à l'intérieur du cercle cluster
++    map.addLayer({
++      id: 'cluster-count',
++      type: 'symbol',
++      source: 'photos',
++      filter: ['has', 'point_count'],
++      layout: {
++        'text-field': '{point_count_abbreviated}',
++        'text-size': 13,
++      },
++      paint: {
++        'text-color': '#ffffff',
++      },
++    })
++
++    // 5. Couche des clichés individuels orientés (Story 3.2 : rotation dynamique selon l'azimut)
++    map.addLayer({
++      id: 'unclustered-oriented',
++      type: 'symbol',
++      source: 'photos',
++      filter: ['all', ['!', ['has', 'point_count']], ['!=', ['get', 'bearing'], null]] as any,
++      layout: {
++        'icon-image': 'marker-oriented',
++        'icon-size': 0.75,
++        'icon-rotate': ['get', 'bearing'],
++        'icon-rotation-alignment': 'map',
++        'icon-allow-overlap': true,
++        'icon-ignore-placement': true,
++      },
++    })
++
++    // 6. Couche des clichés individuels neutres (sans azimut renseigné)
++    map.addLayer({
++      id: 'unclustered-neutral',
++      type: 'symbol',
++      source: 'photos',
++      filter: ['all', ['!', ['has', 'point_count']], ['==', ['get', 'bearing'], null]] as any,
++      layout: {
++        'icon-image': 'marker-neutral',
++        'icon-size': 0.75,
++        'icon-allow-overlap': true,
++        'icon-ignore-placement': true,
++      },
++    })
++
++    // Clic sur un cluster : zoom automatique fluide pour éclater le groupe
++    map.on('click', 'clusters', async (e) => {
++      if (!map) return
++      const features = map.queryRenderedFeatures(e.point, { layers: ['clusters'] })
++      const clusterId = features[0]?.properties?.cluster_id
++      if (clusterId === undefined) return
++
++      const source = map.getSource('photos') as maplibregl.GeoJSONSource
++      try {
++        const expansionZoom = await source.getClusterExpansionZoom(clusterId)
++        const coords = (features[0].geometry as any).coordinates.slice()
++
++        // Gestion du cas où les clichés partagent exactement les mêmes coordonnées GPS
++        const currentZoom = map.getZoom()
++        if (expansionZoom <= currentZoom || currentZoom >= 17) {
++          map.easeTo({
++            center: coords,
++            zoom: Math.min(currentZoom + 1, 18),
++            duration: 400,
++          })
++        } else {
++          map.easeTo({
++            center: coords,
++            zoom: Math.min(expansionZoom, 17),
++            duration: 500,
++          })
++        }
++      } catch (err) {
++        console.warn('Impossible de calculer le zoom de cluster:', err)
++      }
++    })
++
++    // Gestion du clic sur un cliché individuel (orienté ou neutre)
++    const handlePhotoClick = (e: maplibregl.MapMouseEvent) => {
++      if (!map) return
++      const features = map.queryRenderedFeatures(e.point, {
++        layers: ['unclustered-oriented', 'unclustered-neutral'],
++      })
++      const feature = features[0]
++      const featureId = feature?.properties?.id
++      if (!featureId) return
++
++      selectPhotoById(featureId, { flyTo: false, updateUrl: true, pushHistory: true })
++    }
++
++    map.on('click', 'unclustered-oriented', handlePhotoClick)
++    map.on('click', 'unclustered-neutral', handlePhotoClick)
++
++    // Gestion du survol dynamique : réactif même entre clichés contigus (Story 3.2 / ISSUE-02)
++    const handlePhotoMouseMove = (e: maplibregl.MapMouseEvent) => {
++      if (!map) return
++      const features = map.queryRenderedFeatures(e.point, {
++        layers: ['unclustered-oriented', 'unclustered-neutral'],
++      })
++      const featureId = features[0]?.properties?.id
++      if (featureId) {
++        map.getCanvas().style.cursor = 'pointer'
++        if (featureId !== currentHoveredPhotoId) {
++          currentHoveredPhotoId = featureId
++          const fullFeature = photosData.value?.features.find((f) => f.properties.id === featureId)
++          if (fullFeature) {
++            updateViewCone(fullFeature)
++          }
++        }
++      }
++    }
++
++    const handlePhotoMouseLeave = () => {
++      if (!map) return
++      map.getCanvas().style.cursor = ''
++      currentHoveredPhotoId = null
++      updateViewCone(null)
++    }
++
++    map.on('mousemove', 'unclustered-oriented', handlePhotoMouseMove)
++    map.on('mouseleave', 'unclustered-oriented', handlePhotoMouseLeave)
++    map.on('mousemove', 'unclustered-neutral', handlePhotoMouseMove)
++    map.on('mouseleave', 'unclustered-neutral', handlePhotoMouseLeave)
++
++    map.on('mouseenter', 'clusters', () => {
++      if (map) map.getCanvas().style.cursor = 'pointer'
++    })
++    map.on('mouseleave', 'clusters', () => {
++      if (map) map.getCanvas().style.cursor = ''
++    })
++
++    // Traitement du paramètre URL initial (?photo=uuid) dès le chargement complet de la carte
++    const initialPhotoId = pendingInitialPhotoId || getUrlPhotoId()
++    if (initialPhotoId) {
++      selectPhotoById(initialPhotoId, { flyTo: true, updateUrl: false })
++      pendingInitialPhotoId = null
++    }
++  })
++
++  // Surveillance des redimensionnements de fenêtre et de conteneur
++  resizeObserver = new ResizeObserver(() => {
++    map?.resize()
++  })
++  resizeObserver.observe(mapContainer.value)
++}
++
++/**
++ * Recentre la vue sur l'emprise du territoire
++ */
++function resetTerritoryView() {
++  if (!map) return
++  map.flyTo({
++    center: props.territoryCenter,
++    zoom: props.defaultZoom,
++    essential: true,
++  })
++}
++
++// Surveillance des changements de filtres avec debounce
++let searchTimer: ReturnType<typeof setTimeout> | null = null
++watch([searchQuery, filterYearMin, filterYearMax], () => {
++  if (searchTimer) clearTimeout(searchTimer)
++  searchTimer = setTimeout(() => {
++    loadGeoJsonData()
++  }, 300)
++})
++
++// Surveillance du changement de territoire actif
++watch(
++  () => props.territoryCenter,
++  (newCenter) => {
++    if (map && newCenter) {
++      map.flyTo({
++        center: newCenter,
++        zoom: props.defaultZoom,
++      })
++      loadGeoJsonData()
++    }
++  }
++)
++
++onMounted(async () => {
++  isMounted = true
++  pendingInitialPhotoId = getUrlPhotoId()
++  window.addEventListener('popstate', handlePopState)
++
++  await loadGeoJsonData()
++  if (isMounted) {
++    initMap()
++  }
++})
++
++onUnmounted(() => {
++  isMounted = false
++  window.removeEventListener('popstate', handlePopState)
++
++  if (toastTimer) {
++    clearTimeout(toastTimer)
++    toastTimer = null
++  }
++  if (searchTimer) {
++    clearTimeout(searchTimer)
++    searchTimer = null
++  }
++  if (currentAbortController) {
++    currentAbortController.abort()
++    currentAbortController = null
++  }
++  if (activePopup) {
++    activePopup.remove()
++    activePopup = null
++  }
++  if (resizeObserver) {
++    resizeObserver.disconnect()
++    resizeObserver = null
++  }
++  if (map) {
++    map.remove()
++    map = null
++  }
++})
++
++defineExpose({
++  resize: () => map?.resize(),
++  resetView: resetTerritoryView,
++  refresh: loadGeoJsonData,
++  selectPhoto: (photoId: string) => {
++    selectPhotoById(photoId, { flyTo: true, updateUrl: true, pushHistory: true })
++  },
++  closePhoto: () => {
++    closeDrawer({ updateUrl: true, pushHistory: true })
++  },
++})
++</script>
++
++<template>
++  <div class="relative w-full h-[calc(100vh-140px)] min-h-[500px] flex flex-col rounded-2xl overflow-hidden border border-slate-800 bg-slate-950 shadow-2xl">
++    <!-- Barre Supérieure d'Exploration & Filtres -->
++    <div class="absolute top-4 left-4 right-4 z-10 flex flex-wrap items-center justify-between gap-3 pointer-events-none">
++      <!-- Groupe Filtres & Recherche -->
++      <div class="flex flex-wrap items-center gap-2 pointer-events-auto bg-slate-900/90 backdrop-blur-md p-2 rounded-xl border border-slate-700/80 shadow-xl text-xs">
++        <!-- Recherche textuelle -->
++        <div class="relative flex items-center">
++          <span class="absolute left-2.5 text-slate-400">🔍</span>
++          <input
++            v-model="searchQuery"
++            type="text"
++            placeholder="Rechercher un monument, auteur..."
++            class="pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 w-52 sm:w-64 transition-colors"
++          />
++          <button
++            v-if="searchQuery"
++            type="button"
++            class="absolute right-2 text-slate-400 hover:text-white"
++            @click="searchQuery = ''"
++          >
++            ✕
++          </button>
++        </div>
++
++        <!-- Filtre Période / Année -->
++        <div class="hidden sm:flex items-center gap-1.5 pl-2 border-l border-slate-700/80 text-slate-300">
++          <span>Année :</span>
++          <input
++            v-model.number="filterYearMin"
++            type="number"
++            placeholder="Min"
++            class="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 text-center"
++          />
++          <span class="text-slate-500">-</span>
++          <input
++            v-model.number="filterYearMax"
++            type="number"
++            placeholder="Max"
++            class="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 text-center"
++          />
++        </div>
++
++        <!-- Bouton Reset Filtres si actifs -->
++        <button
++          v-if="searchQuery || filterYearMin !== undefined || filterYearMax !== undefined"
++          type="button"
++          class="px-2 py-1.5 text-sky-400 hover:text-sky-300 font-semibold"
++          @click="searchQuery = ''; filterYearMin = undefined; filterYearMax = undefined"
++        >
++          Effacer
++        </button>
++      </div>
++
++      <!-- Badge Décompte & Recentrage -->
++      <div class="flex items-center gap-2 pointer-events-auto bg-slate-900/90 backdrop-blur-md px-3 py-2 rounded-xl border border-slate-700/80 shadow-xl text-xs">
++        <span class="flex items-center gap-1.5 font-semibold text-slate-200">
++          <span
++            class="w-2 h-2 rounded-full"
++            :class="totalPublishedCount > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"
++          ></span>
++          <span>{{ totalPublishedCount }} photo{{ totalPublishedCount > 1 ? 's' : '' }}</span>
++        </span>
++
++        <button
++          type="button"
++          class="ml-2 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg border border-slate-600/80 transition-colors flex items-center gap-1"
++          title="Recentrer sur le territoire"
++          @click="resetTerritoryView"
++        >
++          <span>🎯</span>
++          <span class="hidden md:inline">{{ territoryName }}</span>
++        </button>
++      </div>
++    </div>
++
++    <!-- Conteneur Cartographique MapLibre GL -->
++    <div ref="mapContainer" class="flex-1 w-full h-full relative z-0"></div>
++
++    <!-- État Vide lorsque aucun résultat ne correspond aux filtres -->
++    <div
++      v-if="!loading && totalPublishedCount === 0"
++      class="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 px-4 py-2.5 rounded-xl bg-slate-900/95 border border-slate-700/80 text-xs text-slate-300 shadow-xl flex items-center gap-3"
++    >
++      <span>🔎 Aucune photographie publiée ne correspond aux critères de recherche.</span>
++      <button
++        v-if="searchQuery || filterYearMin !== undefined || filterYearMax !== undefined"
++        type="button"
++        class="px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px]"
++        @click="searchQuery = ''; filterYearMin = undefined; filterYearMax = undefined"
++      >
++        Réinitialiser les filtres
++      </button>
++    </div>
++
++    <!-- Indicateur de Chargement -->
++    <div
++      v-if="loading"
++      class="absolute bottom-6 left-6 z-20 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-700 text-xs text-sky-400 shadow-lg"
++    >
++      <svg class="animate-spin w-4 h-4 text-sky-400" viewBox="0 0 24 24" fill="none">
++        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
++        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
++      </svg>
++      <span>Actualisation des photographies...</span>
++    </div>
++
++    <!-- Message d'Erreur -->
++    <div
++      v-if="error"
++      class="absolute bottom-6 left-6 right-6 z-20 p-3 rounded-xl bg-rose-950/90 border border-rose-800 text-xs text-rose-300 shadow-xl flex items-center justify-between"
++    >
++      <span>⚠️ {{ error }}</span>
++      <button
++        type="button"
++        class="px-2 py-1 bg-rose-800 hover:bg-rose-700 text-white rounded font-medium"
++        @click="loadGeoJsonData"
++      >
++        Réessayer
++      </button>
++    </div>
++
++    <!-- Toast Notification Photo introuvable -->
++    <div
++      v-if="notFoundToast"
++      class="absolute top-20 left-1/2 -translate-x-1/2 z-40 px-4 py-2.5 rounded-xl bg-slate-900/95 border border-amber-500/60 text-xs text-amber-200 shadow-2xl flex items-center gap-2"
++    >
++      <span>⚠️</span>
++      <span>{{ notFoundToast }}</span>
++      <button
++        type="button"
++        class="ml-2 text-slate-400 hover:text-white"
++        @click="notFoundToast = null"
++      >
++        ✕
++      </button>
++    </div>
++
++    <!-- Volet Détaillé Contextuel (Story 3.3) -->
++    <PhotoDetailDrawer
++      :is-open="isDrawerOpen"
++      :is-lightbox-open="isLightboxOpen"
++      :photo="activePhotoFeature?.properties ?? null"
++      :coordinates="activePhotoFeature?.geometry.coordinates ?? null"
++      @close="closeDrawer"
++      @open-lightbox="isLightboxOpen = true"
++      @center-map="handleCenterMap"
++    />
++
++    <!-- Visionneuse Plein Écran Haute Définition (Story 3.3) -->
++    <PhotoLightbox
++      :is-open="isLightboxOpen"
++      :image-url="lightboxImageUrl"
++      :title="activePhotoFeature?.properties.title ?? ''"
++      :photographer="activePhotoFeature?.properties.photographer"
++      :year="activePhotoFeature?.properties.year_taken"
++      :period-label="activePhotoFeature?.properties.period_label"
++      :archive-source="activePhotoFeature?.properties.archive_source"
++      :archive-ref="activePhotoFeature?.properties.archive_ref"
++      :license="activePhotoFeature?.properties.license"
++      @close="isLightboxOpen = false"
++    />
++  </div>
++</template>
++
++<style scoped>
++:deep(.maplibregl-ctrl-group) {
++  background-color: rgb(15 23 42 / 0.9) !important;
++  border: 1px solid rgb(51 65 85) !important;
++  border-radius: 0.75rem !important;
++  overflow: hidden;
++  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3) !important;
++}
++
++:deep(.maplibregl-ctrl-group button) {
++  border-bottom: 1px solid rgb(51 65 85) !important;
++}
++
++:deep(.maplibregl-ctrl-group button:last-child) {
++  border-bottom: none !important;
++}
++
++:deep(.maplibregl-ctrl-group button:hover) {
++  background-color: rgb(30 41 59) !important;
++}
++
++:deep(.maplibregl-ctrl-icon) {
++  filter: invert(1);
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-content) {
++  background-color: rgb(15 23 42 / 0.96) !important;
++  border: 1px solid rgb(51 65 85) !important;
++  border-radius: 1rem !important;
++  padding: 0.5rem !important;
++  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.5) !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-tip) {
++  border-top-color: rgb(15 23 42 / 0.96) !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-close-button) {
++  color: rgb(148 163 184) !important;
++  padding: 4px 8px !important;
++  font-size: 16px !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-close-button:hover) {
++  color: white !important;
++  background: transparent !important;
++}
++</style>
+--- /dev/null
++++ b/frontend/src/App.vue
+@@ -0,0 +1,293 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted } from 'vue'
++import { photoApi, setAuthToken, hasAuthToken } from './services/api'
++import PhotoAdminCatalog from './components/admin/PhotoAdminCatalog.vue'
++import PublicMapViewer from './components/public/PublicMapViewer.vue'
++
++const currentTab = ref<'decouverte' | 'studio'>('studio')
++
++const apiHealth = ref<{ status: string; database: string } | null>(null)
++const territory = ref<{ slug: string; name: string; center_lat: number; center_lng: number; default_zoom: number } | null>(null)
++const currentUser = ref<{ email: string; full_name?: string; role: string } | null>(null)
++const loading = ref(true)
++const error = ref<string | null>(null)
++
++// Modal de connexion
++const isLoginModalOpen = ref(false)
++const loginEmail = ref('admin@hierici.local')
++const loginPassword = ref('admin_hierici_2026')
++const loginError = ref<string | null>(null)
++const isLoggingIn = ref(false)
++
++async function authenticate() {
++  try {
++    if (hasAuthToken()) {
++      try {
++        currentUser.value = await photoApi.getMe()
++        return
++      } catch {
++        setAuthToken(null)
++      }
++    }
++
++    // Tentative d'auto-authentification avec le compte de développement local
++    const loginRes = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = loginRes.user
++  } catch (err: any) {
++    console.warn('Authentification requise pour le Studio:', err.message)
++  }
++}
++
++async function handleManualLogin() {
++  loginError.value = null
++  isLoggingIn.value = true
++
++  try {
++    const res = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = res.user
++    isLoginModalOpen.value = false
++  } catch (err: any) {
++    loginError.value = err.message || 'Identifiants invalides'
++  } finally {
++    isLoggingIn.value = false
++  }
++}
++
++function handleLogout() {
++  setAuthToken(null)
++  currentUser.value = null
++}
++
++function checkUrlForPhotoTab() {
++  const urlParams = new URLSearchParams(window.location.search)
++  if (urlParams.has('photo') && urlParams.get('photo')) {
++    currentTab.value = 'decouverte'
++  }
++}
++
++onMounted(async () => {
++  checkUrlForPhotoTab()
++  window.addEventListener('popstate', checkUrlForPhotoTab)
++
++  try {
++    const [healthRes, territoryRes] = await Promise.all([
++      photoApi.getHealth().catch(() => null),
++      photoApi.getCurrentTerritory().catch(() => null),
++    ])
++
++    if (healthRes) apiHealth.value = healthRes
++    if (territoryRes) territory.value = territoryRes
++
++    // Connexion automatique initiale pour le studio
++    await authenticate()
++  } catch (e: any) {
++    error.value = "Impossible de contacter l'API backend"
++  } finally {
++    loading.value = false
++  }
++})
++
++onUnmounted(() => {
++  window.removeEventListener('popstate', checkUrlForPhotoTab)
++})
++</script>
++
++<template>
++  <main class="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500 selection:text-white">
++    <!-- En-tête Global -->
++    <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur-md sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg">
++      <div class="flex items-center space-x-6">
++        <div class="flex items-center space-x-3 cursor-pointer" @click="currentTab = 'studio'">
++          <span class="text-2xl drop-shadow">🧭</span>
++          <div>
++            <h1 class="text-lg font-black tracking-tight text-white flex items-center gap-2">
++              <span>HierIci</span>
++              <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
++                Studio 2.0
++              </span>
++            </h1>
++            <p class="text-[11px] text-slate-400">Patrimoine géohistorique & archives territoriales</p>
++          </div>
++        </div>
++
++        <!-- Onglets de Navigation Principale -->
++        <nav class="hidden md:flex items-center space-x-1 bg-slate-950/70 p-1 rounded-xl border border-slate-800 text-xs">
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'studio' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'studio'"
++          >
++            <span>🗂️</span>
++            <span>Studio Admin</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'decouverte'"
++          >
++            <span>🗺️</span>
++            <span>Découverte Publique</span>
++          </button>
++        </nav>
++      </div>
++
++      <!-- Informations de session & statut -->
++      <div class="flex items-center space-x-3 text-xs">
++        <!-- Badge Territoire -->
++        <span
++          v-if="territory"
++          class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-medium bg-slate-800/80 text-slate-300 border border-slate-700"
++          :title="`Centre : ${territory.center_lat.toFixed(4)}, ${territory.center_lng.toFixed(4)}`"
++        >
++          📍 {{ territory.name }}
++        </span>
++
++        <!-- Badge Santé API -->
++        <span
++          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium"
++          :class="apiHealth?.database === 'connected' ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800' : 'bg-amber-950/80 text-amber-400 border border-amber-800'"
++        >
++          <span class="w-1.5 h-1.5 rounded-full" :class="apiHealth?.database === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
++          {{ apiHealth?.database === 'connected' ? 'API Connectée' : 'Connexion...' }}
++        </span>
++
++        <!-- Utilisateur connecté -->
++        <div v-if="currentUser" class="flex items-center gap-2 pl-2 border-l border-slate-800">
++          <div class="hidden lg:block text-right">
++            <div class="text-[11px] font-semibold text-white leading-tight">
++              {{ currentUser.full_name || currentUser.email }}
++            </div>
++            <div class="text-[10px] text-slate-400 capitalize">
++              {{ currentUser.role }}
++            </div>
++          </div>
++          <button
++            type="button"
++            class="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++            title="Se déconnecter"
++            @click="handleLogout"
++          >
++            🚪
++          </button>
++        </div>
++        <button
++          v-else
++          type="button"
++          class="px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg font-medium transition-colors"
++          @click="isLoginModalOpen = true"
++        >
++          Connexion
++        </button>
++      </div>
++    </header>
++
++    <!-- Navigation mobile sous l'en-tête -->
++    <div class="md:hidden border-b border-slate-800 bg-slate-900 px-6 py-2 flex items-center justify-center space-x-2 text-xs">
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'studio' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'studio'"
++      >
++        🗂️ Studio Admin
++      </button>
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'decouverte'"
++      >
++        🗺️ Découverte
++      </button>
++    </div>
++
++    <!-- Contenu Principal -->
++    <div :class="currentTab === 'decouverte' ? 'flex-1 w-full px-4 sm:px-6 py-4' : 'flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8'">
++      <!-- VUE STUDIO ADMIN (Story 2.3) -->
++      <section v-if="currentTab === 'studio'" class="space-y-6">
++        <PhotoAdminCatalog />
++      </section>
++
++      <!-- VUE DÉCOUVERTE PUBLIQUE (Story 3.1) -->
++      <section v-else-if="currentTab === 'decouverte'" class="w-full">
++        <PublicMapViewer
++          :territory-center="territory ? [territory.center_lng, territory.center_lat] : [5.93, 43.12]"
++          :default-zoom="territory?.default_zoom ?? 13"
++          :territory-name="territory?.name ?? 'Territoire'"
++          @select-photo="(id) => console.log('Photo sélectionnée:', id)"
++        />
++      </section>
++    </div>
++
++    <!-- Modale de connexion manuelle -->
++    <div
++      v-if="isLoginModalOpen"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isLoginModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4">
++        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
++          <h3 class="text-base font-bold text-white">Connexion au Studio</h3>
++          <button
++            type="button"
++            class="text-slate-400 hover:text-white"
++            @click="isLoginModalOpen = false"
++          >
++            ✕
++          </button>
++        </div>
++
++        <div v-if="loginError" class="p-2.5 rounded-lg bg-rose-950/80 border border-rose-800 text-xs text-rose-300">
++          {{ loginError }}
++        </div>
++
++        <form class="space-y-4" @submit.prevent="handleManualLogin">
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Email</label>
++            <input
++              v-model="loginEmail"
++              type="email"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Mot de passe</label>
++            <input
++              v-model="loginPassword"
++              type="password"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div class="flex items-center justify-end gap-2 pt-2">
++            <button
++              type="button"
++              class="px-3 py-1.5 text-xs text-slate-400 hover:text-white"
++              @click="isLoginModalOpen = false"
++            >
++              Annuler
++            </button>
++            <button
++              type="submit"
++              class="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-md flex items-center gap-1.5"
++              :disabled="isLoggingIn"
++            >
++              <span v-if="isLoggingIn" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++              <span>Connexion</span>
++            </button>
++          </div>
++        </form>
++      </div>
++    </div>
++
++    <!-- Pied de page -->
++    <footer class="border-t border-slate-800/80 bg-slate-950 px-6 py-4 text-center text-xs text-slate-500">
++      HierIci — Studio d'Administration & Métadonnées d'Archives (Story 2.3)
++    </footer>
++  </main>
++</template>
+--- /dev/null
++++ b/frontend/tests/photo_viewer_logic.test.mjs
+@@ -0,0 +1,117 @@
++import assert from 'node:assert/strict'
++import { test, describe } from 'node:test'
++import {
++  getUrlPhotoId,
++  computePhotoUrl,
++  clampZoom,
++  calculateZoomToCursor,
++  resolveDisplayImageUrl,
++  resolveLightboxImageUrl,
++} from '../src/utils/photoViewer.ts'
++
++describe('Story 3.3 - Deep Linking & URL Synchronization Logic', () => {
++  test('Extrait correctement le photoId depuis les paramètres de recherche', () => {
++    const search = '?photo=018f3a5b-9d4e-7b3f-8c2a-9e1d5a7b3c2d&tab=decouverte'
++    const photoId = getUrlPhotoId(search)
++    assert.equal(photoId, '018f3a5b-9d4e-7b3f-8c2a-9e1d5a7b3c2d')
++  })
++
++  test('Retourne null si aucun paramètre photo n\'est présent', () => {
++    const search = '?tab=decouverte'
++    const photoId = getUrlPhotoId(search)
++    assert.equal(photoId, null)
++  })
++
++  test('Ajoute le paramètre ?photo tout en conservant les autres paramètres', () => {
++    const current = 'https://hierici.local/explore?territory=toulon'
++    const updated = computePhotoUrl(current, 'uuid-456')
++    assert.equal(updated, '/explore?territory=toulon&photo=uuid-456')
++  })
++
++  test('Retire le paramètre ?photo lors de la fermeture', () => {
++    const current = 'https://hierici.local/explore?territory=toulon&photo=uuid-456'
++    const updated = computePhotoUrl(current, null)
++    assert.equal(updated, '/explore?territory=toulon')
++  })
++
++  test('Retire complètement le query string si ?photo était le seul paramètre', () => {
++    const current = 'https://hierici.local/?photo=uuid-456'
++    const updated = computePhotoUrl(current, null)
++    assert.equal(updated, '/')
++  })
++})
++
++describe('Story 3.3 - Lightbox Zoom & Pan Math', () => {
++  test('Le zoom reste contraint dans les bornes autorisées [0.5, 6.0]', () => {
++    assert.equal(clampZoom(0.1), 0.5)
++    assert.equal(clampZoom(10.0), 6.0)
++    assert.equal(clampZoom(2.5), 2.5)
++  })
++
++  test('Le zoom centré maintient le point visé sous le curseur', () => {
++    // Curseur à x=100, y=50 par rapport au centre, zoom initial 1.0, pan 0,0
++    const zoomIn = calculateZoomToCursor(1.0, 2.0, 100, 50, 0, 0)
++    assert.equal(zoomIn.zoom, 2.0)
++    // À 2x, pour que le point sous la souris reste à x=100 :
++    // 100 - (100 - 0)*2 = -100
++    assert.equal(zoomIn.panX, -100)
++    assert.equal(zoomIn.panY, -50)
++
++    // Dézoom inverse pour revenir au centre
++    const zoomOut = calculateZoomToCursor(zoomIn.zoom, 0.5, 100, 50, zoomIn.panX, zoomIn.panY)
++    assert.equal(zoomOut.zoom, 1.0)
++    assert.equal(zoomOut.panX, 0)
++    assert.equal(zoomOut.panY, 0)
++  })
++
++  test('Double-clic bascule entre 1x et 2.5x', () => {
++    function toggleDoubleClick(currentZoom) {
++      return currentZoom > 1.1 ? 1.0 : 2.5
++    }
++    assert.equal(toggleDoubleClick(1.0), 2.5)
++    assert.equal(toggleDoubleClick(2.5), 1.0)
++    assert.equal(toggleDoubleClick(4.0), 1.0)
++  })
++})
++
++describe('Story 3.3 - Patrimonial Metadata & Resolution Fallbacks', () => {
++  test('Résolution de l\'image d\'affichage : display en priorité, fallback sur thumb', () => {
++    const photoWithDisplay = {
++      image_display_url: '/media/display.webp',
++      image_thumb_url: '/media/thumb.webp',
++    }
++    assert.equal(resolveDisplayImageUrl(photoWithDisplay), '/media/display.webp')
++
++    const photoWithoutDisplay = {
++      image_thumb_url: '/media/thumb.webp',
++    }
++    assert.equal(resolveDisplayImageUrl(photoWithoutDisplay), '/media/thumb.webp')
++  })
++
++  test('Résolution de la visionneuse HD : original en priorité, fallback sur display', () => {
++    const photoComplete = {
++      image_original_url: '/media/original.jpg',
++      image_display_url: '/media/display.webp',
++    }
++    assert.equal(resolveLightboxImageUrl(photoComplete), '/media/original.jpg')
++
++    const photoWithoutOriginal = {
++      image_display_url: '/media/display.webp',
++      image_thumb_url: '/media/thumb.webp',
++    }
++    assert.equal(resolveLightboxImageUrl(photoWithoutOriginal), '/media/display.webp')
++  })
++
++  test('Aucun identifiant sensible ni chemin brut de fichier n\'est requis dans la vue', () => {
++    const publicPhotoProps = {
++      id: 'uuid-public',
++      title: 'Port de Toulon 1905',
++      archive_source: 'Archives Municipales',
++      archive_ref: '41Fi12',
++      license: 'Domaine Public',
++    }
++    assert.equal(publicPhotoProps.author_user_id, undefined)
++    assert.equal(publicPhotoProps.file_original_path, undefined)
++    assert.equal(publicPhotoProps.license, 'Domaine Public')
++  })
++})

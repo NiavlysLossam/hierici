@@ -1,0 +1,1967 @@
+diff --git a/backend/app/api/v1/admin/photos.py b/backend/app/api/v1/admin/photos.py
+new file mode 100644
+index 0000000..ea1a339
+--- /dev/null
++++ b/backend/app/api/v1/admin/photos.py
+@@ -0,0 +1,624 @@
++import logging
++import math
++import uuid
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Annotated
++from fastapi import (
++    APIRouter,
++    Depends,
++    HTTPException,
++    Query,
++    Response,
++    status,
++    UploadFile,
++    File,
++    Form,
++)
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from geoalchemy2.elements import WKTElement
++
++from app.core.database import get_db
++from app.core.auth import get_current_active_user
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.schemas.photo import (
++    PhotoCreate,
++    PhotoUpdate,
++    PhotoRead,
++    PhotoListResponse,
++    PhotoUploadResponse,
++)
++from app.services.storage import get_storage_driver, StorageDriver
++from app.services.image_service import (
++    ImageService,
++    get_image_service,
++    FileTooLargeError,
++    InvalidImageFormatError,
++)
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/admin/photos", tags=["Administration Photos"])
++
++
++async def _purge_media_files(storage: StorageDriver, paths: list[str | None]) -> None:
++    """Nettoie physiquement les fichiers médias associés via le StorageDriver."""
++    for path in paths:
++        if path:
++            try:
++                await storage.delete(path)
++                logger.info(f"Fichier média purgé : {path}")
++            except Exception as e:
++                logger.warning(f"Erreur lors de la purge du média '{path}': {e}")
++
++
++async def _read_upload_file(file: UploadFile, max_size: int = 25 * 1024 * 1024) -> bytes:
++    """Lit le contenu du fichier téléversé et vérifie la taille limite de 25 Mo."""
++    if file.size is not None and file.size > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++
++    content = await file.read(max_size + 1)
++    if len(content) > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++    return content
++
++
++@router.post(
++    "",
++    response_model=PhotoRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Créer une nouvelle fiche photo historique",
++)
++async def create_photo(
++    photo_in: PhotoCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Crée une nouvelle fiche photo rattachée au territoire du contributeur.
++    En mode 'draft', les coordonnées GPS sont optionnelles.
++    En mode 'published', les coordonnées GPS (latitude et longitude) sont obligatoires.
++    """
++    # Résolution du territoire : strict pour les contributeurs
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = photo_in.territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour créer une photo.",
++                    }
++                },
++            )
++
++    # Construction de la géométrie PostGIS si coordonnées fournies
++    location_geom = None
++    if photo_in.latitude is not None and photo_in.longitude is not None:
++        location_geom = WKTElement(
++            f"POINT({photo_in.longitude} {photo_in.latitude})",
++            srid=4326,
++        )
++
++    new_photo = Photo(
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        title=photo_in.title,
++        description=photo_in.description,
++        photographer=photo_in.photographer,
++        year_taken=photo_in.year_taken,
++        date_exact=photo_in.date_exact,
++        period_label=photo_in.period_label,
++        archive_source=photo_in.archive_source,
++        archive_ref=photo_in.archive_ref,
++        original_source_url=photo_in.original_source_url,
++        license=photo_in.license,
++        latitude=photo_in.latitude,
++        longitude=photo_in.longitude,
++        location=location_geom,
++        bearing=photo_in.bearing,
++        field_of_view=photo_in.field_of_view,
++        file_original_path=photo_in.file_original_path,
++        file_display_path=photo_in.file_display_path,
++        file_thumb_path=photo_in.file_thumb_path,
++        status=photo_in.status,
++    )
++
++    db.add(new_photo)
++    await db.commit()
++    await db.refresh(new_photo)
++    return new_photo
++
++
++@router.get(
++    "",
++    response_model=PhotoListResponse,
++    summary="Lister les photos historiques du territoire actif",
++)
++async def list_photos(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    status_filter: PhotoStatus | None = Query(None, alias="status", description="Filtrer par statut"),
++    search: str | None = Query(None, description="Recherche textuelle sur le titre"),
++    territory_id: uuid.UUID | None = Query(None, description="Filtre territoire réservé aux superadmins"),
++):
++    """Retourne la liste paginée des photographies historiques.
++    Les contributeurs ne reçoivent strictement que les photos de leur propre territoire.
++    """
++    base_query = select(Photo)
++
++    # Cloisonnement multi-territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++    else:
++        if territory_id:
++            base_query = base_query.where(Photo.territory_id == territory_id)
++        elif current_user.territory_id:
++            base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++
++    if status_filter:
++        base_query = base_query.where(Photo.status == status_filter)
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Photo.title.ilike(term) | Photo.description.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri chronologique inversé déterministe
++    paginated_query = (
++        base_query.order_by(Photo.created_at.desc(), Photo.id.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return PhotoListResponse(
++        items=items,
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.post(
++    "/upload",
++    response_model=PhotoUploadResponse,
++    status_code=status.HTTP_201_CREATED,
++    summary="Téléverser une image et créer une nouvelle fiche photo",
++)
++async def upload_photo_direct(
++    file: UploadFile = File(...),
++    title: str | None = Form(None),
++    photo_id: uuid.UUID | None = Form(None),
++    territory_id: uuid.UUID | None = Form(None),
++    current_user: Annotated[User, Depends(get_current_active_user)] = None,
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++    image_service: ImageService = Depends(get_image_service),
++):
++    """Téléverse un cliché photographique, génère les 3 déclinaisons WebP et initialise une photo."""
++    if photo_id:
++        return await upload_photo_image(
++            photo_id=photo_id,
++            file=file,
++            current_user=current_user,
++            db=db,
++            storage=storage,
++            image_service=image_service,
++        )
++
++    # Résolution du territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour téléverser une photo.",
++                    }
++                },
++            )
++
++    content = await _read_upload_file(file, max_size=image_service.MAX_FILE_SIZE)
++    new_photo_id = uuid.uuid4()
++
++    try:
++        proc_result = image_service.process_image(
++            content=content,
++            territory_id=target_territory_id,
++            photo_id=new_photo_id,
++            filename=file.filename,
++        )
++    except FileTooLargeError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": "Le fichier dépasse la taille maximale autorisée de 25 Mo.",
++                }
++            },
++        )
++    except InvalidImageFormatError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_IMAGE_FORMAT",
++                    "message": "Format d'image non valide ou fichier corrompu.",
++                }
++            },
++        )
++
++    saved_urls = await image_service.save_variants(proc_result, storage)
++
++    photo_title = (
++        title.strip()
++        if (title and title.strip())
++        else (Path(file.filename).stem if file.filename else "Nouvelle photo")
++    )
++
++    new_photo = Photo(
++        id=new_photo_id,
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        title=photo_title,
++        file_original_path=proc_result.original.path,
++        file_display_path=proc_result.display.path,
++        file_thumb_path=proc_result.thumb.path,
++        status=PhotoStatus.DRAFT,
++    )
++
++    db.add(new_photo)
++    await db.commit()
++    await db.refresh(new_photo)
++
++    return PhotoUploadResponse(
++        photo_id=new_photo.id,
++        file_original_path=new_photo.file_original_path,
++        file_display_path=new_photo.file_display_path,
++        file_thumb_path=new_photo.file_thumb_path,
++        original_url=saved_urls.get("original_url") or storage.resolve_url(new_photo.file_original_path),
++        display_url=saved_urls.get("display_url") or storage.resolve_url(new_photo.file_display_path),
++        thumb_url=saved_urls.get("thumb_url") or storage.resolve_url(new_photo.file_thumb_path),
++        width=proc_result.width,
++        height=proc_result.height,
++        photo=PhotoRead.model_validate(new_photo),
++    )
++
++
++@router.post(
++    "/{photo_id}/upload",
++    response_model=PhotoUploadResponse,
++    status_code=status.HTTP_200_OK,
++    summary="Téléverser et traiter l'image d'une photo existante",
++)
++async def upload_photo_image(
++    photo_id: uuid.UUID,
++    file: UploadFile = File(...),
++    current_user: Annotated[User, Depends(get_current_active_user)] = None,
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++    image_service: ImageService = Depends(get_image_service),
++):
++    """Téléverse une image pour une fiche photo existante, produit les déclinaisons WebP et purge l'ancien média."""
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    content = await _read_upload_file(file, max_size=image_service.MAX_FILE_SIZE)
++
++    try:
++        proc_result = image_service.process_image(
++            content=content,
++            territory_id=photo.territory_id,
++            photo_id=photo.id,
++            filename=file.filename,
++        )
++    except FileTooLargeError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": "Le fichier dépasse la taille maximale autorisée de 25 Mo.",
++                }
++            },
++        )
++    except InvalidImageFormatError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_IMAGE_FORMAT",
++                    "message": "Format d'image non valide ou fichier corrompu.",
++                }
++            },
++        )
++
++    # Purge des anciens médias associés avant enregistrement des nouveaux
++    old_paths = [
++        photo.file_original_path,
++        photo.file_display_path,
++        photo.file_thumb_path,
++    ]
++    await _purge_media_files(storage, old_paths)
++
++    saved_urls = await image_service.save_variants(proc_result, storage)
++
++    photo.file_original_path = proc_result.original.path
++    photo.file_display_path = proc_result.display.path
++    photo.file_thumb_path = proc_result.thumb.path
++    photo.updated_at = datetime.now(timezone.utc)
++
++    await db.commit()
++    await db.refresh(photo)
++
++    return PhotoUploadResponse(
++        photo_id=photo.id,
++        file_original_path=photo.file_original_path,
++        file_display_path=photo.file_display_path,
++        file_thumb_path=photo.file_thumb_path,
++        original_url=saved_urls.get("original_url") or storage.resolve_url(photo.file_original_path),
++        display_url=saved_urls.get("display_url") or storage.resolve_url(photo.file_display_path),
++        thumb_url=saved_urls.get("thumb_url") or storage.resolve_url(photo.file_thumb_path),
++        width=proc_result.width,
++        height=proc_result.height,
++        photo=PhotoRead.model_validate(photo),
++    )
++
++
++@router.get(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Consulter le détail d'une fiche photo",
++)
++async def get_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Récupère une photo par son identifiant unique.
++    Renvoie 404 si la photo n'existe pas ou appartient à un autre territoire.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    return photo
++
++
++@router.patch(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour partiellement une fiche photo",
++)
++@router.put(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour une fiche photo",
++)
++async def update_photo(
++    photo_id: uuid.UUID,
++    photo_in: PhotoUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Met à jour une fiche photo existante.
++    Vérifie le cloisonnement territorial et impose la présence de coordonnées GPS si le statut est 'published'.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    update_data = photo_in.model_dump(exclude_unset=True)
++
++    # Calcul des coordonnées et du statut résultants
++    target_status = update_data.get("status", photo.status)
++    target_lat = update_data.get("latitude", photo.latitude)
++    target_lng = update_data.get("longitude", photo.longitude)
++
++    if target_status == PhotoStatus.PUBLISHED:
++        if target_lat is None or target_lng is None:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "COORDINATES_REQUIRED",
++                        "message": "Les coordonnées géographiques (latitude et longitude) sont obligatoires pour publier une photo.",
++                    }
++                },
++            )
++
++    # Mise à jour des attributs du modèle
++    for field, value in update_data.items():
++        if field in ("latitude", "longitude"):
++            continue
++        elif field in ("year", "year_taken"):
++            photo.year_taken = value
++        elif field in ("archive_ref", "archive_reference"):
++            photo.archive_ref = value
++        elif field in ("source_url", "original_source_url"):
++            photo.original_source_url = value
++        elif field in ("image_original_path", "file_original_path"):
++            photo.file_original_path = value
++        elif field in ("image_display_path", "file_display_path"):
++            photo.file_display_path = value
++        elif field in ("image_thumb_path", "file_thumb_path"):
++            photo.file_thumb_path = value
++        elif field == "territory_id":
++            if current_user.role == UserRole.SUPERADMIN and value is not None:
++                photo.territory_id = value
++        elif hasattr(photo, field):
++            setattr(photo, field, value)
++
++    # Mise à jour des coordonnées et de la géométrie PostGIS
++    if "latitude" in update_data or "longitude" in update_data:
++        if (target_lat is None) != (target_lng is None):
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "COORDINATES_INCOMPLETE",
++                        "message": "La latitude et la longitude doivent être fournies ensemble.",
++                    }
++                },
++            )
++        photo.latitude = target_lat
++        photo.longitude = target_lng
++        if target_lat is not None and target_lng is not None:
++            photo.location = WKTElement(f"POINT({target_lng} {target_lat})", srid=4326)
++        else:
++            photo.location = None
++
++    photo.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(photo)
++    return photo
++
++
++@router.delete(
++    "/{photo_id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une fiche photo et ses fichiers médias associés",
++)
++async def delete_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Supprime définitivement la fiche photo de la base de données
++    et nettoie physiquement tous les fichiers médias associés via le StorageDriver.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    # Mémorisation des chemins de fichiers pour nettoyage post-commit
++    media_paths = [
++        photo.file_original_path,
++        photo.file_display_path,
++        photo.file_thumb_path,
++    ]
++
++    # Suppression en base de données en premier pour garantir la cohérence transactionnelle
++    await db.delete(photo)
++    await db.commit()
++
++    # Nettoyage des fichiers physiques via le StorageDriver après validation en base
++    storage = get_storage_driver()
++    await _purge_media_files(storage, media_paths)
++
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff --git a/backend/app/schemas/photo.py b/backend/app/schemas/photo.py
+new file mode 100644
+index 0000000..0be12fa
+--- /dev/null
++++ b/backend/app/schemas/photo.py
+@@ -0,0 +1,263 @@
++import uuid
++from datetime import datetime
++from pydantic import BaseModel, Field, ConfigDict, computed_field, model_validator
++from app.models.photo import PhotoStatus
++from app.services.storage import resolve_media_url
++
++
++class PhotoBase(BaseModel):
++    title: str = Field(..., min_length=1, description="Titre de la photographie")
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    year: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    archive_reference: str | None = None
++    original_source_url: str | None = None
++    source_url: str | None = None
++    license: str | None = "Domaine Public"
++    latitude: float | None = Field(None, ge=-90.0, le=90.0)
++    longitude: float | None = Field(None, ge=-180.0, le=180.0)
++    bearing: int | None = Field(None, ge=0, le=359, description="Azimut en degrés (0-359)")
++    field_of_view: int = Field(60, ge=1, le=180, description="Champ de vision en degrés")
++    file_original_path: str | None = None
++    image_original_path: str | None = None
++    file_display_path: str | None = None
++    image_display_path: str | None = None
++    file_thumb_path: str | None = None
++    image_thumb_path: str | None = None
++    status: PhotoStatus = PhotoStatus.DRAFT
++    territory_id: uuid.UUID | None = None
++
++
++class PhotoCreate(PhotoBase):
++    @model_validator(mode="after")
++    def validate_rules(self) -> "PhotoCreate":
++        # Synchronisation des alias
++        if self.year is not None and self.year_taken is None:
++            self.year_taken = self.year
++        if self.archive_reference is not None and self.archive_ref is None:
++            self.archive_ref = self.archive_reference
++        if self.source_url is not None and self.original_source_url is None:
++            self.original_source_url = self.source_url
++        if self.image_original_path is not None and self.file_original_path is None:
++            self.file_original_path = self.image_original_path
++        if self.image_display_path is not None and self.file_display_path is None:
++            self.file_display_path = self.image_display_path
++        if self.image_thumb_path is not None and self.file_thumb_path is None:
++            self.file_thumb_path = self.image_thumb_path
++
++        # Si l'une des coordonnées est fournie, l'autre doit l'être
++        if (self.latitude is not None and self.longitude is None) or (
++            self.latitude is None and self.longitude is not None
++        ):
++            raise ValueError("Latitude et longitude doivent être renseignées ensemble.")
++
++        # Si publié, les coordonnées géographiques sont obligatoires
++        if self.status == PhotoStatus.PUBLISHED:
++            if self.latitude is None or self.longitude is None:
++                raise ValueError(
++                    "Les coordonnées géographiques (latitude et longitude) sont obligatoires pour la publication d'une photo."
++                )
++
++        return self
++
++
++class PhotoUpdate(BaseModel):
++    title: str | None = Field(None, min_length=1)
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    year: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    archive_reference: str | None = None
++    original_source_url: str | None = None
++    source_url: str | None = None
++    license: str | None = None
++    latitude: float | None = Field(None, ge=-90.0, le=90.0)
++    longitude: float | None = Field(None, ge=-180.0, le=180.0)
++    bearing: int | None = Field(None, ge=0, le=359)
++    field_of_view: int | None = Field(None, ge=1, le=180)
++    file_original_path: str | None = None
++    image_original_path: str | None = None
++    file_display_path: str | None = None
++    image_display_path: str | None = None
++    file_thumb_path: str | None = None
++    image_thumb_path: str | None = None
++    status: PhotoStatus | None = None
++    territory_id: uuid.UUID | None = None
++
++    @model_validator(mode="after")
++    def validate_rules(self) -> "PhotoUpdate":
++        if self.year is not None and self.year_taken is None:
++            self.year_taken = self.year
++        if self.archive_reference is not None and self.archive_ref is None:
++            self.archive_ref = self.archive_reference
++        if self.source_url is not None and self.original_source_url is None:
++            self.original_source_url = self.source_url
++        if self.image_original_path is not None and self.file_original_path is None:
++            self.file_original_path = self.image_original_path
++        if self.image_display_path is not None and self.file_display_path is None:
++            self.file_display_path = self.image_display_path
++        if self.image_thumb_path is not None and self.file_thumb_path is None:
++            self.file_thumb_path = self.image_thumb_path
++        return self
++
++
++class PhotoRead(BaseModel):
++    id: uuid.UUID
++    territory_id: uuid.UUID
++    author_user_id: uuid.UUID | None = None
++    title: str
++    description: str | None = None
++    photographer: str | None = None
++    year_taken: int | None = None
++    date_exact: str | None = None
++    period_label: str | None = None
++    archive_source: str | None = None
++    archive_ref: str | None = None
++    original_source_url: str | None = None
++    license: str | None = None
++    latitude: float | None = None
++    longitude: float | None = None
++    bearing: int | None = None
++    field_of_view: int = 60
++    file_original_path: str | None = None
++    file_display_path: str | None = None
++    file_thumb_path: str | None = None
++    status: PhotoStatus
++    created_at: datetime
++    updated_at: datetime
++
++    model_config = ConfigDict(from_attributes=True)
++
++    @computed_field
++    @property
++    def year(self) -> int | None:
++        return self.year_taken
++
++    @computed_field
++    @property
++    def archive_reference(self) -> str | None:
++        return self.archive_ref
++
++    @computed_field
++    @property
++    def source_url(self) -> str | None:
++        return self.original_source_url
++
++    @computed_field
++    @property
++    def created_by_id(self) -> uuid.UUID | None:
++        return self.author_user_id
++
++    @computed_field
++    @property
++    def image_original_path(self) -> str | None:
++        return self.file_original_path
++
++    @computed_field
++    @property
++    def image_display_path(self) -> str | None:
++        return self.file_display_path
++
++    @computed_field
++    @property
++    def image_thumb_path(self) -> str | None:
++        return self.file_thumb_path
++
++    @computed_field
++    @property
++    def original_url(self) -> str | None:
++        return resolve_media_url(self.file_original_path)
++
++    @computed_field
++    @property
++    def display_url(self) -> str | None:
++        return resolve_media_url(self.file_display_path)
++
++    @computed_field
++    @property
++    def thumb_url(self) -> str | None:
++        return resolve_media_url(self.file_thumb_path)
++
++    @computed_field
++    @property
++    def image_original_url(self) -> str | None:
++        return self.original_url
++
++    @computed_field
++    @property
++    def image_display_url(self) -> str | None:
++        return self.display_url
++
++    @computed_field
++    @property
++    def image_thumb_url(self) -> str | None:
++        return self.thumb_url
++
++    @computed_field
++    @property
++    def location(self) -> dict | None:
++        if self.longitude is not None and self.latitude is not None:
++            return {"type": "Point", "coordinates": [self.longitude, self.latitude]}
++        return None
++
++
++class PhotoUploadResponse(BaseModel):
++    photo_id: uuid.UUID
++    file_original_path: str
++    file_display_path: str
++    file_thumb_path: str
++    original_url: str
++    display_url: str
++    thumb_url: str
++    width: int
++    height: int
++    photo: PhotoRead | None = None
++
++    model_config = ConfigDict(from_attributes=True)
++
++    @computed_field
++    @property
++    def image_original_path(self) -> str:
++        return self.file_original_path
++
++    @computed_field
++    @property
++    def image_display_path(self) -> str:
++        return self.file_display_path
++
++    @computed_field
++    @property
++    def image_thumb_path(self) -> str:
++        return self.file_thumb_path
++
++    @computed_field
++    @property
++    def image_original_url(self) -> str:
++        return self.original_url
++
++    @computed_field
++    @property
++    def image_display_url(self) -> str:
++        return self.display_url
++
++    @computed_field
++    @property
++    def image_thumb_url(self) -> str:
++        return self.thumb_url
++
++
++class PhotoListResponse(BaseModel):
++    items: list[PhotoRead]
++    total: int
++    page: int
++    page_size: int
++    pages: int
+diff --git a/backend/app/services/image_service.py b/backend/app/services/image_service.py
+new file mode 100644
+index 0000000..8a64b49
+--- /dev/null
++++ b/backend/app/services/image_service.py
+@@ -0,0 +1,242 @@
++import io
++import uuid
++import logging
++from dataclasses import dataclass
++from typing import Any
++from PIL import Image, ImageOps, UnidentifiedImageError
++
++from app.services.storage.base import StorageDriver
++
++logger = logging.getLogger(__name__)
++
++
++class ImageProcessingError(Exception):
++    """Exception de base pour les erreurs de traitement d'image."""
++    pass
++
++
++class FileTooLargeError(ImageProcessingError):
++    """Le fichier dépasse la taille maximale autorisée."""
++    pass
++
++
++class InvalidImageFormatError(ImageProcessingError):
++    """Le format d'image est invalide, non autorisé ou corrompu."""
++    pass
++
++
++@dataclass
++class ProcessedVariant:
++    """Représente une déclinaison d'image générée."""
++    variant_name: str
++    content: bytes
++    path: str
++    content_type: str
++    width: int
++    height: int
++
++
++@dataclass
++class ImageProcessingResult:
++    """Résultat complet du traitement des 3 déclinaisons d'image."""
++    width: int
++    height: int
++    original: ProcessedVariant
++    display: ProcessedVariant
++    thumb: ProcessedVariant
++
++    @property
++    def variants(self) -> list[ProcessedVariant]:
++        return [self.original, self.display, self.thumb]
++
++
++class ImageService:
++    """Service de validation, redressement EXIF, redimensionnement et compression WebP."""
++
++    # 25 Mo strict
++    MAX_FILE_SIZE = 25 * 1024 * 1024
++    ALLOWED_FORMATS = {"JPEG", "JPG", "PNG", "WEBP", "TIFF"}
++    DISPLAY_MAX_DIM = 2048
++    DISPLAY_QUALITY = 85
++    THUMB_MAX_DIM = 400
++    THUMB_QUALITY = 80
++
++    FORMAT_EXTENSIONS = {
++        "JPEG": "jpg",
++        "JPG": "jpg",
++        "PNG": "png",
++        "WEBP": "webp",
++        "TIFF": "tif",
++    }
++
++    FORMAT_CONTENT_TYPES = {
++        "JPEG": "image/jpeg",
++        "JPG": "image/jpeg",
++        "PNG": "image/png",
++        "WEBP": "image/webp",
++        "TIFF": "image/tiff",
++    }
++
++    def validate_file_size(self, content: bytes) -> None:
++        """Vérifie que la taille du fichier ne dépasse pas la limite autorisée."""
++        if len(content) > self.MAX_FILE_SIZE:
++            raise FileTooLargeError(
++                f"Le fichier dépasse la taille maximale autorisée de {self.MAX_FILE_SIZE // (1024 * 1024)} Mo."
++            )
++
++    def validate_and_open_image(self, content: bytes) -> tuple[Image.Image, str]:
++        """Vérifie la taille, le format et l'intégrité de l'image via Pillow."""
++        self.validate_file_size(content)
++
++        if not content:
++            raise InvalidImageFormatError("Le fichier d'image est vide.")
++
++        try:
++            img = Image.open(io.BytesIO(content))
++            fmt = (img.format or "").upper()
++
++            if fmt not in self.ALLOWED_FORMATS:
++                raise InvalidImageFormatError(
++                    f"Format d'image non supporté ({fmt or 'inconnu'}). Formats acceptés : JPEG, PNG, WEBP, TIFF."
++                )
++
++            # Charger les données de pixels pour détecter les fichiers corrompus ou tronqués
++            img.load()
++            return img, fmt
++        except (UnidentifiedImageError, SyntaxError, ValueError, OSError) as e:
++            logger.warning(f"Erreur d'ouverture ou d'intégrité d'image Pillow: {e}")
++            raise InvalidImageFormatError("Format d'image non valide ou fichier corrompu.") from e
++
++    def normalize_image(self, img: Image.Image) -> Image.Image:
++        """Redresse automatiquement l'orientation EXIF et normalise les modes de couleur."""
++        # Redressement EXIF automatique (orientation 1 à 8)
++        oriented = ImageOps.exif_transpose(img)
++        if oriented is None:
++            oriented = img.copy()
++
++        # Normalisation des modes de couleur pour compatibilité WebP
++        if oriented.mode in ("RGB", "RGBA"):
++            return oriented
++        elif oriented.mode == "CMYK":
++            return oriented.convert("RGB")
++        elif oriented.mode == "P":
++            if "transparency" in oriented.info:
++                return oriented.convert("RGBA")
++            return oriented.convert("RGB")
++        elif oriented.mode in ("1", "L"):
++            return oriented.convert("RGB")
++        elif oriented.mode == "LA":
++            return oriented.convert("RGBA")
++        return oriented.convert("RGB")
++
++    def create_variant(
++        self, img: Image.Image, max_dim: int, quality: int
++    ) -> tuple[bytes, int, int]:
++        """Génère une déclinaison WebP compressée sans métadonnées EXIF."""
++        variant_img = img.copy()
++        # Ne redimensionne que si l'image dépasse la boîte max_dim x max_dim
++        variant_img.thumbnail((max_dim, max_dim), Image.Resampling.LANCZOS)
++        width, height = variant_img.size
++
++        out = io.BytesIO()
++        # Enregistrer en WebP sans passer d'argument exif -> métadonnées purgées
++        variant_img.save(out, format="WEBP", quality=quality)
++        return out.getvalue(), width, height
++
++    def process_image(
++        self,
++        content: bytes,
++        territory_id: str | uuid.UUID,
++        photo_id: str | uuid.UUID,
++        filename: str | None = None,
++    ) -> ImageProcessingResult:
++        """Exécute l'intégralité du pipeline : validation, redressement, 3 déclinaisons."""
++        img, fmt = self.validate_and_open_image(content)
++        oriented_img = self.normalize_image(img)
++        orig_width, orig_height = oriented_img.size
++
++        # Détermination de l'extension de l'original
++        ext = self.FORMAT_EXTENSIONS.get(fmt, "jpg")
++        if filename:
++            lower_name = filename.lower()
++            if lower_name.endswith(".jpeg") or lower_name.endswith(".jpg"):
++                ext = "jpg"
++            elif lower_name.endswith(".png"):
++                ext = "png"
++            elif lower_name.endswith(".webp"):
++                ext = "webp"
++            elif lower_name.endswith(".tif") or lower_name.endswith(".tiff"):
++                ext = "tif"
++
++        str_territory_id = str(territory_id)
++        str_photo_id = str(photo_id)
++
++        original_path = f"photos/{str_territory_id}/{str_photo_id}/original.{ext}"
++        display_path = f"photos/{str_territory_id}/{str_photo_id}/display.webp"
++        thumb_path = f"photos/{str_territory_id}/{str_photo_id}/thumb.webp"
++
++        # Déclinaison display (max 2048px, q85)
++        display_bytes, disp_w, disp_h = self.create_variant(
++            oriented_img, self.DISPLAY_MAX_DIM, self.DISPLAY_QUALITY
++        )
++
++        # Déclinaison thumb (max 400px, q80)
++        thumb_bytes, thumb_w, thumb_h = self.create_variant(
++            oriented_img, self.THUMB_MAX_DIM, self.THUMB_QUALITY
++        )
++
++        orig_content_type = self.FORMAT_CONTENT_TYPES.get(fmt, "application/octet-stream")
++
++        original_variant = ProcessedVariant(
++            variant_name="original",
++            content=content,
++            path=original_path,
++            content_type=orig_content_type,
++            width=orig_width,
++            height=orig_height,
++        )
++        display_variant = ProcessedVariant(
++            variant_name="display",
++            content=display_bytes,
++            path=display_path,
++            content_type="image/webp",
++            width=disp_w,
++            height=disp_h,
++        )
++        thumb_variant = ProcessedVariant(
++            variant_name="thumb",
++            content=thumb_bytes,
++            path=thumb_path,
++            content_type="image/webp",
++            width=thumb_w,
++            height=thumb_h,
++        )
++
++        return ImageProcessingResult(
++            width=orig_width,
++            height=orig_height,
++            original=original_variant,
++            display=display_variant,
++            thumb=thumb_variant,
++        )
++
++    async def save_variants(
++        self, result: ImageProcessingResult, storage: StorageDriver
++    ) -> dict[str, str]:
++        """Sauvegarde les 3 déclinaisons sur le stockage et retourne les URLs d'accès."""
++        urls: dict[str, str] = {}
++        for variant in result.variants:
++            url = await storage.save(
++                content=variant.content,
++                destination_path=variant.path,
++                content_type=variant.content_type,
++            )
++            urls[f"{variant.variant_name}_url"] = url
++        return urls
++
++
++default_image_service = ImageService()
++
++
++def get_image_service() -> ImageService:
++    return default_image_service
+diff --git a/backend/app/services/storage/__init__.py b/backend/app/services/storage/__init__.py
+new file mode 100644
+index 0000000..48b84b2
+--- /dev/null
++++ b/backend/app/services/storage/__init__.py
+@@ -0,0 +1,38 @@
++from functools import lru_cache
++from app.config import settings
++from app.services.storage.base import StorageDriver
++from app.services.storage.local import LocalStorageDriver
++from app.services.storage.s3 import S3StorageDriver
++
++
++@lru_cache()
++def get_storage_driver() -> StorageDriver:
++    """Factory instanciant le pilote de stockage configuré par variable d'environnement."""
++    driver_type = settings.STORAGE_DRIVER.lower().strip()
++    if driver_type == "s3":
++        return S3StorageDriver()
++    return LocalStorageDriver()
++
++
++def resolve_media_url(path: str | None) -> str | None:
++    """Résout l'URL publique d'un chemin de fichier média via le pilote de stockage actif."""
++    if not path:
++        return None
++    try:
++        driver = get_storage_driver()
++        if hasattr(driver, "resolve_url"):
++            return driver.resolve_url(path)
++    except Exception:
++        pass
++    clean_path = path.lstrip("/")
++    return f"/uploads/{clean_path}"
++
++
++__all__ = [
++    "StorageDriver",
++    "LocalStorageDriver",
++    "S3StorageDriver",
++    "get_storage_driver",
++    "resolve_media_url",
++]
++
+diff --git a/backend/app/services/storage/base.py b/backend/app/services/storage/base.py
+new file mode 100644
+index 0000000..26c2874
+--- /dev/null
++++ b/backend/app/services/storage/base.py
+@@ -0,0 +1,41 @@
++from abc import ABC, abstractmethod
++
++
++class StorageDriver(ABC):
++    """Interface abstraite définissant le contrat pour tous les pilotes de stockage média."""
++
++    @abstractmethod
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        """Enregistre le contenu binaire à la destination spécifiée et renvoie l'URL d'accès."""
++        pass
++
++    @abstractmethod
++    async def read(self, path: str) -> bytes:
++        """Lit et retourne le contenu binaire du fichier situé au chemin indiqué."""
++        pass
++
++    @abstractmethod
++    async def delete(self, path: str) -> bool:
++        """Supprime le fichier du stockage. Renvoie True si supprimé, False s'il n'existait pas."""
++        pass
++
++    @abstractmethod
++    async def exists(self, path: str) -> bool:
++        """Indique si le fichier existe dans le stockage."""
++        pass
++
++    @abstractmethod
++    def resolve_url(self, path: str) -> str:
++        """Génère l'URL d'accès public de manière synchrone pour le fichier."""
++        pass
++
++    @abstractmethod
++    async def get_url(self, path: str) -> str:
++        """Génère l'URL d'accès public ou relative pour le fichier."""
++        pass
++
+diff --git a/backend/app/services/storage/local.py b/backend/app/services/storage/local.py
+new file mode 100644
+index 0000000..2d535f8
+--- /dev/null
++++ b/backend/app/services/storage/local.py
+@@ -0,0 +1,74 @@
++import os
++import asyncio
++from pathlib import Path
++from app.services.storage.base import StorageDriver
++from app.config import settings
++
++
++class LocalStorageDriver(StorageDriver):
++    """Pilote de stockage écrivant sur le système de fichiers local / volume persistant Docker."""
++
++    def __init__(self, base_dir: str | None = None):
++        self.base_dir = Path(base_dir or settings.LOCAL_STORAGE_PATH).resolve()
++        self.base_dir.mkdir(parents=True, exist_ok=True)
++
++    def _resolve_path(self, relative_path: str) -> Path:
++        # Sécurise contre les traversées de répertoire
++        clean_rel = Path(relative_path.lstrip("/"))
++        full_path = (self.base_dir / clean_rel).resolve()
++        if not full_path.is_relative_to(self.base_dir):
++            raise ValueError(f"Tentative de traversée de répertoire non autorisée : {relative_path}")
++        return full_path
++
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        target_path = self._resolve_path(destination_path)
++        target_path.parent.mkdir(parents=True, exist_ok=True)
++
++        def _write():
++            with open(target_path, "wb") as f:
++                f.write(content)
++
++        await asyncio.to_thread(_write)
++        return await self.get_url(destination_path)
++
++    async def read(self, path: str) -> bytes:
++        target_path = self._resolve_path(path)
++        if not target_path.is_file():
++            raise FileNotFoundError(f"Fichier introuvable sur le stockage local : {path}")
++
++        def _read():
++            with open(target_path, "rb") as f:
++                return f.read()
++
++        return await asyncio.to_thread(_read)
++
++    async def delete(self, path: str) -> bool:
++        target_path = self._resolve_path(path)
++        if not target_path.exists():
++            return False
++
++        def _delete():
++            try:
++                target_path.unlink()
++                return True
++            except OSError:
++                return False
++
++        return await asyncio.to_thread(_delete)
++
++    async def exists(self, path: str) -> bool:
++        target_path = self._resolve_path(path)
++        return target_path.is_file()
++
++    def resolve_url(self, path: str) -> str:
++        clean_path = path.lstrip("/")
++        return f"/uploads/{clean_path}"
++
++    async def get_url(self, path: str) -> str:
++        return self.resolve_url(path)
++
+diff --git a/backend/app/services/storage/s3.py b/backend/app/services/storage/s3.py
+new file mode 100644
+index 0000000..b1dacfd
+--- /dev/null
++++ b/backend/app/services/storage/s3.py
+@@ -0,0 +1,113 @@
++import asyncio
++from typing import Any
++import boto3
++from botocore.exceptions import ClientError
++from app.services.storage.base import StorageDriver
++from app.config import settings
++
++
++class S3StorageDriver(StorageDriver):
++    """Pilote de stockage pour S3 et compatibles (MinIO, Cloudflare R2, Scaleway, AWS)."""
++
++    def __init__(
++        self,
++        bucket_name: str | None = None,
++        endpoint_url: str | None = None,
++        access_key_id: str | None = None,
++        secret_access_key: str | None = None,
++        region: str | None = None,
++    ):
++        self.bucket_name = bucket_name or settings.S3_BUCKET_NAME or "hierici-media"
++        self.endpoint_url = endpoint_url or settings.S3_ENDPOINT_URL
++        self.access_key_id = access_key_id or settings.S3_ACCESS_KEY_ID
++        self.secret_access_key = secret_access_key or settings.S3_SECRET_ACCESS_KEY
++        self.region = region or settings.S3_REGION or "fr-par"
++
++        self._client: Any = None
++
++    def _get_client(self):
++        if self._client is None:
++            self._client = boto3.client(
++                "s3",
++                endpoint_url=self.endpoint_url,
++                aws_access_key_id=self.access_key_id,
++                aws_secret_access_key=self.secret_access_key,
++                region_name=self.region,
++            )
++        return self._client
++
++    def _clean_path(self, path: str) -> str:
++        return path.lstrip("/")
++
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        key = self._clean_path(destination_path)
++        client = self._get_client()
++
++        def _upload():
++            client.put_object(
++                Bucket=self.bucket_name,
++                Key=key,
++                Body=content,
++                ContentType=content_type,
++            )
++
++        await asyncio.to_thread(_upload)
++        return await self.get_url(key)
++
++    async def read(self, path: str) -> bytes:
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _download():
++            try:
++                response = client.get_object(Bucket=self.bucket_name, Key=key)
++                return response["Body"].read()
++            except ClientError as e:
++                if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
++                    raise FileNotFoundError(f"Objet introuvable dans le bucket S3 : {path}")
++                raise
++
++        return await asyncio.to_thread(_download)
++
++    async def delete(self, path: str) -> bool:
++        if not await self.exists(path):
++            return False
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _delete():
++            try:
++                client.delete_object(Bucket=self.bucket_name, Key=key)
++                return True
++            except ClientError:
++                return False
++
++        return await asyncio.to_thread(_delete)
++
++    async def exists(self, path: str) -> bool:
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _head():
++            try:
++                client.head_object(Bucket=self.bucket_name, Key=key)
++                return True
++            except ClientError:
++                return False
++
++        return await asyncio.to_thread(_head)
++
++    def resolve_url(self, path: str) -> str:
++        key = self._clean_path(path)
++        if self.endpoint_url:
++            return f"{self.endpoint_url.rstrip('/')}/{self.bucket_name}/{key}"
++        return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{key}"
++
++    async def get_url(self, path: str) -> str:
++        return self.resolve_url(path)
++
+diff --git a/backend/tests/test_photo_upload.py b/backend/tests/test_photo_upload.py
+new file mode 100644
+index 0000000..c166bbc
+--- /dev/null
++++ b/backend/tests/test_photo_upload.py
+@@ -0,0 +1,524 @@
++import io
++import uuid
++import pytest
++from PIL import Image
++from httpx import AsyncClient, ASGITransport
++from sqlalchemy import select, delete
++
++from app.main import app
++from app.core.database import AsyncSessionLocal
++from app.core.auth import get_current_active_user
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.services.image_service import (
++    ImageService,
++    get_image_service,
++    FileTooLargeError,
++    InvalidImageFormatError,
++)
++from app.services.storage import get_storage_driver
++
++
++def create_test_image(
++    width: int,
++    height: int,
++    fmt: str = "JPEG",
++    orientation: int | None = None,
++    color: tuple[int, int, int] | str = (100, 150, 200),
++) -> bytes:
++    """Génère un flux d'octets d'image valide en mémoire pour les tests."""
++    img = Image.new("RGB", (width, height), color=color)
++    buf = io.BytesIO()
++
++    if orientation is not None and fmt.upper() in ("JPEG", "JPG"):
++        exif = img.getexif()
++        exif[0x0112] = orientation
++        img.save(buf, format=fmt, exif=exif)
++    else:
++        img.save(buf, format=fmt)
++
++    return buf.getvalue()
++
++
++@pytest.fixture
++async def setup_upload_test_data():
++    """Prépare les territoires, contributeurs et fiches photos pour les tests d'upload."""
++    async with AsyncSessionLocal() as session:
++        t_a = Territory(
++            id=uuid.uuid4(),
++            slug=f"toulon-{uuid.uuid4().hex[:6]}",
++            name="Toulon Upload Test",
++            center_lat=43.12,
++            center_lng=5.93,
++            default_zoom=13,
++        )
++        t_b = Territory(
++            id=uuid.uuid4(),
++            slug=f"marseille-{uuid.uuid4().hex[:6]}",
++            name="Marseille Upload Test",
++            center_lat=43.29,
++            center_lng=5.37,
++            default_zoom=13,
++        )
++        session.add_all([t_a, t_b])
++        await session.commit()
++        await session.refresh(t_a)
++        await session.refresh(t_b)
++
++        u_a = User(
++            id=uuid.uuid4(),
++            email=f"contrib_a_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Contributeur Toulon",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        u_b = User(
++            id=uuid.uuid4(),
++            email=f"contrib_b_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Contributeur Marseille",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_b.id,
++            is_active=True,
++        )
++        u_admin = User(
++            id=uuid.uuid4(),
++            email=f"superadmin_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Super Administrateur",
++            role=UserRole.SUPERADMIN,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        session.add_all([u_a, u_b, u_admin])
++        await session.commit()
++        await session.refresh(u_a)
++        await session.refresh(u_b)
++        await session.refresh(u_admin)
++
++        p_a = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo A Toulon",
++            status=PhotoStatus.DRAFT,
++        )
++        p_b = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo B Marseille",
++            status=PhotoStatus.DRAFT,
++        )
++        session.add_all([p_a, p_b])
++        await session.commit()
++        await session.refresh(p_a)
++        await session.refresh(p_b)
++
++    yield {
++        "t_a": t_a,
++        "t_b": t_b,
++        "u_a": u_a,
++        "u_b": u_b,
++        "u_admin": u_admin,
++        "p_a": p_a,
++        "p_b": p_b,
++    }
++
++    # Nettoyage
++    async with AsyncSessionLocal() as session:
++        await session.execute(
++            delete(Photo).where(Photo.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(User).where(User.id.in_([u_a.id, u_b.id, u_admin.id]))
++        )
++        await session.execute(
++            delete(Territory).where(Territory.id.in_([t_a.id, t_b.id]))
++        )
++        await session.commit()
++
++
++# =====================================================================
++# Tests Unitaires ImageService
++# =====================================================================
++
++def test_image_service_size_validation():
++    """Vérifie que la taille max de 25 Mo est strictement appliquée."""
++    service = ImageService()
++    # 25 Mo pile autorisés
++    service.validate_file_size(b"x" * (25 * 1024 * 1024))
++
++    # 25 Mo + 1 octet rejetés
++    with pytest.raises(FileTooLargeError):
++        service.validate_file_size(b"x" * (25 * 1024 * 1024 + 1))
++
++
++def test_image_service_invalid_formats():
++    """Vérifie le rejet des formats non autorisés ou des fichiers vides/corrompus."""
++    service = ImageService()
++
++    # Fichier vide
++    with pytest.raises(InvalidImageFormatError):
++        service.validate_and_open_image(b"")
++
++    # Contenu non image (PDF, texte, executable)
++    with pytest.raises(InvalidImageFormatError):
++        service.validate_and_open_image(b"%PDF-1.4 header text dummy")
++
++    with pytest.raises(InvalidImageFormatError):
++        service.validate_and_open_image(b"MZ\x90\x00\x03\x00\x00\x00binary executable")
++
++
++def test_image_service_supported_formats():
++    """Vérifie le bon support de JPEG, PNG, WEBP, TIFF."""
++    service = ImageService()
++    for fmt in ("JPEG", "PNG", "WEBP", "TIFF"):
++        img_bytes = create_test_image(100, 100, fmt=fmt)
++        img, detected_fmt = service.validate_and_open_image(img_bytes)
++        assert detected_fmt in ("JPEG", "PNG", "WEBP", "TIFF")
++        assert img.size == (100, 100)
++
++
++def test_image_service_exif_orientation_redressed():
++    """Vérifie que l'orientation EXIF 6 (rotation 90° CCW) est redressée à la verticale."""
++    service = ImageService()
++    # Image paysage 400x200 avec flag EXIF 6 (doit devenir portrait 200x400)
++    img_bytes = create_test_image(400, 200, fmt="JPEG", orientation=6)
++    img, _ = service.validate_and_open_image(img_bytes)
++    assert img.size == (400, 200)
++
++    oriented = service.normalize_image(img)
++    assert oriented.size == (200, 400)
++
++
++def test_image_service_variant_generation():
++    """Vérifie les contraintes dimensionnelles des variantes display et thumb."""
++    service = ImageService()
++    # Image HD 4000x3000
++    img_bytes = create_test_image(4000, 3000, fmt="JPEG")
++    res = service.process_image(
++        content=img_bytes,
++        territory_id=uuid.uuid4(),
++        photo_id=uuid.uuid4(),
++        filename="scan_archive.jpg",
++    )
++
++    # Original
++    assert res.width == 4000
++    assert res.height == 3000
++    assert res.original.path.endswith("original.jpg")
++    assert res.original.content == img_bytes
++
++    # Display (max 2048px -> 2048x1536)
++    assert res.display.path.endswith("display.webp")
++    assert res.display.width == 2048
++    assert res.display.height == 1536
++    display_pil = Image.open(io.BytesIO(res.display.content))
++    assert display_pil.format == "WEBP"
++    assert display_pil.size == (2048, 1536)
++    # Vérification métadonnées EXIF purgées
++    assert not bool(display_pil.getexif())
++
++    # Thumb (max 400px -> 400x300)
++    assert res.thumb.path.endswith("thumb.webp")
++    assert res.thumb.width == 400
++    assert res.thumb.height == 300
++    thumb_pil = Image.open(io.BytesIO(res.thumb.content))
++    assert thumb_pil.format == "WEBP"
++    assert thumb_pil.size == (400, 300)
++    assert not bool(thumb_pil.getexif())
++
++
++def test_image_service_smaller_image_not_upscaled():
++    """Vérifie qu'une petite image (ex: 300x200) n'est pas agrandie artificiellement."""
++    service = ImageService()
++    img_bytes = create_test_image(300, 200, fmt="PNG")
++    res = service.process_image(
++        content=img_bytes,
++        territory_id=uuid.uuid4(),
++        photo_id=uuid.uuid4(),
++        filename="small.png",
++    )
++    assert res.display.width == 300
++    assert res.display.height == 200
++    assert res.thumb.width == 300
++    assert res.thumb.height == 200
++
++
++# =====================================================================
++# Tests d'Intégration API REST
++# =====================================================================
++
++async def test_upload_valid_hd_jpeg_existing_photo(setup_upload_test_data):
++    """Scénario 1: Upload d'une image JPEG HD (4000x3000) sur une photo existante."""
++    u_a = setup_upload_test_data["u_a"]
++    t_a = setup_upload_test_data["t_a"]
++    p_a = setup_upload_test_data["p_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            jpeg_hd = create_test_image(4000, 3000, fmt="JPEG")
++            files = {"file": ("archive_hd.jpg", jpeg_hd, "image/jpeg")}
++
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files=files,
++            )
++
++            assert response.status_code == 200
++            data = response.json()
++
++            # Vérification des propriétés retournées
++            assert data["photo_id"] == str(p_a.id)
++            assert data["width"] == 4000
++            assert data["height"] == 3000
++            assert data["file_original_path"] == f"photos/{t_a.id}/{p_a.id}/original.jpg"
++            assert data["file_display_path"] == f"photos/{t_a.id}/{p_a.id}/display.webp"
++            assert data["file_thumb_path"] == f"photos/{t_a.id}/{p_a.id}/thumb.webp"
++            assert data["original_url"].endswith(data["file_original_path"])
++            assert data["display_url"].endswith(data["file_display_path"])
++            assert data["thumb_url"].endswith(data["file_thumb_path"])
++
++            # Vérification de la persistance en base de données
++            async with AsyncSessionLocal() as session:
++                refreshed = await session.get(Photo, p_a.id)
++                assert refreshed.file_original_path == data["file_original_path"]
++                assert refreshed.file_display_path == data["file_display_path"]
++                assert refreshed.file_thumb_path == data["file_thumb_path"]
++
++            # Vérification de l'existence physique dans le StorageDriver
++            storage = get_storage_driver()
++            assert await storage.exists(data["file_original_path"]) is True
++            assert await storage.exists(data["file_display_path"]) is True
++            assert await storage.exists(data["file_thumb_path"]) is True
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_upload_file_too_large_rejected(setup_upload_test_data):
++    """Scénario 2: Fichier de 28 Mo rejeté avec HTTP 400 et RFC 7807 FILE_TOO_LARGE."""
++    u_a = setup_upload_test_data["u_a"]
++    p_a = setup_upload_test_data["p_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            # 28 Mo
++            huge_content = b"0" * (28 * 1024 * 1024)
++            files = {"file": ("too_large.jpg", huge_content, "image/jpeg")}
++
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files=files,
++            )
++
++            assert response.status_code == 400
++            data = response.json()
++            assert data["title"] == "FILE_TOO_LARGE"
++            assert data["status"] == 400
++            assert "FILE_TOO_LARGE" in data["error"]["code"]
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_upload_invalid_format_rejected(setup_upload_test_data):
++    """Scénario 3: Fichier non image rejeté avec HTTP 400 et RFC 7807 INVALID_IMAGE_FORMAT."""
++    u_a = setup_upload_test_data["u_a"]
++    p_a = setup_upload_test_data["p_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            files = {"file": ("malicious.exe", b"MZ\x90\x00NotAnImageFile", "application/octet-stream")}
++
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files=files,
++            )
++
++            assert response.status_code == 400
++            data = response.json()
++            assert data["title"] == "INVALID_IMAGE_FORMAT"
++            assert data["status"] == 400
++            assert "INVALID_IMAGE_FORMAT" in data["error"]["code"]
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_upload_exif_orientation_via_api(setup_upload_test_data):
++    """Scénario 4: Image avec flag EXIF orientation 6 redressée à la verticale dans l'API."""
++    u_a = setup_upload_test_data["u_a"]
++    p_a = setup_upload_test_data["p_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            # 600x300 paysage avec orientation 6 -> doit être redressée en 300x600 portrait
++            img_bytes = create_test_image(600, 300, fmt="JPEG", orientation=6)
++            files = {"file": ("portrait_sideways.jpg", img_bytes, "image/jpeg")}
++
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files=files,
++            )
++
++            assert response.status_code == 200
++            data = response.json()
++            assert data["width"] == 300
++            assert data["height"] == 600
++
++            # Vérification physique de l'image display
++            storage = get_storage_driver()
++            display_bytes = await storage.read(data["file_display_path"])
++            disp_img = Image.open(io.BytesIO(display_bytes))
++            assert disp_img.size == (300, 600)
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_upload_replacement_purges_old_media(setup_upload_test_data):
++    """Scénario 5: Le remplacement d'image purge automatiquement les anciens fichiers via StorageDriver."""
++    u_a = setup_upload_test_data["u_a"]
++    p_a = setup_upload_test_data["p_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            storage = get_storage_driver()
++
++            # 1. Premier téléversement (PNG)
++            png_bytes = create_test_image(200, 200, fmt="PNG")
++            resp1 = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files={"file": ("first_cliche.png", png_bytes, "image/png")},
++            )
++            assert resp1.status_code == 200
++            data1 = resp1.json()
++            old_original = data1["file_original_path"]
++            old_display = data1["file_display_path"]
++            old_thumb = data1["file_thumb_path"]
++
++            assert await storage.exists(old_original) is True
++            assert await storage.exists(old_display) is True
++            assert await storage.exists(old_thumb) is True
++
++            # 2. Deuxième téléversement (remplacement par JPEG)
++            jpeg_bytes = create_test_image(400, 400, fmt="JPEG")
++            resp2 = await ac.post(
++                f"/api/v1/admin/photos/{p_a.id}/upload",
++                files={"file": ("second_cliche.jpg", jpeg_bytes, "image/jpeg")},
++            )
++            assert resp2.status_code == 200
++            data2 = resp2.json()
++            new_original = data2["file_original_path"]
++
++            # L'ancien fichier original PNG a été purgé
++            assert await storage.exists(old_original) is False
++            # Le nouveau original JPG existe
++            assert await storage.exists(new_original) is True
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_upload_wrong_territory_returns_404(setup_upload_test_data):
++    """Scénario 6: Un contributeur du Territoire A ne peut pas téléverser sur une photo du Territoire B."""
++    u_a = setup_upload_test_data["u_a"]
++    p_b = setup_upload_test_data["p_b"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            img_bytes = create_test_image(200, 200, fmt="JPEG")
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_b.id}/upload",
++                files={"file": ("hack.jpg", img_bytes, "image/jpeg")},
++            )
++
++            assert response.status_code == 404
++            data = response.json()
++            assert data["title"] == "PHOTO_NOT_FOUND"
++            assert data["error"]["code"] == "PHOTO_NOT_FOUND"
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_direct_upload_creates_draft_photo(setup_upload_test_data):
++    """Scénario 7: Téléversement direct via POST /admin/photos/upload créant une fiche photo en brouillon."""
++    u_a = setup_upload_test_data["u_a"]
++    t_a = setup_upload_test_data["t_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            img_bytes = create_test_image(1200, 800, fmt="JPEG")
++            response = await ac.post(
++                "/api/v1/admin/photos/upload",
++                files={"file": ("port_de_toulon_1905.jpg", img_bytes, "image/jpeg")},
++                data={"title": "Port de Toulon 1905"},
++            )
++
++            assert response.status_code == 201
++            data = response.json()
++            created_id = uuid.UUID(data["photo_id"])
++
++            assert data["width"] == 1200
++            assert data["height"] == 800
++            assert data["photo"]["title"] == "Port de Toulon 1905"
++            assert data["photo"]["status"] == "draft"
++
++            # Vérification stockage
++            storage = get_storage_driver()
++            assert await storage.exists(data["file_original_path"]) is True
++            assert await storage.exists(data["file_display_path"]) is True
++            assert await storage.exists(data["file_thumb_path"]) is True
++
++            # Nettoyage
++            async with AsyncSessionLocal() as session:
++                photo_db = await session.get(Photo, created_id)
++                if photo_db:
++                    await session.delete(photo_db)
++                    await session.commit()
++    finally:
++        app.dependency_overrides.clear()
++
++
++async def test_superadmin_can_upload_to_any_photo(setup_upload_test_data):
++    """Scénario 8: Un superadmin peut téléverser une image sur n'importe quel territoire."""
++    u_admin = setup_upload_test_data["u_admin"]
++    p_b = setup_upload_test_data["p_b"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_admin
++    try:
++        async with AsyncClient(
++            transport=ASGITransport(app=app), base_url="http://test"
++        ) as ac:
++            img_bytes = create_test_image(300, 300, fmt="JPEG")
++            response = await ac.post(
++                f"/api/v1/admin/photos/{p_b.id}/upload",
++                files={"file": ("admin_override.jpg", img_bytes, "image/jpeg")},
++            )
++
++            assert response.status_code == 200
++            data = response.json()
++            assert data["photo_id"] == str(p_b.id)
++    finally:
++        app.dependency_overrides.clear()

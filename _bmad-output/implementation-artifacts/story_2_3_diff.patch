@@ -1,0 +1,2640 @@
+diff --git a/backend/app/api/v1/admin/photos.py b/backend/app/api/v1/admin/photos.py
+new file mode 100644
+index 0000000..a610312
+--- /dev/null
++++ b/backend/app/api/v1/admin/photos.py
+@@ -0,0 +1,632 @@
++import asyncio
++import logging
++import math
++import uuid
++from datetime import datetime, timezone
++from pathlib import Path
++from typing import Annotated
++from fastapi import (
++    APIRouter,
++    Depends,
++    HTTPException,
++    Query,
++    Response,
++    status,
++    UploadFile,
++    File,
++    Form,
++)
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from geoalchemy2.elements import WKTElement
++
++from app.core.database import get_db
++from app.core.auth import get_current_active_user
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.schemas.photo import (
++    PhotoCreate,
++    PhotoUpdate,
++    PhotoRead,
++    PhotoListResponse,
++    PhotoUploadResponse,
++)
++from app.services.storage import get_storage_driver, StorageDriver
++from app.services.image_service import (
++    ImageService,
++    get_image_service,
++    FileTooLargeError,
++    InvalidImageFormatError,
++)
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/admin/photos", tags=["Administration Photos"])
++
++
++async def _purge_media_files(storage: StorageDriver, paths: list[str | None]) -> None:
++    """Nettoie physiquement les fichiers médias associés via le StorageDriver."""
++    for path in paths:
++        if path:
++            try:
++                await storage.delete(path)
++                logger.info(f"Fichier média purgé : {path}")
++            except Exception as e:
++                logger.warning(f"Erreur lors de la purge du média '{path}': {e}")
++
++
++async def _read_upload_file(file: UploadFile, max_size: int = 25 * 1024 * 1024) -> bytes:
++    """Lit le contenu du fichier téléversé et vérifie la taille limite de 25 Mo."""
++    if file.size is not None and file.size > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++
++    content = await file.read(max_size + 1)
++    if len(content) > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++    return content
++
++
++@router.post(
++    "",
++    response_model=PhotoRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Créer une nouvelle fiche photo historique",
++)
++async def create_photo(
++    photo_in: PhotoCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Crée une nouvelle fiche photo rattachée au territoire du contributeur.
++    En mode 'draft', les coordonnées GPS sont optionnelles.
++    En mode 'published', les coordonnées GPS (latitude et longitude) sont obligatoires.
++    """
++    # Résolution du territoire : strict pour les contributeurs
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = photo_in.territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour créer une photo.",
++                    }
++                },
++            )
++
++    # Construction de la géométrie PostGIS si coordonnées fournies
++    location_geom = None
++    if photo_in.latitude is not None and photo_in.longitude is not None:
++        location_geom = WKTElement(
++            f"POINT({photo_in.longitude} {photo_in.latitude})",
++            srid=4326,
++        )
++
++    new_photo = Photo(
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        title=photo_in.title,
++        description=photo_in.description,
++        photographer=photo_in.photographer,
++        year_taken=photo_in.year_taken,
++        date_exact=photo_in.date_exact,
++        period_label=photo_in.period_label,
++        archive_source=photo_in.archive_source,
++        archive_ref=photo_in.archive_ref,
++        original_source_url=photo_in.original_source_url,
++        license=photo_in.license,
++        latitude=photo_in.latitude,
++        longitude=photo_in.longitude,
++        location=location_geom,
++        bearing=photo_in.bearing,
++        field_of_view=photo_in.field_of_view,
++        file_original_path=photo_in.file_original_path,
++        file_display_path=photo_in.file_display_path,
++        file_thumb_path=photo_in.file_thumb_path,
++        status=photo_in.status,
++    )
++
++    db.add(new_photo)
++    await db.commit()
++    await db.refresh(new_photo)
++    return new_photo
++
++
++@router.get(
++    "",
++    response_model=PhotoListResponse,
++    summary="Lister les photos historiques du territoire actif",
++)
++async def list_photos(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    status_filter: PhotoStatus | None = Query(None, alias="status", description="Filtrer par statut"),
++    search: str | None = Query(None, description="Recherche textuelle sur le titre"),
++    territory_id: uuid.UUID | None = Query(None, description="Filtre territoire réservé aux superadmins"),
++):
++    """Retourne la liste paginée des photographies historiques.
++    Les contributeurs ne reçoivent strictement que les photos de leur propre territoire.
++    """
++    base_query = select(Photo)
++
++    # Cloisonnement multi-territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++    else:
++        if territory_id:
++            base_query = base_query.where(Photo.territory_id == territory_id)
++        elif current_user.territory_id:
++            base_query = base_query.where(Photo.territory_id == current_user.territory_id)
++
++    if status_filter:
++        base_query = base_query.where(Photo.status == status_filter)
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Photo.title.ilike(term) | Photo.description.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri chronologique inversé déterministe
++    paginated_query = (
++        base_query.order_by(Photo.created_at.desc(), Photo.id.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return PhotoListResponse(
++        items=items,
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.post(
++    "/upload",
++    response_model=PhotoUploadResponse,
++    status_code=status.HTTP_201_CREATED,
++    summary="Téléverser une image et créer une nouvelle fiche photo",
++)
++async def upload_photo_direct(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    file: UploadFile = File(...),
++    title: str | None = Form(None),
++    photo_id: uuid.UUID | None = Form(None),
++    territory_id: uuid.UUID | None = Form(None),
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++    image_service: ImageService = Depends(get_image_service),
++):
++    """Téléverse un cliché photographique, génère les 3 déclinaisons WebP et initialise une photo."""
++    if photo_id:
++        return await upload_photo_image(
++            photo_id=photo_id,
++            file=file,
++            current_user=current_user,
++            db=db,
++            storage=storage,
++            image_service=image_service,
++        )
++
++    # Résolution du territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour téléverser une photo.",
++                    }
++                },
++            )
++
++    content = await _read_upload_file(file, max_size=image_service.MAX_FILE_SIZE)
++    new_photo_id = uuid.uuid4()
++
++    try:
++        proc_result = await asyncio.to_thread(
++            image_service.process_image,
++            content=content,
++            territory_id=target_territory_id,
++            photo_id=new_photo_id,
++            filename=file.filename,
++        )
++    except FileTooLargeError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": "Le fichier dépasse la taille maximale autorisée de 25 Mo.",
++                }
++            },
++        )
++    except InvalidImageFormatError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_IMAGE_FORMAT",
++                    "message": "Format d'image non valide ou fichier corrompu.",
++                }
++            },
++        )
++
++    saved_urls = await image_service.save_variants(proc_result, storage)
++
++    photo_title = (
++        title.strip()
++        if (title and title.strip())
++        else (Path(file.filename).stem if file.filename else "Nouvelle photo")
++    )
++
++    new_photo = Photo(
++        id=new_photo_id,
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        title=photo_title,
++        file_original_path=proc_result.original.path,
++        file_display_path=proc_result.display.path,
++        file_thumb_path=proc_result.thumb.path,
++        status=PhotoStatus.DRAFT,
++    )
++
++    db.add(new_photo)
++    await db.commit()
++    await db.refresh(new_photo)
++
++    return PhotoUploadResponse(
++        photo_id=new_photo.id,
++        file_original_path=new_photo.file_original_path,
++        file_display_path=new_photo.file_display_path,
++        file_thumb_path=new_photo.file_thumb_path,
++        original_url=saved_urls.get("original_url") or storage.resolve_url(new_photo.file_original_path),
++        display_url=saved_urls.get("display_url") or storage.resolve_url(new_photo.file_display_path),
++        thumb_url=saved_urls.get("thumb_url") or storage.resolve_url(new_photo.file_thumb_path),
++        width=proc_result.width,
++        height=proc_result.height,
++        photo=PhotoRead.model_validate(new_photo),
++    )
++
++
++@router.post(
++    "/{photo_id}/upload",
++    response_model=PhotoUploadResponse,
++    status_code=status.HTTP_200_OK,
++    summary="Téléverser et traiter l'image d'une photo existante",
++)
++async def upload_photo_image(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    file: UploadFile = File(...),
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++    image_service: ImageService = Depends(get_image_service),
++):
++    """Téléverse une image pour une fiche photo existante, produit les déclinaisons WebP et purge l'ancien média."""
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    content = await _read_upload_file(file, max_size=image_service.MAX_FILE_SIZE)
++
++    try:
++        proc_result = await asyncio.to_thread(
++            image_service.process_image,
++            content=content,
++            territory_id=photo.territory_id,
++            photo_id=photo.id,
++            filename=file.filename,
++        )
++    except FileTooLargeError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": "Le fichier dépasse la taille maximale autorisée de 25 Mo.",
++                }
++            },
++        )
++    except InvalidImageFormatError:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_IMAGE_FORMAT",
++                    "message": "Format d'image non valide ou fichier corrompu.",
++                }
++            },
++        )
++
++    # Sauvegarde des nouveaux variants
++    saved_urls = await image_service.save_variants(proc_result, storage)
++
++    # Récupération des anciens chemins différents des nouveaux à purger
++    old_paths = [
++        p
++        for p in [photo.file_original_path, photo.file_display_path, photo.file_thumb_path]
++        if p and p not in (proc_result.original.path, proc_result.display.path, proc_result.thumb.path)
++    ]
++
++    photo.file_original_path = proc_result.original.path
++    photo.file_display_path = proc_result.display.path
++    photo.file_thumb_path = proc_result.thumb.path
++    photo.updated_at = datetime.now(timezone.utc)
++
++    await db.commit()
++    await db.refresh(photo)
++
++    # Purge des anciens médias désormais orphelins
++    if old_paths:
++        await _purge_media_files(storage, old_paths)
++
++    return PhotoUploadResponse(
++        photo_id=photo.id,
++        file_original_path=photo.file_original_path,
++        file_display_path=photo.file_display_path,
++        file_thumb_path=photo.file_thumb_path,
++        original_url=saved_urls.get("original_url") or storage.resolve_url(photo.file_original_path),
++        display_url=saved_urls.get("display_url") or storage.resolve_url(photo.file_display_path),
++        thumb_url=saved_urls.get("thumb_url") or storage.resolve_url(photo.file_thumb_path),
++        width=proc_result.width,
++        height=proc_result.height,
++        photo=PhotoRead.model_validate(photo),
++    )
++
++
++@router.get(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Consulter le détail d'une fiche photo",
++)
++async def get_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Récupère une photo par son identifiant unique.
++    Renvoie 404 si la photo n'existe pas ou appartient à un autre territoire.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    return photo
++
++
++@router.patch(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour partiellement une fiche photo",
++)
++@router.put(
++    "/{photo_id}",
++    response_model=PhotoRead,
++    summary="Mettre à jour une fiche photo",
++)
++async def update_photo(
++    photo_id: uuid.UUID,
++    photo_in: PhotoUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Met à jour une fiche photo existante.
++    Vérifie le cloisonnement territorial et impose la présence de coordonnées GPS si le statut est 'published'.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    update_data = photo_in.model_dump(exclude_unset=True)
++
++    # Calcul des coordonnées et du statut résultants
++    target_status = update_data.get("status", photo.status)
++    target_lat = update_data.get("latitude", photo.latitude)
++    target_lng = update_data.get("longitude", photo.longitude)
++
++    if target_status == PhotoStatus.PUBLISHED:
++        if target_lat is None or target_lng is None:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "COORDINATES_REQUIRED",
++                        "message": "Les coordonnées géographiques (latitude et longitude) sont obligatoires pour publier une photo.",
++                    }
++                },
++            )
++
++    # Mise à jour des attributs du modèle
++    for field, value in update_data.items():
++        if field in ("latitude", "longitude"):
++            continue
++        elif field in ("year", "year_taken"):
++            photo.year_taken = value
++        elif field in ("archive_ref", "archive_reference"):
++            photo.archive_ref = value
++        elif field in ("source_url", "original_source_url"):
++            photo.original_source_url = value
++        elif field in ("image_original_path", "file_original_path"):
++            photo.file_original_path = value
++        elif field in ("image_display_path", "file_display_path"):
++            photo.file_display_path = value
++        elif field in ("image_thumb_path", "file_thumb_path"):
++            photo.file_thumb_path = value
++        elif field == "territory_id":
++            if current_user.role == UserRole.SUPERADMIN and value is not None:
++                photo.territory_id = value
++        elif hasattr(photo, field):
++            setattr(photo, field, value)
++
++    # Mise à jour des coordonnées et de la géométrie PostGIS
++    if "latitude" in update_data or "longitude" in update_data:
++        if (target_lat is None) != (target_lng is None):
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "COORDINATES_INCOMPLETE",
++                        "message": "La latitude et la longitude doivent être fournies ensemble.",
++                    }
++                },
++            )
++        photo.latitude = target_lat
++        photo.longitude = target_lng
++        if target_lat is not None and target_lng is not None:
++            photo.location = WKTElement(f"POINT({target_lng} {target_lat})", srid=4326)
++        else:
++            photo.location = None
++
++    photo.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(photo)
++    return photo
++
++
++@router.delete(
++    "/{photo_id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une fiche photo et ses fichiers médias associés",
++)
++async def delete_photo(
++    photo_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++):
++    """Supprime définitivement la fiche photo de la base de données
++    et nettoie physiquement tous les fichiers médias associés via le StorageDriver.
++    """
++    query = select(Photo).where(Photo.id == photo_id)
++    if current_user.role != UserRole.SUPERADMIN:
++        query = query.where(Photo.territory_id == current_user.territory_id)
++
++    result = await db.execute(query)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photo non trouvée",
++                }
++            },
++        )
++
++    # Mémorisation des chemins de fichiers pour nettoyage post-commit
++    media_paths = [
++        photo.file_original_path,
++        photo.file_display_path,
++        photo.file_thumb_path,
++    ]
++
++    # Suppression en base de données en premier pour garantir la cohérence transactionnelle
++    await db.delete(photo)
++    await db.commit()
++
++    # Nettoyage des fichiers physiques via le StorageDriver après validation en base
++    driver = get_storage_driver() or storage
++    await _purge_media_files(driver, media_paths)
++
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+diff --git a/frontend/src/App.vue b/frontend/src/App.vue
+new file mode 100644
+index 0000000..d6ae158
+--- /dev/null
++++ b/frontend/src/App.vue
+@@ -0,0 +1,300 @@
++<script setup lang="ts">
++import { ref, onMounted } from 'vue'
++import { photoApi, setAuthToken, hasAuthToken } from './services/api'
++import PhotoAdminCatalog from './components/admin/PhotoAdminCatalog.vue'
++
++const currentTab = ref<'decouverte' | 'studio'>('studio')
++
++const apiHealth = ref<{ status: string; database: string } | null>(null)
++const territory = ref<{ slug: string; name: string; center_lat: number; center_lng: number; default_zoom: number } | null>(null)
++const currentUser = ref<{ email: string; full_name?: string; role: string } | null>(null)
++const loading = ref(true)
++const error = ref<string | null>(null)
++
++// Modal de connexion
++const isLoginModalOpen = ref(false)
++const loginEmail = ref('admin@hierici.local')
++const loginPassword = ref('admin_hierici_2026')
++const loginError = ref<string | null>(null)
++const isLoggingIn = ref(false)
++
++async function authenticate() {
++  try {
++    if (hasAuthToken()) {
++      try {
++        currentUser.value = await photoApi.getMe()
++        return
++      } catch {
++        setAuthToken(null)
++      }
++    }
++
++    // Tentative d'auto-authentification avec le compte de développement local
++    const loginRes = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = loginRes.user
++  } catch (err: any) {
++    console.warn('Authentification requise pour le Studio:', err.message)
++  }
++}
++
++async function handleManualLogin() {
++  loginError.value = null
++  isLoggingIn.value = true
++
++  try {
++    const res = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = res.user
++    isLoginModalOpen.value = false
++  } catch (err: any) {
++    loginError.value = err.message || 'Identifiants invalides'
++  } finally {
++    isLoggingIn.value = false
++  }
++}
++
++function handleLogout() {
++  setAuthToken(null)
++  currentUser.value = null
++}
++
++onMounted(async () => {
++  try {
++    const [healthRes, territoryRes] = await Promise.all([
++      photoApi.getHealth().catch(() => null),
++      photoApi.getCurrentTerritory().catch(() => null),
++    ])
++
++    if (healthRes) apiHealth.value = healthRes
++    if (territoryRes) territory.value = territoryRes
++
++    // Connexion automatique initiale pour le studio
++    await authenticate()
++  } catch (e: any) {
++    error.value = "Impossible de contacter l'API backend"
++  } finally {
++    loading.value = false
++  }
++})
++</script>
++
++<template>
++  <main class="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500 selection:text-white">
++    <!-- En-tête Global -->
++    <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur-md sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg">
++      <div class="flex items-center space-x-6">
++        <div class="flex items-center space-x-3 cursor-pointer" @click="currentTab = 'studio'">
++          <span class="text-2xl drop-shadow">🧭</span>
++          <div>
++            <h1 class="text-lg font-black tracking-tight text-white flex items-center gap-2">
++              <span>HierIci</span>
++              <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
++                Studio 2.0
++              </span>
++            </h1>
++            <p class="text-[11px] text-slate-400">Patrimoine géohistorique & archives territoriales</p>
++          </div>
++        </div>
++
++        <!-- Onglets de Navigation Principale -->
++        <nav class="hidden md:flex items-center space-x-1 bg-slate-950/70 p-1 rounded-xl border border-slate-800 text-xs">
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'studio' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'studio'"
++          >
++            <span>🗂️</span>
++            <span>Studio Admin</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'decouverte'"
++          >
++            <span>🗺️</span>
++            <span>Découverte Publique</span>
++          </button>
++        </nav>
++      </div>
++
++      <!-- Informations de session & statut -->
++      <div class="flex items-center space-x-3 text-xs">
++        <!-- Badge Territoire -->
++        <span
++          v-if="territory"
++          class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-medium bg-slate-800/80 text-slate-300 border border-slate-700"
++          :title="`Centre : ${territory.center_lat.toFixed(4)}, ${territory.center_lng.toFixed(4)}`"
++        >
++          📍 {{ territory.name }}
++        </span>
++
++        <!-- Badge Santé API -->
++        <span
++          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium"
++          :class="apiHealth?.database === 'connected' ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800' : 'bg-amber-950/80 text-amber-400 border border-amber-800'"
++        >
++          <span class="w-1.5 h-1.5 rounded-full" :class="apiHealth?.database === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
++          {{ apiHealth?.database === 'connected' ? 'API Connectée' : 'Connexion...' }}
++        </span>
++
++        <!-- Utilisateur connecté -->
++        <div v-if="currentUser" class="flex items-center gap-2 pl-2 border-l border-slate-800">
++          <div class="hidden lg:block text-right">
++            <div class="text-[11px] font-semibold text-white leading-tight">
++              {{ currentUser.full_name || currentUser.email }}
++            </div>
++            <div class="text-[10px] text-slate-400 capitalize">
++              {{ currentUser.role }}
++            </div>
++          </div>
++          <button
++            type="button"
++            class="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++            title="Se déconnecter"
++            @click="handleLogout"
++          >
++            🚪
++          </button>
++        </div>
++        <button
++          v-else
++          type="button"
++          class="px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg font-medium transition-colors"
++          @click="isLoginModalOpen = true"
++        >
++          Connexion
++        </button>
++      </div>
++    </header>
++
++    <!-- Navigation mobile sous l'en-tête -->
++    <div class="md:hidden border-b border-slate-800 bg-slate-900 px-6 py-2 flex items-center justify-center space-x-2 text-xs">
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'studio' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'studio'"
++      >
++        🗂️ Studio Admin
++      </button>
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'decouverte'"
++      >
++        🗺️ Découverte
++      </button>
++    </div>
++
++    <!-- Contenu Principal -->
++    <div class="flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8">
++      <!-- VUE STUDIO ADMIN (Story 2.3) -->
++      <section v-if="currentTab === 'studio'" class="space-y-6">
++        <PhotoAdminCatalog />
++      </section>
++
++      <!-- VUE DÉCOUVERTE PUBLIQUE -->
++      <section v-else-if="currentTab === 'decouverte'" class="py-12 max-w-4xl mx-auto space-y-8">
++        <div class="text-center space-y-4">
++          <div class="inline-block px-3 py-1 rounded-full bg-indigo-950/60 border border-indigo-800 text-indigo-300 text-xs font-semibold uppercase tracking-wider">
++            Exploration Cartographique & Patrimoniale
++          </div>
++          <h2 class="text-4xl font-extrabold text-white tracking-tight">
++            Carte Interactive & Cônes d'Orientation
++          </h2>
++          <p class="text-slate-300 max-w-2xl mx-auto text-sm leading-relaxed">
++            Naviguez sur la carte vectorielle pour découvrir les clichés historiques sous l'angle exact où les photographes ont immortalisé le paysage territorial.
++          </p>
++        </div>
++
++        <div class="p-8 rounded-2xl bg-slate-900/60 border border-slate-800 text-center space-y-4">
++          <div class="w-16 h-16 mx-auto rounded-full bg-sky-950/80 border border-sky-800 flex items-center justify-center text-3xl">
++            🗺️
++          </div>
++          <h3 class="text-lg font-bold text-white">Visualiseur MapLibre GL JS</h3>
++          <p class="text-xs text-slate-400 max-w-md mx-auto">
++            Le visualiseur cartographique avec clustering dynamique et projection des polygones d'azimut est en cours d'intégration dans l'Epic 3.
++          </p>
++          <button
++            type="button"
++            class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold rounded-lg transition-all shadow-lg shadow-sky-950/50 inline-flex items-center gap-2"
++            @click="currentTab = 'studio'"
++          >
++            <span>← Revenir au Studio pour gérer le catalogue</span>
++          </button>
++        </div>
++      </section>
++    </div>
++
++    <!-- Modale de connexion manuelle -->
++    <div
++      v-if="isLoginModalOpen"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isLoginModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4">
++        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
++          <h3 class="text-base font-bold text-white">Connexion au Studio</h3>
++          <button
++            type="button"
++            class="text-slate-400 hover:text-white"
++            @click="isLoginModalOpen = false"
++          >
++            ✕
++          </button>
++        </div>
++
++        <div v-if="loginError" class="p-2.5 rounded-lg bg-rose-950/80 border border-rose-800 text-xs text-rose-300">
++          {{ loginError }}
++        </div>
++
++        <form class="space-y-4" @submit.prevent="handleManualLogin">
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Email</label>
++            <input
++              v-model="loginEmail"
++              type="email"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Mot de passe</label>
++            <input
++              v-model="loginPassword"
++              type="password"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div class="flex items-center justify-end gap-2 pt-2">
++            <button
++              type="button"
++              class="px-3 py-1.5 text-xs text-slate-400 hover:text-white"
++              @click="isLoginModalOpen = false"
++            >
++              Annuler
++            </button>
++            <button
++              type="submit"
++              class="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-md flex items-center gap-1.5"
++              :disabled="isLoggingIn"
++            >
++              <span v-if="isLoggingIn" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++              <span>Connexion</span>
++            </button>
++          </div>
++        </form>
++      </div>
++    </div>
++
++    <!-- Pied de page -->
++    <footer class="border-t border-slate-800/80 bg-slate-950 px-6 py-4 text-center text-xs text-slate-500">
++      HierIci — Studio d'Administration & Métadonnées d'Archives (Story 2.3)
++    </footer>
++  </main>
++</template>
+diff --git a/frontend/src/components/admin/PhotoAdminCatalog.vue b/frontend/src/components/admin/PhotoAdminCatalog.vue
+new file mode 100644
+index 0000000..1b5acfc
+--- /dev/null
++++ b/frontend/src/components/admin/PhotoAdminCatalog.vue
+@@ -0,0 +1,485 @@
++<script setup lang="ts">
++import { ref, onMounted, watch } from 'vue'
++import type { Photo, PhotoStatus } from '@/types/photo'
++import { photoApi, ApiError } from '@/services/api'
++import PhotoFormModal from './PhotoFormModal.vue'
++
++// État du catalogue
++const photos = ref<Photo[]>([])
++const totalPhotos = ref(0)
++const currentPage = ref(1)
++const pageSize = ref(15)
++const totalPages = ref(1)
++const isLoading = ref(false)
++const errorMessage = ref<string | null>(null)
++
++// Filtres
++const searchQuery = ref('')
++const statusFilter = ref<PhotoStatus | ''>('')
++let searchDebounceTimeout: any = null
++
++// Modale de création / édition
++const isModalOpen = ref(false)
++const selectedPhotoForEdit = ref<Photo | null>(null)
++
++// Modale de confirmation de suppression
++const isDeleteModalOpen = ref(false)
++const photoToDelete = ref<Photo | null>(null)
++const isDeleting = ref(false)
++
++// Notifications Toast
++interface Toast {
++  id: number
++  message: string
++  type: 'success' | 'error' | 'info'
++}
++const toasts = ref<Toast[]>([])
++let toastCounter = 0
++
++function addToast(message: string, type: 'success' | 'error' | 'info' = 'info') {
++  const id = ++toastCounter
++  toasts.value.push({ id, message, type })
++  setTimeout(() => {
++    toasts.value = toasts.value.filter((t) => t.id !== id)
++  }, 4500)
++}
++
++// Chargement des photographies
++async function loadPhotos() {
++  isLoading.value = true
++  errorMessage.value = null
++
++  try {
++    const res = await photoApi.listPhotos({
++      page: currentPage.value,
++      page_size: pageSize.value,
++      status: statusFilter.value || undefined,
++      search: searchQuery.value || undefined,
++    })
++
++    photos.value = res.items
++    totalPhotos.value = res.total
++    totalPages.value = res.pages || 1
++    currentPage.value = res.page
++  } catch (err: any) {
++    errorMessage.value = err.message || 'Impossible de charger le catalogue des photographies.'
++    addToast(errorMessage.value || 'Erreur chargement', 'error')
++  } finally {
++    isLoading.value = false
++  }
++}
++
++// Déclencheurs de filtrage avec debounce
++watch(searchQuery, () => {
++  clearTimeout(searchDebounceTimeout)
++  searchDebounceTimeout = setTimeout(() => {
++    currentPage.value = 1
++    loadPhotos()
++  }, 350)
++})
++
++watch(statusFilter, () => {
++  currentPage.value = 1
++  loadPhotos()
++})
++
++function changePage(newPage: number) {
++  if (newPage >= 1 && newPage <= totalPages.value) {
++    currentPage.value = newPage
++    loadPhotos()
++  }
++}
++
++// Actions de gestion
++function openCreateModal() {
++  selectedPhotoForEdit.value = null
++  isModalOpen.value = true
++}
++
++function openEditModal(photo: Photo) {
++  selectedPhotoForEdit.value = photo
++  isModalOpen.value = true
++}
++
++function handlePhotoSaved(savedPhoto: Photo) {
++  // Recharger le catalogue pour refléter les ajouts/modifications
++  loadPhotos()
++}
++
++function confirmDeletePhoto(photo: Photo) {
++  photoToDelete.value = photo
++  isDeleteModalOpen.value = true
++}
++
++async function executeDeletePhoto() {
++  if (!photoToDelete.value) return
++
++  isDeleting.value = true
++  const deletedTitle = photoToDelete.value.title
++
++  try {
++    await photoApi.deletePhoto(photoToDelete.value.id)
++    addToast(`Cliché "${deletedTitle}" supprimé avec succès.`, 'success')
++    isDeleteModalOpen.value = false
++    photoToDelete.value = null
++    // Recharger la liste
++    await loadPhotos()
++  } catch (err: any) {
++    addToast(err.message || 'Erreur lors de la suppression du cliché', 'error')
++  } finally {
++    isDeleting.value = false
++  }
++}
++
++onMounted(() => {
++  loadPhotos()
++})
++</script>
++
++<template>
++  <div class="space-y-6">
++    <!-- Barre de titre & Actions principales -->
++    <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 pb-4 border-b border-slate-800">
++      <div>
++        <div class="flex items-center gap-3">
++          <h2 class="text-2xl font-extrabold text-white tracking-tight">Studio Catalogue</h2>
++          <span class="px-2.5 py-0.5 rounded-full text-xs font-semibold bg-sky-950 text-sky-400 border border-sky-800">
++            {{ totalPhotos }} cliché{{ totalPhotos > 1 ? 's' : '' }}
++          </span>
++        </div>
++        <p class="text-xs text-slate-400 mt-1">
++          Inventaire, géoréférencement directionnel et métadonnées des photographies patrimoniales.
++        </p>
++      </div>
++
++      <div class="flex items-center gap-3">
++        <button
++          type="button"
++          class="px-3 py-2 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors flex items-center gap-2"
++          :disabled="isLoading"
++          @click="loadPhotos"
++          title="Actualiser le catalogue"
++        >
++          <span :class="isLoading ? 'animate-spin' : ''">🔄</span>
++          <span>Actualiser</span>
++        </button>
++
++        <button
++          type="button"
++          class="px-4 py-2 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-500 rounded-lg shadow-lg shadow-sky-950/50 transition-all flex items-center gap-2"
++          @click="openCreateModal"
++        >
++          <span class="text-base leading-none">＋</span>
++          <span>Nouveau Cliché</span>
++        </button>
++      </div>
++    </div>
++
++    <!-- Barre de recherche et filtres -->
++    <div class="bg-slate-900/60 p-4 rounded-xl border border-slate-800 flex flex-col md:flex-row gap-3 items-stretch md:items-center justify-between">
++      <!-- Recherche texte -->
++      <div class="relative flex-1">
++        <span class="absolute inset-y-0 left-0 pl-3.5 flex items-center pointer-events-none text-slate-400">
++          🔍
++        </span>
++        <input
++          v-model="searchQuery"
++          type="text"
++          placeholder="Rechercher par titre, description, auteur ou cote..."
++          class="w-full bg-slate-950/80 border border-slate-700/80 rounded-lg pl-10 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all"
++        />
++        <button
++          v-if="searchQuery"
++          type="button"
++          class="absolute inset-y-0 right-0 pr-3 flex items-center text-slate-400 hover:text-white"
++          @click="searchQuery = ''"
++        >
++          ✕
++        </button>
++      </div>
++
++      <!-- Filtre statut -->
++      <div class="flex items-center gap-2">
++        <label class="text-xs text-slate-400 whitespace-nowrap">Statut :</label>
++        <select
++          v-model="statusFilter"
++          class="bg-slate-950/80 border border-slate-700/80 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++        >
++          <option value="">Tous les statuts</option>
++          <option value="draft">Brouillons uniquement</option>
++          <option value="published">Publiés uniquement</option>
++        </select>
++      </div>
++    </div>
++
++    <!-- Tableau du catalogue -->
++    <div class="bg-slate-900/80 border border-slate-800 rounded-xl overflow-hidden shadow-xl">
++      <div class="overflow-x-auto">
++        <table class="w-full text-left text-xs text-slate-300">
++          <thead class="bg-slate-950/70 text-slate-400 uppercase tracking-wider text-[11px] border-b border-slate-800">
++            <tr>
++              <th scope="col" class="py-3 px-4 w-20">Aperçu</th>
++              <th scope="col" class="py-3 px-4">Titre & Description</th>
++              <th scope="col" class="py-3 px-4 w-32">Époque / Date</th>
++              <th scope="col" class="py-3 px-4 w-36">Fonds / Cote</th>
++              <th scope="col" class="py-3 px-4 w-36">Position & Azimut</th>
++              <th scope="col" class="py-3 px-4 w-28">Statut</th>
++              <th scope="col" class="py-3 px-4 w-28 text-right">Actions</th>
++            </tr>
++          </thead>
++          <tbody class="divide-y divide-slate-800/80">
++            <!-- Spinner chargement -->
++            <tr v-if="isLoading">
++              <td colspan="7" class="py-12 text-center text-slate-400">
++                <div class="w-8 h-8 mx-auto border-2 border-sky-400 border-t-transparent rounded-full animate-spin mb-3"></div>
++                Chargement du catalogue photographique...
++              </td>
++            </tr>
++
++            <!-- Message vide -->
++            <tr v-else-if="photos.length === 0">
++              <td colspan="7" class="py-12 text-center text-slate-400">
++                <div class="text-3xl mb-2">📂</div>
++                <div class="font-medium text-slate-300">Aucun cliché trouvé</div>
++                <p class="text-xs text-slate-500 mt-1">
++                  {{ searchQuery || statusFilter ? 'Aucun résultat ne correspond à vos filtres.' : 'Commencez par ajouter votre premier cliché d\'archive.' }}
++                </p>
++                <button
++                  v-if="!searchQuery && !statusFilter"
++                  type="button"
++                  class="mt-4 px-3 py-1.5 text-xs font-semibold text-white bg-sky-600 hover:bg-sky-500 rounded-lg inline-flex items-center gap-1.5"
++                  @click="openCreateModal"
++                >
++                  <span>＋</span>
++                  <span>Ajouter une photographie</span>
++                </button>
++              </td>
++            </tr>
++
++            <!-- Lignes du tableau -->
++            <tr
++              v-for="photo in photos"
++              :key="photo.id"
++              class="hover:bg-slate-800/40 transition-colors group"
++            >
++              <!-- Vignette -->
++              <td class="py-3 px-4">
++                <div class="w-14 h-14 rounded-lg bg-slate-950 border border-slate-800 overflow-hidden flex items-center justify-center relative">
++                  <img
++                    v-if="photo.thumb_url || photo.image_thumb_url || photo.display_url"
++                    :src="photo.thumb_url || photo.image_thumb_url || photo.display_url || ''"
++                    :alt="photo.title"
++                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
++                    loading="lazy"
++                  />
++                  <span v-else class="text-xl text-slate-600">📷</span>
++                </div>
++              </td>
++
++              <!-- Titre & Description -->
++              <td class="py-3 px-4 max-w-xs">
++                <div class="font-semibold text-white truncate text-sm" :title="photo.title">
++                  {{ photo.title }}
++                </div>
++                <p
++                  v-if="photo.description"
++                  class="text-slate-400 line-clamp-1 text-xs mt-0.5"
++                  :title="photo.description"
++                >
++                  {{ photo.description }}
++                </p>
++                <div class="flex items-center gap-2 mt-1 text-[11px] text-slate-500">
++                  <span v-if="photo.photographer">👤 {{ photo.photographer }}</span>
++                  <span v-if="photo.license" class="text-slate-400">⚖️ {{ photo.license }}</span>
++                </div>
++              </td>
++
++              <!-- Époque / Date -->
++              <td class="py-3 px-4">
++                <div v-if="photo.year_taken || photo.year" class="font-medium text-white">
++                  {{ photo.year_taken || photo.year }}
++                </div>
++                <div v-if="photo.date_exact" class="text-[11px] text-slate-400">
++                  {{ photo.date_exact }}
++                </div>
++                <div v-if="photo.period_label" class="text-[11px] text-sky-400/90 mt-0.5">
++                  {{ photo.period_label }}
++                </div>
++                <div v-if="!photo.year_taken && !photo.year && !photo.period_label" class="text-slate-600">
++                  —
++                </div>
++              </td>
++
++              <!-- Fonds / Cote -->
++              <td class="py-3 px-4">
++                <div v-if="photo.archive_ref || photo.archive_reference" class="font-mono text-sky-300 font-semibold">
++                  {{ photo.archive_ref || photo.archive_reference }}
++                </div>
++                <div v-if="photo.archive_source" class="text-[11px] text-slate-400 truncate max-w-[140px]" :title="photo.archive_source">
++                  {{ photo.archive_source }}
++                </div>
++                <div v-if="!photo.archive_ref && !photo.archive_reference && !photo.archive_source" class="text-slate-600">
++                  —
++                </div>
++              </td>
++
++              <!-- Position & Azimut -->
++              <td class="py-3 px-4">
++                <div v-if="photo.latitude !== null && photo.latitude !== undefined && photo.longitude !== null && photo.longitude !== undefined" class="space-y-0.5">
++                  <span class="inline-flex items-center gap-1 text-emerald-400 font-mono text-[11px]">
++                    📍 {{ photo.latitude.toFixed(4) }}, {{ photo.longitude.toFixed(4) }}
++                  </span>
++                  <div class="text-[11px] text-slate-400 flex items-center gap-1">
++                    <span>🧭</span>
++                    <span>{{ photo.bearing !== null && photo.bearing !== undefined ? `${photo.bearing}°` : 'Sans azimut' }}</span>
++                    <span v-if="photo.field_of_view">({{ photo.field_of_view }}°)</span>
++                  </div>
++                </div>
++                <div v-else>
++                  <span class="inline-flex items-center gap-1 text-amber-500 text-[11px]">
++                    ⚠️ Non géolocalisé
++                  </span>
++                </div>
++              </td>
++
++              <!-- Statut -->
++              <td class="py-3 px-4">
++                <span
++                  v-if="photo.status === 'published'"
++                  class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-emerald-950/80 text-emerald-400 border border-emerald-800"
++                >
++                  <span class="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
++                  Publié
++                </span>
++                <span
++                  v-else
++                  class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-semibold bg-amber-950/80 text-amber-400 border border-amber-800"
++                >
++                  <span class="w-1.5 h-1.5 rounded-full bg-amber-400"></span>
++                  Brouillon
++                </span>
++              </td>
++
++              <!-- Actions -->
++              <td class="py-3 px-4 text-right whitespace-nowrap">
++                <div class="flex items-center justify-end gap-1.5">
++                  <button
++                    type="button"
++                    class="px-2.5 py-1 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded transition-colors"
++                    title="Modifier la fiche"
++                    @click="openEditModal(photo)"
++                  >
++                    ✏️ Modifier
++                  </button>
++                  <button
++                    type="button"
++                    class="p-1 text-xs text-rose-400 hover:text-rose-200 hover:bg-rose-950/60 rounded transition-colors"
++                    title="Supprimer la fiche"
++                    @click="confirmDeletePhoto(photo)"
++                  >
++                    🗑️
++                  </button>
++                </div>
++              </td>
++            </tr>
++          </tbody>
++        </table>
++      </div>
++
++      <!-- Pagination -->
++      <div class="px-4 py-3 bg-slate-950/60 border-t border-slate-800 flex items-center justify-between text-xs text-slate-400">
++        <div>
++          Affichage de <span class="font-medium text-white">{{ photos.length }}</span> sur <span class="font-medium text-white">{{ totalPhotos }}</span> clichés
++        </div>
++
++        <div class="flex items-center gap-2">
++          <button
++            type="button"
++            class="px-3 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-all"
++            :disabled="currentPage <= 1 || isLoading"
++            @click="changePage(currentPage - 1)"
++          >
++            ← Précédent
++          </button>
++
++          <span class="px-2">Page {{ currentPage }} / {{ totalPages }}</span>
++
++          <button
++            type="button"
++            class="px-3 py-1 rounded bg-slate-800 border border-slate-700 text-slate-300 hover:text-white disabled:opacity-40 disabled:cursor-not-allowed transition-all"
++            :disabled="currentPage >= totalPages || isLoading"
++            @click="changePage(currentPage + 1)"
++          >
++            Suivant →
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Modale de création / édition PhotoFormModal -->
++    <PhotoFormModal
++      :is-open="isModalOpen"
++      :photo-to-edit="selectedPhotoForEdit"
++      @close="isModalOpen = false"
++      @saved="handlePhotoSaved"
++      @toast="addToast"
++    />
++
++    <!-- Modale de confirmation de suppression -->
++    <div
++      v-if="isDeleteModalOpen && photoToDelete"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isDeleteModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
++        <div class="w-12 h-12 rounded-full bg-rose-950/80 border border-rose-800 flex items-center justify-center text-2xl text-rose-400 mx-auto">
++          🗑️
++        </div>
++
++        <div class="text-center space-y-1.5">
++          <h3 class="text-base font-bold text-white">Supprimer ce cliché d'archive ?</h3>
++          <p class="text-xs text-slate-400">
++            Cette action est irréversible. La fiche documentaire <strong class="text-slate-200">"{{ photoToDelete.title }}"</strong> ainsi que toutes ses déclinaisons d'images WebP associées seront définitivement détruites.
++          </p>
++        </div>
++
++        <div class="flex items-center justify-end gap-3 pt-2">
++          <button
++            type="button"
++            class="px-4 py-2 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors"
++            :disabled="isDeleting"
++            @click="isDeleteModalOpen = false"
++          >
++            Annuler
++          </button>
++          <button
++            type="button"
++            class="px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg shadow-lg shadow-rose-950/50 transition-all flex items-center gap-1.5"
++            :disabled="isDeleting"
++            @click="executeDeletePhoto"
++          >
++            <span v-if="isDeleting" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++            <span>{{ isDeleting ? 'Suppression...' : 'Confirmer la suppression' }}</span>
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Conteneur des notifications Toast -->
++    <div class="fixed bottom-5 right-5 z-50 flex flex-col gap-2 max-w-sm pointer-events-none">
++      <div
++        v-for="toast in toasts"
++        :key="toast.id"
++        class="pointer-events-auto px-4 py-3 rounded-xl shadow-xl border text-xs font-medium flex items-center gap-2.5 transition-all animate-in slide-in-from-bottom-2 duration-200"
++        :class="{
++          'bg-emerald-950 border-emerald-800 text-emerald-200': toast.type === 'success',
++          'bg-rose-950 border-rose-800 text-rose-200': toast.type === 'error',
++          'bg-slate-900 border-slate-700 text-slate-200': toast.type === 'info',
++        }"
++      >
++        <span>{{ toast.type === 'success' ? '✅' : toast.type === 'error' ? '❌' : 'ℹ️' }}</span>
++        <span class="flex-1">{{ toast.message }}</span>
++      </div>
++    </div>
++  </div>
++</template>
+diff --git a/frontend/src/components/admin/PhotoFormModal.vue b/frontend/src/components/admin/PhotoFormModal.vue
+new file mode 100644
+index 0000000..3602719
+--- /dev/null
++++ b/frontend/src/components/admin/PhotoFormModal.vue
+@@ -0,0 +1,806 @@
++<script setup lang="ts">
++import { ref, computed, watch } from 'vue'
++import type { Photo, PhotoCreatePayload, PhotoUpdatePayload, PhotoStatus, PhotoLicense } from '@/types/photo'
++import { PHOTO_LICENSES } from '@/types/photo'
++import { photoApi, ApiError } from '@/services/api'
++
++const props = defineProps<{
++  isOpen: boolean
++  photoToEdit?: Photo | null
++}>()
++
++const emit = defineEmits<{
++  (e: 'close'): void
++  (e: 'saved', photo: Photo): void
++  (e: 'toast', message: string, type?: 'success' | 'error' | 'info'): void
++}>()
++
++// État du formulaire
++const form = ref<{
++  id?: string
++  title: string
++  description: string
++  photographer: string
++  year_taken: number | null
++  date_exact: string
++  period_label: string
++  archive_source: string
++  archive_ref: string
++  original_source_url: string
++  license: PhotoLicense | string
++  latitude: number | null
++  longitude: number | null
++  bearing: number | null
++  field_of_view: number
++  status: PhotoStatus
++  thumb_url?: string | null
++  display_url?: string | null
++  original_url?: string | null
++}>({
++  title: '',
++  description: '',
++  photographer: '',
++  year_taken: null,
++  date_exact: '',
++  period_label: '',
++  archive_source: '',
++  archive_ref: '',
++  original_source_url: '',
++  license: 'Domaine Public',
++  latitude: null,
++  longitude: null,
++  bearing: null,
++  field_of_view: 60,
++  status: 'draft',
++})
++
++const isSubmitting = ref(false)
++const isUploadingImage = ref(false)
++const uploadProgress = ref(false)
++const localImagePreview = ref<string | null>(null)
++const selectedImageFile = ref<File | null>(null)
++const errorMessage = ref<string | null>(null)
++const activeTab = ref<'document' | 'geo' | 'media'>('document')
++const fileInputRef = ref<HTMLInputElement | null>(null)
++
++// Initialisation du formulaire lors du changement de prop photoToEdit
++watch(
++  () => props.photoToEdit,
++  (newVal) => {
++    errorMessage.value = null
++    localImagePreview.value = null
++    selectedImageFile.value = null
++
++    if (newVal) {
++      form.value = {
++        id: newVal.id,
++        title: newVal.title || '',
++        description: newVal.description || '',
++        photographer: newVal.photographer || '',
++        year_taken: newVal.year_taken ?? newVal.year ?? null,
++        date_exact: newVal.date_exact || '',
++        period_label: newVal.period_label || '',
++        archive_source: newVal.archive_source || '',
++        archive_ref: newVal.archive_ref ?? newVal.archive_reference ?? '',
++        original_source_url: newVal.original_source_url ?? newVal.source_url ?? '',
++        license: newVal.license || 'Domaine Public',
++        latitude: newVal.latitude ?? null,
++        longitude: newVal.longitude ?? null,
++        bearing: newVal.bearing ?? null,
++        field_of_view: newVal.field_of_view ?? 60,
++        status: newVal.status || 'draft',
++        thumb_url: newVal.thumb_url ?? newVal.image_thumb_url ?? null,
++        display_url: newVal.display_url ?? newVal.image_display_url ?? null,
++        original_url: newVal.original_url ?? newVal.image_original_url ?? null,
++      }
++    } else {
++      // Réinitialisation pour création
++      form.value = {
++        title: '',
++        description: '',
++        photographer: '',
++        year_taken: null,
++        date_exact: '',
++        period_label: '',
++        archive_source: '',
++        archive_ref: '',
++        original_source_url: '',
++        license: 'Domaine Public',
++        latitude: null,
++        longitude: null,
++        bearing: null,
++        field_of_view: 60,
++        status: 'draft',
++        thumb_url: null,
++        display_url: null,
++        original_url: null,
++      }
++    }
++  },
++  { immediate: true }
++)
++
++// Détection de présence de coordonnées géographiques complètes
++const hasCoordinates = computed(() => {
++  return (
++    form.value.latitude !== null &&
++    form.value.latitude !== undefined &&
++    form.value.latitude.toString().trim() !== '' &&
++    form.value.longitude !== null &&
++    form.value.longitude !== undefined &&
++    form.value.longitude.toString().trim() !== ''
++  )
++})
++
++// Détection du blocage de publication sans coordonnées
++const isPublishBlocked = computed(() => {
++  return form.value.status === 'published' && !hasCoordinates.value
++})
++
++const canSubmit = computed(() => {
++  return (
++    form.value.title.trim().length > 0 &&
++    !isPublishBlocked.value &&
++    !isSubmitting.value &&
++    !isUploadingImage.value
++  )
++})
++
++const currentPreviewUrl = computed(() => {
++  if (localImagePreview.value) {
++    return localImagePreview.value
++  }
++  return form.value.display_url || form.value.thumb_url || null
++})
++
++// Gestion du téléversement d'image
++async function handleFileSelect(event: Event) {
++  const target = event.target as HTMLInputElement
++  if (target.files && target.files.length > 0) {
++    await processFile(target.files[0])
++  }
++}
++
++async function handleDrop(event: DragEvent) {
++  event.preventDefault()
++  if (event.dataTransfer?.files && event.dataTransfer.files.length > 0) {
++    await processFile(event.dataTransfer.files[0])
++  }
++}
++
++async function processFile(file: File) {
++  if (!file.type.startsWith('image/')) {
++    errorMessage.value = 'Seuls les fichiers images (JPEG, PNG, TIFF, WebP) sont autorisés.'
++    return
++  }
++
++  // 25 Mo limite
++  if (file.size > 25 * 1024 * 1024) {
++    errorMessage.value = 'Le fichier dépasse la taille maximale de 25 Mo.'
++    return
++  }
++
++  errorMessage.value = null
++  selectedImageFile.value = file
++
++  // Aperçu local immédiat
++  const reader = new FileReader()
++  reader.onload = (e) => {
++    localImagePreview.value = e.target?.result as string
++  }
++  reader.readAsDataURL(file)
++
++  // Si la photo existe déjà en base, on déclenche directement l'upload API pour actualisation immédiate
++  if (form.value.id) {
++    try {
++      isUploadingImage.value = true
++      uploadProgress.value = true
++      const uploadRes = await photoApi.uploadPhotoImage(form.value.id, file)
++      form.value.thumb_url = uploadRes.thumb_url
++      form.value.display_url = uploadRes.display_url
++      form.value.original_url = uploadRes.original_url
++      localImagePreview.value = null
++      emit('toast', 'Image téléversée et déclinaisons WebP générées avec succès !', 'success')
++      if (uploadRes.photo) {
++        emit('saved', uploadRes.photo)
++      }
++    } catch (err: any) {
++      errorMessage.value = err.message || "Erreur lors de l'upload de l'image"
++      emit('toast', errorMessage.value || 'Erreur upload', 'error')
++    } finally {
++      isUploadingImage.value = false
++      uploadProgress.value = false
++    }
++  }
++}
++
++// Soumission du formulaire
++async function handleSubmit() {
++  errorMessage.value = null
++
++  if (!form.value.title.trim()) {
++    errorMessage.value = 'Le titre du cliché est obligatoire.'
++    return
++  }
++
++  // Règle d'or de la spec : Aucune publication sans coordonnées GPS
++  if (form.value.status === 'published' && !hasCoordinates.value) {
++    errorMessage.value = 'Coordonnées GPS obligatoires pour publier. Veuillez renseigner la latitude et la longitude ou conserver le statut brouillon.'
++    emit('toast', errorMessage.value, 'error')
++    return
++  }
++
++  try {
++    isSubmitting.value = true
++
++    let savedPhoto: Photo
++
++    if (form.value.id) {
++      // Mise à jour de la photo existante
++      const payload: PhotoUpdatePayload = {
++        title: form.value.title.trim(),
++        description: form.value.description.trim() || null,
++        photographer: form.value.photographer.trim() || null,
++        year_taken: form.value.year_taken ? Number(form.value.year_taken) : null,
++        date_exact: form.value.date_exact.trim() || null,
++        period_label: form.value.period_label.trim() || null,
++        archive_source: form.value.archive_source.trim() || null,
++        archive_ref: form.value.archive_ref.trim() || null,
++        original_source_url: form.value.original_source_url.trim() || null,
++        license: form.value.license,
++        latitude: form.value.latitude !== null && form.value.latitude !== undefined ? Number(form.value.latitude) : null,
++        longitude: form.value.longitude !== null && form.value.longitude !== undefined ? Number(form.value.longitude) : null,
++        bearing: form.value.bearing !== null && form.value.bearing !== undefined ? Number(form.value.bearing) : null,
++        field_of_view: Number(form.value.field_of_view || 60),
++        status: form.value.status,
++      }
++
++      savedPhoto = await photoApi.updatePhoto(form.value.id, payload)
++      emit('toast', `Fiche "${savedPhoto.title}" mise à jour avec succès.`, 'success')
++    } else {
++      // Création d'une nouvelle photo
++      const payload: PhotoCreatePayload = {
++        title: form.value.title.trim(),
++        description: form.value.description.trim() || null,
++        photographer: form.value.photographer.trim() || null,
++        year_taken: form.value.year_taken ? Number(form.value.year_taken) : null,
++        date_exact: form.value.date_exact.trim() || null,
++        period_label: form.value.period_label.trim() || null,
++        archive_source: form.value.archive_source.trim() || null,
++        archive_ref: form.value.archive_ref.trim() || null,
++        original_source_url: form.value.original_source_url.trim() || null,
++        license: form.value.license,
++        latitude: form.value.latitude !== null && form.value.latitude !== undefined ? Number(form.value.latitude) : null,
++        longitude: form.value.longitude !== null && form.value.longitude !== undefined ? Number(form.value.longitude) : null,
++        bearing: form.value.bearing !== null && form.value.bearing !== undefined ? Number(form.value.bearing) : null,
++        field_of_view: Number(form.value.field_of_view || 60),
++        status: form.value.status,
++      }
++
++      savedPhoto = await photoApi.createPhoto(payload)
++
++      // Si un fichier image a été sélectionné pour cette nouvelle photo, on le téléverse immédiatement
++      if (selectedImageFile.value) {
++        try {
++          isUploadingImage.value = true
++          const uploadRes = await photoApi.uploadPhotoImage(savedPhoto.id, selectedImageFile.value)
++          if (uploadRes.photo) {
++            savedPhoto = uploadRes.photo
++          }
++        } catch (uploadErr: any) {
++          emit(
++            'toast',
++            `Fiche créée mais échec du traitement de l'image : ${uploadErr.message}`,
++            'error'
++          )
++        }
++      }
++
++      emit('toast', `Nouveau cliché "${savedPhoto.title}" enregistré avec succès.`, 'success')
++    }
++
++    emit('saved', savedPhoto)
++    emit('close')
++  } catch (err: any) {
++    if (err instanceof ApiError) {
++      errorMessage.value = err.message
++    } else {
++      errorMessage.value = err.message || "Une erreur inattendue s'est produite lors de la sauvegarde."
++    }
++    emit('toast', errorMessage.value || 'Erreur', 'error')
++  } finally {
++    isSubmitting.value = false
++    isUploadingImage.value = false
++  }
++}
++</script>
++
++<template>
++  <div
++    v-if="isOpen"
++    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm overflow-y-auto"
++    @click.self="emit('close')"
++  >
++    <div
++      class="bg-slate-900 border border-slate-700/80 rounded-2xl w-full max-w-4xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-150"
++      role="dialog"
++      aria-modal="true"
++    >
++      <!-- En-tête de la modale -->
++      <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/50">
++        <div class="flex items-center space-x-3">
++          <div
++            class="w-10 h-10 rounded-xl flex items-center justify-center text-lg"
++            :class="form.id ? 'bg-indigo-950/80 text-indigo-400 border border-indigo-700' : 'bg-emerald-950/80 text-emerald-400 border border-emerald-700'"
++          >
++            {{ form.id ? '✏️' : '📸' }}
++          </div>
++          <div>
++            <h2 class="text-lg font-bold text-white tracking-tight">
++              {{ form.id ? 'Modifier le cliché d\'archive' : 'Nouveau cliché patrimonial' }}
++            </h2>
++            <p class="text-xs text-slate-400">
++              {{ form.id ? 'Mise à jour des métadonnées et du géoréférencement' : 'Saisie documentaire et rattachement au territoire actif' }}
++            </p>
++          </div>
++        </div>
++
++        <button
++          type="button"
++          class="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++          @click="emit('close')"
++          aria-label="Fermer la boîte de dialogue"
++        >
++          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++          </svg>
++        </button>
++      </div>
++
++      <!-- Alerte de blocage publication sans GPS -->
++      <div
++        v-if="isPublishBlocked"
++        class="bg-amber-950/80 border-b border-amber-800/80 px-6 py-3 flex items-center gap-3 text-amber-200 text-sm"
++      >
++        <span class="text-xl">⚠️</span>
++        <div>
++          <strong class="font-semibold text-amber-300">Coordonnées GPS obligatoires pour publier</strong>
++          <p class="text-xs text-amber-200/90 mt-0.5">
++            Vous avez sélectionné le statut <em>Publié</em>, mais ce cliché ne dispose pas encore de latitude/longitude.
++            Renseignez ses coordonnées dans l'onglet <strong>Géolocalisation</strong> ou basculez le statut sur <strong>Brouillon (draft)</strong>.
++          </p>
++        </div>
++      </div>
++
++      <!-- Alerte d'erreur générique -->
++      <div
++        v-if="errorMessage && !isPublishBlocked"
++        class="bg-rose-950/80 border-b border-rose-800/80 px-6 py-3 flex items-center gap-3 text-rose-200 text-sm"
++      >
++        <span class="text-xl">❌</span>
++        <div class="flex-1 text-xs">
++          {{ errorMessage }}
++        </div>
++      </div>
++
++      <!-- Navigation par onglets -->
++      <div class="flex border-b border-slate-800 bg-slate-900/60 px-6 pt-2 gap-2 text-sm">
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'document' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'document'"
++        >
++          <span>📜</span>
++          <span>Notice & Métadonnées</span>
++        </button>
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'geo' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'geo'"
++        >
++          <span>📍</span>
++          <span>Géoréférencement</span>
++          <span
++            v-if="hasCoordinates"
++            class="w-2 h-2 rounded-full bg-emerald-400"
++            title="Coordonnées renseignées"
++          ></span>
++          <span
++            v-else
++            class="w-2 h-2 rounded-full bg-amber-500"
++            title="Non géolocalisé"
++          ></span>
++        </button>
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'media' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'media'"
++        >
++          <span>🖼️</span>
++          <span>Image & Numérisation</span>
++          <span
++            v-if="currentPreviewUrl"
++            class="w-2 h-2 rounded-full bg-emerald-400"
++            title="Image attachée"
++          ></span>
++        </button>
++      </div>
++
++      <!-- Corps du formulaire scrollable -->
++      <form class="flex-1 overflow-y-auto p-6 space-y-6" @submit.prevent="handleSubmit">
++        <!-- ONGLET 1 : Notice & Métadonnées documentaires -->
++        <div v-show="activeTab === 'document'" class="space-y-5">
++          <!-- Titre (obligatoire) -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              Titre du cliché <span class="text-rose-400">*</span>
++            </label>
++            <input
++              v-model="form.title"
++              type="text"
++              required
++              placeholder="Ex: Le Quai Cronstadt et les cuirassés en rade"
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++            />
++          </div>
++
++          <!-- Statut et Licence -->
++          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Statut de publication <span class="text-rose-400">*</span>
++              </label>
++              <select
++                v-model="form.status"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++              >
++                <option value="draft">Brouillon (draft - masqué au public)</option>
++                <option value="published">Publié (published - visible sur la carte)</option>
++              </select>
++              <p class="text-[11px] text-slate-400 mt-1">
++                Le mode brouillon autorise l'enregistrement partiel sans coordonnées GPS.
++              </p>
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Licence de diffusion <span class="text-rose-400">*</span>
++              </label>
++              <select
++                v-model="form.license"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++              >
++                <option
++                  v-for="lic in PHOTO_LICENSES"
++                  :key="lic.value"
++                  :value="lic.value"
++                >
++                  {{ lic.label }}
++                </option>
++              </select>
++              <p class="text-[11px] text-slate-400 mt-1">
++                {{ PHOTO_LICENSES.find(l => l.value === form.license)?.description }}
++              </p>
++            </div>
++          </div>
++
++          <!-- Description historique -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              Description & Contexte Historique
++            </label>
++            <textarea
++              v-model="form.description"
++              rows="3"
++              placeholder="Description documentaire de la vue, des monuments ou navires visibles, de l'événement immortalisé..."
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm resize-y"
++            ></textarea>
++          </div>
++
++          <!-- Auteur et Datation -->
++          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Photographe / Auteur
++              </label>
++              <input
++                v-model="form.photographer"
++                type="text"
++                placeholder="Ex: Marius Bar, Félix Mesguich"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Année de prise de vue
++              </label>
++              <input
++                v-model.number="form.year_taken"
++                type="number"
++                min="1800"
++                max="2030"
++                placeholder="Ex: 1912"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Date précise (si connue)
++              </label>
++              <input
++                v-model="form.date_exact"
++                type="text"
++                placeholder="Ex: 1912-05-14"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++          </div>
++
++          <!-- Période et Fonds d'archives -->
++          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Époque / Période
++              </label>
++              <input
++                v-model="form.period_label"
++                type="text"
++                placeholder="Ex: Belle Époque, Reconstruction"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Institution d'archive
++              </label>
++              <input
++                v-model="form.archive_source"
++                type="text"
++                placeholder="Ex: Arch. Municipales de Toulon"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Cote d'inventaire
++              </label>
++              <input
++                v-model="form.archive_ref"
++                type="text"
++                placeholder="Ex: 21Fi45, 4S128"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++          </div>
++
++          <!-- Lien source / notice -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              URL de la notice d'origine
++            </label>
++            <input
++              v-model="form.original_source_url"
++              type="url"
++              placeholder="https://archives.toulon.fr/fonds/photos/21Fi45"
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++            />
++          </div>
++        </div>
++
++        <!-- ONGLET 2 : Géoréférencement & Azimut -->
++        <div v-show="activeTab === 'geo'" class="space-y-5">
++          <div class="p-4 rounded-xl bg-slate-800/60 border border-slate-700/80">
++            <div class="flex items-start justify-between">
++              <div>
++                <h3 class="text-sm font-semibold text-white flex items-center gap-2">
++                  <span>🗺️</span>
++                  <span>Positionnement WGS84 & Orientation</span>
++                </h3>
++                <p class="text-xs text-slate-400 mt-1">
++                  Les coordonnées définissent l'emplacement exact d'où le photographe a pris le cliché.
++                </p>
++              </div>
++              <span
++                class="text-xs px-2.5 py-1 rounded-full font-medium"
++                :class="hasCoordinates ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-amber-950 text-amber-400 border border-amber-800'"
++              >
++                {{ hasCoordinates ? '● Coordonnées valides' : '○ En attente de saisie' }}
++              </span>
++            </div>
++          </div>
++
++          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Latitude (WGS84)
++              </label>
++              <input
++                v-model.number="form.latitude"
++                type="number"
++                step="0.000001"
++                min="-90"
++                max="90"
++                placeholder="Ex: 43.120542"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++              <p class="text-[11px] text-slate-400 mt-1">Compris entre -90.0° et +90.0°.</p>
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Longitude (WGS84)
++              </label>
++              <input
++                v-model.number="form.longitude"
++                type="number"
++                step="0.000001"
++                min="-180"
++                max="180"
++                placeholder="Ex: 5.931289"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++              <p class="text-[11px] text-slate-400 mt-1">Compris entre -180.0° et +180.0°.</p>
++            </div>
++          </div>
++
++          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Azimut / Orientation (0° - 359°)
++              </label>
++              <div class="flex items-center gap-3">
++                <input
++                  v-model.number="form.bearing"
++                  type="number"
++                  min="0"
++                  max="359"
++                  placeholder="Ex: 135"
++                  class="w-32 bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++                />
++                <input
++                  v-model.number="form.bearing"
++                  type="range"
++                  min="0"
++                  max="359"
++                  class="flex-1 accent-sky-500 cursor-pointer"
++                />
++              </div>
++              <p class="text-[11px] text-slate-400 mt-1">
++                0° = Nord, 90° = Est, 180° = Sud, 270° = Ouest.
++              </p>
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Champ de vision (FOV en degrés)
++              </label>
++              <input
++                v-model.number="form.field_of_view"
++                type="number"
++                min="10"
++                max="180"
++                placeholder="60"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++              <p class="text-[11px] text-slate-400 mt-1">
++                Ouverture angulaire du cône de prise de vue (défaut : 60°).
++              </p>
++            </div>
++          </div>
++        </div>
++
++        <!-- ONGLET 3 : Image & Numérisation -->
++        <div v-show="activeTab === 'media'" class="space-y-5">
++          <!-- Zone Drag & Drop -->
++          <div
++            class="border-2 border-dashed rounded-2xl p-6 text-center transition-all cursor-pointer flex flex-col items-center justify-center relative overflow-hidden"
++            :class="isUploadingImage ? 'border-sky-500 bg-sky-950/20' : 'border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-800/30'"
++            @dragover.prevent
++            @drop="handleDrop"
++            @click="fileInputRef?.click()"
++          >
++            <input
++              ref="fileInputRef"
++              type="file"
++              accept="image/jpeg,image/png,image/webp,image/tiff"
++              class="hidden"
++              @change="handleFileSelect"
++            />
++
++            <!-- Spinner pendant le téléversement -->
++            <div v-if="isUploadingImage" class="py-8 flex flex-col items-center gap-3">
++              <div class="w-10 h-10 border-4 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
++              <p class="text-sm font-semibold text-sky-300">Traitement de l'image & conversion WebP...</p>
++              <p class="text-xs text-slate-400">Génération des déclinaisons (original, display 2048px, thumb 400px)</p>
++            </div>
++
++            <!-- Aperçu de l'image -->
++            <div v-else-if="currentPreviewUrl" class="space-y-4 w-full">
++              <div class="relative max-h-64 mx-auto rounded-lg overflow-hidden border border-slate-700 bg-black flex items-center justify-center">
++                <img
++                  :src="currentPreviewUrl"
++                  alt="Aperçu du cliché"
++                  class="max-h-64 object-contain"
++                />
++                <span class="absolute top-2 right-2 px-2 py-1 bg-slate-900/80 backdrop-blur rounded text-[11px] font-mono text-slate-300 border border-slate-700">
++                  WebP Optimisé
++                </span>
++              </div>
++
++              <div class="text-xs text-slate-400">
++                <span class="text-sky-400 font-medium hover:underline">Cliquer ou déposer</span> un nouveau fichier pour remplacer l'image existante (Max 25 Mo).
++              </div>
++            </div>
++
++            <!-- Placeholder sans image -->
++            <div v-else class="py-8 space-y-3">
++              <div class="w-12 h-12 mx-auto rounded-full bg-slate-800 flex items-center justify-center text-2xl text-slate-400">
++                📷
++              </div>
++              <div>
++                <p class="text-sm font-semibold text-white">
++                  Glissez-déposez le fichier numérisé ici, ou <span class="text-sky-400 underline">parcourez vos dossiers</span>
++                </p>
++                <p class="text-xs text-slate-400 mt-1">
++                  Formats acceptés : JPEG, PNG, TIFF, WebP (Jusqu'à 25 Mo).
++                </p>
++              </div>
++            </div>
++          </div>
++
++          <!-- Informations sur le pipeline d'ingestion -->
++          <div class="p-4 rounded-xl bg-slate-800/40 border border-slate-700/60 text-xs text-slate-400 space-y-1.5">
++            <div class="font-semibold text-slate-300">ℹ️ Pipeline automatique d'archivage (Pillow WebP) :</div>
++            <ul class="list-disc pl-4 space-y-1">
++              <li>Le fichier original haute définition est conservé intact pour la conservation patrimoniale.</li>
++              <li>Une version WebP affichage (display) max 2048px qualité 85 est générée pour les écrans et la carte.</li>
++              <li>Une vignette WebP (thumb) max 400px qualité 80 est générée pour les aperçus rapides.</li>
++              <li>Les métadonnées EXIF potentiellement vulnérables sont désinfectées automatiquement.</li>
++            </ul>
++          </div>
++        </div>
++      </form>
++
++      <!-- Pied de la modale avec actions -->
++      <div class="px-6 py-4 border-t border-slate-800 bg-slate-950/70 flex items-center justify-between">
++        <div class="text-xs text-slate-400">
++          <span v-if="form.status === 'published'" class="inline-flex items-center gap-1.5 text-emerald-400">
++            <span class="w-2 h-2 rounded-full bg-emerald-400"></span> Publication immédiate sur la carte
++          </span>
++          <span v-else class="inline-flex items-center gap-1.5 text-amber-400">
++            <span class="w-2 h-2 rounded-full bg-amber-400"></span> Sauvegarde en brouillon (mode draft)
++          </span>
++        </div>
++
++        <div class="flex items-center gap-3">
++          <button
++            type="button"
++            class="px-4 py-2 text-sm font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors"
++            @click="emit('close')"
++          >
++            Annuler
++          </button>
++
++          <button
++            type="button"
++            class="px-5 py-2 text-sm font-medium text-white rounded-lg transition-all flex items-center gap-2 shadow-lg"
++            :class="canSubmit ? 'bg-sky-600 hover:bg-sky-500 shadow-sky-900/30' : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'"
++            :disabled="!canSubmit"
++            :title="isPublishBlocked ? 'Coordonnées GPS obligatoires pour publier' : ''"
++            @click="handleSubmit"
++          >
++            <span v-if="isSubmitting" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++            <span>{{ isSubmitting ? 'Enregistrement...' : (form.status === 'published' ? 'Publier la fiche' : 'Enregistrer le brouillon') }}</span>
++          </button>
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
+diff --git a/frontend/src/services/api.ts b/frontend/src/services/api.ts
+new file mode 100644
+index 0000000..b6d63a0
+--- /dev/null
++++ b/frontend/src/services/api.ts
+@@ -0,0 +1,236 @@
++import type {
++  Photo,
++  PhotoCreatePayload,
++  PhotoUpdatePayload,
++  PhotoListResponse,
++  PhotoUploadResponse,
++  PhotoStatus,
++} from '@/types/photo'
++
++const TOKEN_STORAGE_KEY = 'hierici_access_token'
++
++export class ApiError extends Error {
++  code: string
++  status: number
++  details?: any
++
++  constructor(message: string, code = 'API_ERROR', status = 500, details?: any) {
++    super(message)
++    this.name = 'ApiError'
++    this.code = code
++    this.status = status
++    this.details = details
++  }
++}
++
++export function getAuthToken(): string | null {
++  return localStorage.getItem(TOKEN_STORAGE_KEY)
++}
++
++export function setAuthToken(token: string | null): void {
++  if (token) {
++    localStorage.setItem(TOKEN_STORAGE_KEY, token)
++  } else {
++    localStorage.removeItem(TOKEN_STORAGE_KEY)
++  }
++}
++
++export function hasAuthToken(): boolean {
++  return !!getAuthToken()
++}
++
++async function request<T>(
++  endpoint: string,
++  options: RequestInit = {}
++): Promise<T> {
++  const headers: Record<string, string> = {
++    ...(options.headers as Record<string, string> || {}),
++  }
++
++  const token = getAuthToken()
++  if (token && !headers['Authorization']) {
++    headers['Authorization'] = `Bearer ${token}`
++  }
++
++  // Si le body n'est pas un FormData, on ajoute Content-Type: application/json si non défini
++  if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
++    headers['Content-Type'] = 'application/json'
++  }
++
++  const response = await fetch(endpoint, {
++    ...options,
++    headers,
++  })
++
++  if (response.status === 204) {
++    return {} as T
++  }
++
++  let data: any = null
++  const contentType = response.headers.get('content-type')
++  if (contentType && contentType.includes('application/json')) {
++    try {
++      data = await response.json()
++    } catch {
++      data = null
++    }
++  }
++
++  if (!response.ok) {
++    let message = `Erreur HTTP ${response.status}`
++    let code = 'HTTP_ERROR'
++    let details = undefined
++
++    if (data?.error) {
++      code = data.error.code || code
++      message = data.error.message || message
++      details = data.error.details
++    } else if (data?.detail) {
++      if (typeof data.detail === 'string') {
++        message = data.detail
++      } else if (data.detail?.error) {
++        code = data.detail.error.code || code
++        message = data.detail.error.message || message
++        details = data.detail.error.details
++      } else if (Array.isArray(data.detail)) {
++        // FastAPI validation errors
++        message = data.detail.map((err: any) => `${err.loc?.join('.') || 'champ'}: ${err.msg}`).join(', ')
++      }
++    }
++
++    throw new ApiError(message, code, response.status, details)
++  }
++
++  return data as T
++}
++
++export const photoApi = {
++  /**
++   * Connexion avec email et mot de passe
++   */
++  async login(email: string, password: string): Promise<{ access_token: string; user: any }> {
++    const res = await request<{ access_token: string; token_type: string; user: any }>(
++      '/api/v1/auth/login',
++      {
++        method: 'POST',
++        body: JSON.stringify({ email, password }),
++      }
++    )
++    setAuthToken(res.access_token)
++    return res
++  },
++
++  /**
++   * Récupère le profil de l'utilisateur connecté
++   */
++  async getMe(): Promise<any> {
++    return request<any>('/api/v1/auth/me')
++  },
++
++  /**
++   * Liste paginée des photographies
++   */
++  async listPhotos(params?: {
++    page?: number
++    page_size?: number
++    status?: PhotoStatus
++    search?: string
++    territory_id?: string
++  }): Promise<PhotoListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.status) query.set('status', params.status)
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.territory_id) query.set('territory_id', params.territory_id)
++
++    const qs = query.toString()
++    return request<PhotoListResponse>(`/api/v1/admin/photos${qs ? `?${qs}` : ''}`)
++  },
++
++  /**
++   * Consultation du détail d'une photographie
++   */
++  async getPhoto(id: string): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`)
++  },
++
++  /**
++   * Création d'une nouvelle fiche photo
++   */
++  async createPhoto(payload: PhotoCreatePayload): Promise<Photo> {
++    return request<Photo>('/api/v1/admin/photos', {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour d'une fiche photo existante
++   */
++  async updatePhoto(id: string, payload: PhotoUpdatePayload): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression d'une fiche photo et de ses médias
++   */
++  async deletePhoto(id: string): Promise<void> {
++    await request<void>(`/api/v1/admin/photos/${id}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Téléversement d'image pour une photo existante
++   */
++  async uploadPhotoImage(photoId: string, file: File): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++
++    return request<PhotoUploadResponse>(`/api/v1/admin/photos/${photoId}/upload`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Téléversement direct créant une nouvelle photo avec image
++   */
++  async uploadPhotoDirect(file: File, title?: string): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++    if (title && title.trim()) {
++      formData.append('title', title.trim())
++    }
++
++    return request<PhotoUploadResponse>('/api/v1/admin/photos/upload', {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Récupération du territoire actif
++   */
++  async getCurrentTerritory(): Promise<{
++    id: string
++    slug: string
++    name: string
++    center_lat: number
++    center_lng: number
++    default_zoom: number
++  }> {
++    return request('/api/v1/territory/current')
++  },
++
++  /**
++   * Health check de l'API
++   */
++  async getHealth(): Promise<{ status: string; database: string }> {
++    return request('/api/health')
++  },
++}
+diff --git a/frontend/src/types/photo.ts b/frontend/src/types/photo.ts
+new file mode 100644
+index 0000000..b467e11
+--- /dev/null
++++ b/frontend/src/types/photo.ts
+@@ -0,0 +1,145 @@
++export type PhotoStatus = 'draft' | 'published'
++
++export type PhotoLicense =
++  | 'Domaine Public'
++  | 'Licence Ouverte (Etalab)'
++  | 'Creative Commons (BY)'
++  | 'Creative Commons (BY-SA)'
++  | 'Tous droits réservés'
++
++export const PHOTO_LICENSES: { value: PhotoLicense; label: string; description: string }[] = [
++  {
++    value: 'Domaine Public',
++    label: 'Domaine Public',
++    description: 'Œuvre libre de droits patrimoniaux, réutilisation sans restriction.',
++  },
++  {
++    value: 'Licence Ouverte (Etalab)',
++    label: 'Licence Ouverte (Etalab)',
++    description: 'Réutilisation libre sous réserve de mentionner la source et la date.',
++  },
++  {
++    value: 'Creative Commons (BY)',
++    label: 'Creative Commons (BY)',
++    description: 'Attribution obligatoire, modifications et usages commerciaux autorisés.',
++  },
++  {
++    value: 'Creative Commons (BY-SA)',
++    label: 'Creative Commons (BY-SA)',
++    description: 'Attribution et partage dans les mêmes conditions.',
++  },
++  {
++    value: 'Tous droits réservés',
++    label: 'Tous droits réservés',
++    description: 'Diffusion sous autorisation exclusive du titulaire des droits.',
++  },
++]
++
++export interface Photo {
++  id: string
++  territory_id: string
++  author_user_id?: string | null
++  title: string
++  description?: string | null
++  photographer?: string | null
++  year_taken?: number | null
++  year?: number | null
++  date_exact?: string | null
++  period_label?: string | null
++  archive_source?: string | null
++  archive_ref?: string | null
++  archive_reference?: string | null
++  original_source_url?: string | null
++  source_url?: string | null
++  license?: PhotoLicense | string | null
++  latitude?: number | null
++  longitude?: number | null
++  bearing?: number | null
++  field_of_view?: number
++  file_original_path?: string | null
++  file_display_path?: string | null
++  file_thumb_path?: string | null
++  original_url?: string | null
++  display_url?: string | null
++  thumb_url?: string | null
++  image_original_url?: string | null
++  image_display_url?: string | null
++  image_thumb_url?: string | null
++  status: PhotoStatus
++  created_at: string
++  updated_at: string
++  location?: {
++    type: 'Point'
++    coordinates: [number, number]
++  } | null
++}
++
++export interface PhotoCreatePayload {
++  title: string
++  description?: string | null
++  photographer?: string | null
++  year_taken?: number | null
++  date_exact?: string | null
++  period_label?: string | null
++  archive_source?: string | null
++  archive_ref?: string | null
++  original_source_url?: string | null
++  license?: string | null
++  latitude?: number | null
++  longitude?: number | null
++  bearing?: number | null
++  field_of_view?: number
++  status?: PhotoStatus
++  territory_id?: string | null
++  file_original_path?: string | null
++  file_display_path?: string | null
++  file_thumb_path?: string | null
++}
++
++export interface PhotoUpdatePayload {
++  title?: string
++  description?: string | null
++  photographer?: string | null
++  year_taken?: number | null
++  date_exact?: string | null
++  period_label?: string | null
++  archive_source?: string | null
++  archive_ref?: string | null
++  original_source_url?: string | null
++  license?: string | null
++  latitude?: number | null
++  longitude?: number | null
++  bearing?: number | null
++  field_of_view?: number
++  status?: PhotoStatus
++  territory_id?: string | null
++}
++
++export interface PhotoListResponse {
++  items: Photo[]
++  total: number
++  page: number
++  page_size: number
++  pages: number
++}
++
++export interface PhotoUploadResponse {
++  photo_id: string
++  file_original_path: string
++  file_display_path: string
++  file_thumb_path: string
++  original_url: string
++  display_url: string
++  thumb_url: string
++  width: number
++  height: number
++  photo?: Photo | null
++}
++
++export interface ApiProblemDetails {
++  error: {
++    code: string
++    message: string
++    details?: Record<string, any>
++  }
++}

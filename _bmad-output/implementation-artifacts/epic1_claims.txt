@@ -1,0 +1,5 @@
+Epic 1: Socle Territorial, Authentification et Stockage Média
+- Story 1.1: Initialisation Docker Compose, FastAPI, Vue 3, PostGIS
+- Story 1.2: Modèle Territoire et Middleware d'Isolation Multi-Territoire
+- Story 1.3: Authentification JWT et Contrôle d'Accès RBAC
+- Story 1.4: Adaptateur de Stockage Média Abstrait Local & S3

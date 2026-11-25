@@ -360,3 +360,70 @@ So that je puisse choisir un sujet historique qui m'intéresse (ex. histoire ind
 **When** le visiteur clique sur une storymap
 **Then** le lecteur immersif plein écran de la storymap s'ouvre instantanément
 **And** un bouton de retour permet de regagner la carte générale d'exploration libre à tout instant.
+
+---
+
+## Epic 5: Personnalisation Cartographique, Administration Générale & Vitrine Patrimoniale
+
+Permettre un paramétrage territorial fin (fonds de carte, centrage par défaut), doter la plateforme d'une console d'administration pour la gestion des contributeurs, raffiner l'expérience cartographique et les métadonnées de clichés (cône métrique, autocomplétion des sources), et accueillir les visiteurs avec une page d'accueil valorisant le patrimoine grâce aux archives historiques.
+
+### Story 5.1: Révision du Modèle de Métadonnées Photo et Cône de Vision Métrique
+
+As a contributeur ou archiviste saisissant un cliché,
+I want renseigner la précision de l'année, bénéficier de suggestions pour les photographes et institutions, et ajuster la portée métrique du cône de vue,
+So that les fiches soient conformes aux pratiques archivistiques et que la profondeur de champ sur la carte reflète la réalité de la prise de vue.
+
+**Acceptance Criteria:**
+- **Given** le modèle et le formulaire de gestion d'une photo
+- **When** le contributeur édite les métadonnées
+- **Then** les champs "époque/période" et "date précise" ne sont plus présentés
+- **And** une option booléenne "Année précise ?" (`is_exact_year`) permet d'indiquer si l'année est certifiée ou approximative
+- **And** les champs "Institution d'archives" et "Photographe" proposent une liste déroulante / suggestions basées sur les valeurs déjà enregistrées dans le territoire
+- **And** un curseur permet de régler la distance du cône de vision (`view_distance`, entre 20 et 2000 mètres, défaut 160m) avec prévisualisation dynamique sur la carte.
+
+---
+
+### Story 5.2: Optimisation de l'Exploration Cartographique (Marqueurs Visibles & Fiche Latérale Droite)
+
+As a visiteur explorant la carte interactive,
+I want repérer instantanément les photos grâce à des marqueurs bien visibles et consulter la fiche détaillée directement dans un panneau latéral droit sans popup intermédiaire,
+So that la navigation soit directe, claire et débarrassée d'éléments d'en-tête superflus.
+
+**Acceptance Criteria:**
+- **Given** la carte découverte publique
+- **When** les photos sont affichées sur la carte
+- **Then** les marqueurs orientés et neutres ont une taille agrandie et un contraste renforcé pour une visibilité optimale
+- **When** le visiteur clique sur un marqueur
+- **Then** aucune popup intermédiaire MapLibre ne s'affiche ; le volet latéral droit (`PhotoDetailDrawer`) s'ouvre immédiatement avec la fiche complète
+- **And** le cône de vue projeté utilise la distance métrique personnalisée `view_distance` de la photo
+- **And** le badge de décompte et le nom de territoire en haut à droite sont retirés de la carte.
+
+---
+
+### Story 5.3: Console d'Administration Générale (Territoire, Contributeurs & Fonds de Carte)
+
+As a administrateur de territoire ou superadministrateur,
+I want configurer le centrage initial de la carte, gérer les comptes de contributeurs et choisir les fonds de carte (WMS, WMTS, tuiles vectorielles, XYZ),
+So that le territoire soit entièrement personnalisable et son équipe de rédaction autonome.
+
+**Acceptance Criteria:**
+- **Given** un utilisateur authentifié avec le rôle approprié accédant à la console d'administration
+- **When** l'administrateur configure le territoire
+- **Then** il peut ajuster ou capturer les coordonnées (`center_lat`, `center_lng`) et le niveau de zoom par défaut de la carte
+- **And** il peut ajouter, modifier le rôle, ou désactiver des comptes contributeurs pour le territoire
+- **And** il peut configurer et activer les fonds de carte disponibles (WMS/WMTS, tuiles vecteur, XYZ) avec un fond actif par défaut.
+
+---
+
+### Story 5.4: Page de Présentation / Vitrine Patrimoniale (Landing Page)
+
+As a visiteur découvrant la plateforme HierIci,
+I want accéder à une page d'accueil élégante illustrée par de superbes photographies historiques qui m'explique les concepts clés (cônes de vue, géolocalisation, storymaps),
+So that je comprenne immédiatement la valeur du projet et puisse plonger dans la carte ou les récits en un clic.
+
+**Acceptance Criteria:**
+- **Given** un internaute arrivant sur le site ou cliquant sur l'onglet "🏠 Accueil"
+- **When** la page d'accueil s'affiche
+- **Then** un visuel d'accroche et des sections thématiques mettent en valeur les photographies patrimoniales fournies (fonds Gallica BnF)
+- **And** les fonctionnalités majeures (cônes d'azimut, scrollytelling sonore, archives géolocalisées) sont présentées de manière accessible
+- **And** des boutons d'appel à l'action permettent de basculer instantanément vers la Carte Découverte ou le Catalogue des Récits.

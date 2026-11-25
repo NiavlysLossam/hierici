@@ -1,0 +1,5195 @@
+--- /dev/null
++++ b/backend/app/api/v1/admin/storymaps.py
+@@ -0,0 +1,1058 @@
++import io
++import asyncio
++from pathlib import Path
++import math
++import uuid
++import logging
++from datetime import datetime, timezone
++from typing import Annotated
++from fastapi import APIRouter, Depends, HTTPException, Query, Response, status, UploadFile, File
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from sqlalchemy.orm import selectinload
++from PIL import Image, ImageOps, UnidentifiedImageError
++
++from app.core.database import get_db
++from app.core.auth import get_current_active_user
++from app.models.user import User, UserRole
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++from app.models.photo import Photo
++from app.services.storage import get_storage_driver, StorageDriver
++from app.schemas.storymap import (
++    slugify,
++    StorymapCreate,
++    StorymapUpdate,
++    StorymapRead,
++    StorymapListResponse,
++    StorymapStepCreate,
++    StorymapStepUpdate,
++    StorymapStepRead,
++    StorymapReorderPayload,
++)
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/admin/storymaps", tags=["Administration Storymaps"])
++
++MAX_COVER_FILE_SIZE = 25 * 1024 * 1024  # 25 Mo
++MAX_AUDIO_FILE_SIZE = 50 * 1024 * 1024  # 50 Mo
++
++ALLOWED_COVER_FORMATS = {"JPEG", "JPG", "PNG", "WEBP"}
++ALLOWED_AUDIO_EXTENSIONS = {".mp3", ".m4a", ".ogg", ".wav"}
++ALLOWED_AUDIO_MIMES = {
++    "audio/mpeg",
++    "audio/mp3",
++    "audio/mp4",
++    "audio/x-m4a",
++    "audio/aac",
++    "audio/ogg",
++    "audio/wav",
++    "audio/x-wav",
++    "audio/wave",
++    "application/ogg",
++}
++
++
++async def _read_upload_file(file: UploadFile, max_size: int) -> bytes:
++    """Lit le flux du fichier téléversé et valide sa taille maximale."""
++    if file.size is not None and file.size > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++    content = await file.read(max_size + 1)
++    if len(content) > max_size:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "FILE_TOO_LARGE",
++                    "message": f"Le fichier dépasse la taille maximale autorisée de {max_size // (1024 * 1024)} Mo.",
++                }
++            },
++        )
++    return content
++
++
++async def _generate_unique_slug(db: AsyncSession, territory_id: uuid.UUID, base_text: str, current_id: uuid.UUID | None = None) -> str:
++    """Génère un slug normalisé unique pour un territoire donné."""
++    clean_slug = slugify(base_text)
++    if not clean_slug:
++        clean_slug = f"recit-{uuid.uuid4().hex[:6]}"
++
++    clean_slug = clean_slug[:240]
++
++    candidate = clean_slug
++    counter = 1
++    while True:
++        stmt = select(Storymap.id).where(
++            Storymap.territory_id == territory_id,
++            Storymap.slug == candidate,
++        )
++        if current_id:
++            stmt = stmt.where(Storymap.id != current_id)
++        result = await db.execute(stmt)
++        if result.scalar_one_or_none() is None:
++            return candidate
++        counter += 1
++        candidate = f"{clean_slug}-{counter}"
++
++
++async def _validate_photo_id(db: AsyncSession, territory_id: uuid.UUID, photo_id: uuid.UUID | None) -> None:
++    """Vérifie qu'une photo existe et appartient bien au même territoire (AD-2)."""
++    if photo_id is not None:
++        stmt = select(Photo.id).where(
++            Photo.id == photo_id,
++            Photo.territory_id == territory_id,
++        )
++        result = await db.execute(stmt)
++        if result.scalar_one_or_none() is None:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "INVALID_PHOTO",
++                        "message": "Photo introuvable ou non autorisée dans ce territoire.",
++                    }
++                },
++            )
++
++
++@router.post(
++    "",
++    response_model=StorymapRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Créer une nouvelle storymap",
++)
++async def create_storymap(
++    storymap_in: StorymapCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Crée une nouvelle storymap rattachée au territoire actif et à l'auteur connecté.
++    Permet l'ajout facultatif d'étapes initiales ordonnées.
++    """
++    # 1. Résolution stricte du territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = storymap_in.territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour créer une storymap.",
++                    }
++                },
++            )
++
++    # 2. Slug automatique unique
++    slug_source = storymap_in.slug.strip() if storymap_in.slug else storymap_in.title
++    unique_slug = await _generate_unique_slug(db, target_territory_id, slug_source)
++
++    # 3. Création de l'entité Storymap
++    new_storymap = Storymap(
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        slug=unique_slug,
++        title=storymap_in.title,
++        summary=storymap_in.summary,
++        cover_image_path=storymap_in.cover_image_path,
++        status=storymap_in.status,
++    )
++
++    # 4. Étapes initiales optionnelles avec validation territoriale de photo_id
++    for idx, step_in in enumerate(storymap_in.steps):
++        await _validate_photo_id(db, target_territory_id, step_in.photo_id)
++        order = step_in.step_order if step_in.step_order > 0 else idx
++        step = StorymapStep(
++            storymap=new_storymap,
++            photo_id=step_in.photo_id,
++            step_order=order,
++            title=step_in.title,
++            content_markdown=step_in.content_markdown,
++            audio_file_path=step_in.audio_file_path,
++            camera_lat=step_in.camera_lat,
++            camera_lng=step_in.camera_lng,
++            camera_zoom=step_in.camera_zoom,
++            camera_bearing=step_in.camera_bearing,
++            camera_pitch=step_in.camera_pitch,
++        )
++        new_storymap.steps.append(step)
++
++    db.add(new_storymap)
++    await db.commit()
++    await db.refresh(new_storymap)
++
++    # Recharger avec les étapes et photos associées
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++            selectinload(Storymap.territory),
++        )
++        .where(Storymap.id == new_storymap.id)
++    )
++    res = await db.execute(stmt)
++    persisted = res.scalar_one()
++
++    return StorymapRead.model_validate(persisted)
++
++
++@router.get(
++    "",
++    response_model=StorymapListResponse,
++    summary="Lister les storymaps du territoire actif",
++)
++async def list_storymaps(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    status_filter: StorymapStatus | None = Query(None, alias="status", description="Filtrer par statut"),
++    search: str | None = Query(None, description="Recherche textuelle sur le titre ou résumé"),
++    territory_id: uuid.UUID | None = Query(None, description="Filtre territoire réservé aux superadmins"),
++) -> StorymapListResponse:
++    """Retourne la liste paginée des storymaps du territoire du contributeur."""
++    base_query = select(Storymap).options(
++        selectinload(Storymap.steps),
++        selectinload(Storymap.author),
++    )
++
++    # Cloisonnement multi-territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        base_query = base_query.where(Storymap.territory_id == current_user.territory_id)
++    else:
++        if territory_id:
++            base_query = base_query.where(Storymap.territory_id == territory_id)
++        elif current_user.territory_id:
++            base_query = base_query.where(Storymap.territory_id == current_user.territory_id)
++
++    if status_filter:
++        base_query = base_query.where(Storymap.status == status_filter)
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Storymap.title.ilike(term) | Storymap.summary.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri chronologique inversé
++    paginated_query = (
++        base_query.order_by(Storymap.created_at.desc(), Storymap.id.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return StorymapListResponse(
++        items=[StorymapRead.model_validate(item) for item in items],
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.get(
++    "/{id}",
++    response_model=StorymapRead,
++    summary="Consulter le détail administratif d'une storymap avec ses étapes",
++)
++async def get_storymap(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Retourne une storymap par identifiant unique."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.put(
++    "/{id}",
++    response_model=StorymapRead,
++    summary="Mettre à jour les métadonnées d'une storymap",
++)
++async def update_storymap(
++    id: uuid.UUID,
++    storymap_in: StorymapUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Met à jour le titre, le résumé, le slug ou le statut de publication d'une storymap."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    update_data = storymap_in.model_dump(exclude_unset=True)
++
++    if "title" in update_data and update_data["title"] is not None:
++        storymap.title = update_data["title"]
++    if "summary" in update_data:
++        storymap.summary = update_data["summary"]
++    if "cover_image_path" in update_data:
++        storymap.cover_image_path = update_data["cover_image_path"]
++    if "status" in update_data and update_data["status"] is not None:
++        storymap.status = update_data["status"]
++
++    if "slug" in update_data and update_data["slug"] is not None and update_data["slug"].strip():
++        new_slug = await _generate_unique_slug(
++            db, storymap.territory_id, update_data["slug"], current_id=storymap.id
++        )
++        storymap.slug = new_slug
++
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(storymap)
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.delete(
++    "/{id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une storymap et toutes ses étapes (cascade)",
++)
++async def delete_storymap(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++):
++    """Supprime définitivement une storymap et propage la suppression en cascade à toutes ses étapes."""
++    stmt = (
++        select(Storymap)
++        .options(selectinload(Storymap.steps))
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    # Nettoyage des fichiers physiques orphelins (couverture et audios des étapes)
++    if storymap.cover_image_path:
++        try:
++            await storage.delete(storymap.cover_image_path)
++        except Exception as e:
++            logger.warning(f"Erreur purge couverture lors suppression storymap: {e}")
++
++    for step in storymap.steps:
++        if step.audio_file_path:
++            try:
++                await storage.delete(step.audio_file_path)
++            except Exception as e:
++                logger.warning(f"Erreur purge audio step {step.id} lors suppression storymap: {e}")
++
++    await db.delete(storymap)
++    await db.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
++
++
++# ============================================================================
++# Gestion des étapes (StorymapStep)
++# ============================================================================
++
++@router.post(
++    "/{id}/steps",
++    response_model=StorymapStepRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Ajouter un chapitre / étape à une storymap",
++)
++async def add_storymap_step(
++    id: uuid.UUID,
++    step_in: StorymapStepCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapStepRead:
++    """Ajoute une nouvelle étape ordonnée avec cadrage cartographique à la storymap."""
++    stmt = (
++        select(Storymap)
++        .options(selectinload(Storymap.steps))
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    # Validation d'isolation territoriale de la photo liée
++    await _validate_photo_id(db, storymap.territory_id, step_in.photo_id)
++
++    # Calcul de l'ordre séquentiel si non fourni
++    if step_in.step_order <= 0 and storymap.steps:
++        next_order = max(s.step_order for s in storymap.steps) + 1
++    else:
++        next_order = step_in.step_order
++
++    new_step = StorymapStep(
++        storymap_id=storymap.id,
++        photo_id=step_in.photo_id,
++        step_order=next_order,
++        title=step_in.title,
++        content_markdown=step_in.content_markdown,
++        audio_file_path=step_in.audio_file_path,
++        camera_lat=step_in.camera_lat,
++        camera_lng=step_in.camera_lng,
++        camera_zoom=step_in.camera_zoom,
++        camera_bearing=step_in.camera_bearing,
++        camera_pitch=step_in.camera_pitch,
++    )
++
++    db.add(new_step)
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(new_step)
++
++    # Charger la photo liée si présente
++    if new_step.photo_id:
++        step_stmt = (
++            select(StorymapStep)
++            .options(selectinload(StorymapStep.photo))
++            .where(StorymapStep.id == new_step.id)
++        )
++        step_res = await db.execute(step_stmt)
++        new_step = step_res.scalar_one()
++
++    return StorymapStepRead.model_validate(new_step)
++
++
++@router.put(
++    "/{id}/steps/reorder",
++    response_model=StorymapRead,
++    summary="Réordonner atomiquement les étapes d'une storymap",
++)
++async def reorder_storymap_steps(
++    id: uuid.UUID,
++    payload: StorymapReorderPayload,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Met à jour atomiquement les champs `step_order` (0, 1, 2...) de l'ensemble des étapes d'une storymap."""
++    ordered_ids = payload.step_ids
++
++    stmt = (
++        select(Storymap)
++        .options(selectinload(Storymap.steps).selectinload(StorymapStep.photo))
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_map = {step.id: step for step in storymap.steps}
++
++    # Vérifier que les IDs reçus correspondent exactement aux étapes existantes (ni doublons, ni manquants)
++    if len(ordered_ids) != len(step_map) or set(ordered_ids) != set(step_map.keys()):
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_STEP_IDS",
++                    "message": "La liste des identifiants d'étapes ne correspond pas exactement aux étapes de ce récit.",
++                }
++            },
++        )
++
++    # Réordonnancement atomique
++    for new_order, step_id in enumerate(ordered_ids):
++        step_map[step_id].step_order = new_order
++        step_map[step_id].updated_at = datetime.now(timezone.utc)
++
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(storymap)
++
++    # Recharger les étapes triées
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == storymap.id)
++    )
++    reloaded = (await db.execute(stmt)).scalar_one()
++
++    return StorymapRead.model_validate(reloaded)
++
++
++@router.put(
++    "/{id}/steps/{step_id}",
++    response_model=StorymapStepRead,
++    summary="Mettre à jour un chapitre / étape",
++)
++async def update_storymap_step(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    step_in: StorymapStepUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapStepRead:
++    """Met à jour le contenu, le cadrage cartographique ou la photo d'une étape."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = (
++        select(StorymapStep)
++        .options(selectinload(StorymapStep.photo))
++        .where(StorymapStep.id == step_id, StorymapStep.storymap_id == id)
++    )
++    step_result = await db.execute(step_stmt)
++    step = step_result.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    update_data = step_in.model_dump(exclude_unset=True)
++
++    if "photo_id" in update_data:
++        await _validate_photo_id(db, storymap.territory_id, update_data["photo_id"])
++        step.photo_id = update_data["photo_id"]
++    if "title" in update_data and update_data["title"] is not None:
++        step.title = update_data["title"]
++    if "content_markdown" in update_data:
++        step.content_markdown = update_data["content_markdown"]
++    if "audio_file_path" in update_data:
++        step.audio_file_path = update_data["audio_file_path"]
++    if "step_order" in update_data and update_data["step_order"] is not None:
++        step.step_order = update_data["step_order"]
++
++    if "camera_lat" in update_data and update_data["camera_lat"] is not None:
++        step.camera_lat = update_data["camera_lat"]
++    if "camera_lng" in update_data and update_data["camera_lng"] is not None:
++        step.camera_lng = update_data["camera_lng"]
++    if "camera_zoom" in update_data and update_data["camera_zoom"] is not None:
++        step.camera_zoom = update_data["camera_zoom"]
++    if "camera_bearing" in update_data and update_data["camera_bearing"] is not None:
++        step.camera_bearing = update_data["camera_bearing"]
++    if "camera_pitch" in update_data and update_data["camera_pitch"] is not None:
++        step.camera_pitch = update_data["camera_pitch"]
++
++    step.updated_at = datetime.now(timezone.utc)
++    storymap.updated_at = datetime.now(timezone.utc)
++
++    await db.commit()
++    await db.refresh(step)
++
++    # Recharger avec photo si photo_id est défini
++    if step.photo_id:
++        step_stmt = (
++            select(StorymapStep)
++            .options(selectinload(StorymapStep.photo))
++            .where(StorymapStep.id == step.id)
++        )
++        step = (await db.execute(step_stmt)).scalar_one()
++
++    return StorymapStepRead.model_validate(step)
++
++
++@router.delete(
++    "/{id}/steps/{step_id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une étape d'une storymap",
++)
++async def delete_storymap_step(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++):
++    """Supprime une étape spécifique d'une storymap et purge son fichier audio."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = select(StorymapStep).where(
++        StorymapStep.id == step_id,
++        StorymapStep.storymap_id == id,
++    )
++    step_res = await db.execute(step_stmt)
++    step = step_res.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    # Purge de l'audio orphelin
++    if step.audio_file_path:
++        try:
++            await storage.delete(step.audio_file_path)
++        except Exception as e:
++            logger.warning(f"Erreur purge audio step {step.id}: {e}")
++
++    await db.delete(step)
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
++
++
++# ============================================================================
++# Téléversement de Médias (Couverture & Audio de chapitre)
++# ============================================================================
++
++@router.post(
++    "/{id}/cover",
++    response_model=StorymapRead,
++    summary="Téléverser et associer une image de couverture pour la storymap",
++)
++async def upload_storymap_cover(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    file: UploadFile = File(...),
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++) -> StorymapRead:
++    """Téléverse une image de couverture, la redimensionne et la convertit en WebP optimisé."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    content = await _read_upload_file(file, max_size=MAX_COVER_FILE_SIZE)
++
++    def _process_cover(raw_bytes: bytes) -> bytes:
++        try:
++            img = Image.open(io.BytesIO(raw_bytes))
++            fmt = (img.format or "").upper()
++            if fmt not in ALLOWED_COVER_FORMATS:
++                raise ValueError("FORMAT_NOT_ALLOWED")
++            img = ImageOps.exif_transpose(img)
++            if img.mode in ("RGBA", "LA", "P"):
++                img = img.convert("RGBA")
++            else:
++                img = img.convert("RGB")
++            img.thumbnail((2048, 2048), Image.Resampling.LANCZOS)
++            out_buf = io.BytesIO()
++            img.save(out_buf, format="WEBP", quality=85)
++            return out_buf.getvalue()
++        except UnidentifiedImageError:
++            raise ValueError("INVALID_IMAGE")
++        except Image.DecompressionBombError:
++            raise ValueError("DECOMPRESSION_BOMB")
++        except (OSError, ValueError) as e:
++            if str(e) == "FORMAT_NOT_ALLOWED":
++                raise
++            raise ValueError("CORRUPTED_IMAGE")
++
++    try:
++        webp_bytes = await asyncio.to_thread(_process_cover, content)
++    except (ValueError, OSError, Image.DecompressionBombError) as ve:
++        if str(ve) == "FORMAT_NOT_ALLOWED":
++            raise HTTPException(
++                status_code=status.HTTP_400_BAD_REQUEST,
++                detail={
++                    "error": {
++                        "code": "INVALID_IMAGE_FORMAT",
++                        "message": "Format d'image non supporté. Formats acceptés : JPEG, PNG, WEBP.",
++                    }
++                },
++            )
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_IMAGE_FORMAT",
++                    "message": "Fichier image corrompu ou illisible.",
++                }
++            },
++        )
++
++    # Purge ancien cover si existant
++    if storymap.cover_image_path:
++        try:
++            await storage.delete(storymap.cover_image_path)
++        except Exception as e:
++            logger.warning(f"Erreur lors de la purge de l'ancien cover {storymap.cover_image_path}: {e}")
++
++    dest_path = f"territories/{storymap.territory_id}/storymaps/{storymap.id}/cover_{uuid.uuid4().hex[:8]}.webp"
++    await storage.save(webp_bytes, dest_path, content_type="image/webp")
++
++    storymap.cover_image_path = dest_path
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(storymap)
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.delete(
++    "/{id}/cover",
++    response_model=StorymapRead,
++    summary="Supprimer l'image de couverture d'une storymap",
++)
++async def delete_storymap_cover(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++) -> StorymapRead:
++    """Supprime l'image de couverture d'une storymap et purge le fichier physique."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    if storymap.cover_image_path:
++        try:
++            await storage.delete(storymap.cover_image_path)
++        except Exception as e:
++            logger.warning(f"Erreur purge couverture {storymap.cover_image_path}: {e}")
++        storymap.cover_image_path = None
++        storymap.updated_at = datetime.now(timezone.utc)
++        await db.commit()
++        await db.refresh(storymap)
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.post(
++    "/{id}/steps/{step_id}/audio",
++    response_model=StorymapStepRead,
++    summary="Téléverser et associer un fichier audio pour une étape de storymap",
++)
++async def upload_storymap_step_audio(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    file: UploadFile = File(...),
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++) -> StorymapStepRead:
++    """Téléverse un document sonore (MP3, M4A, OGG, WAV) pour un chapitre narrative."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = (
++        select(StorymapStep)
++        .options(selectinload(StorymapStep.photo))
++        .where(StorymapStep.id == step_id, StorymapStep.storymap_id == id)
++    )
++    step_res = await db.execute(step_stmt)
++    step = step_res.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    # Validation stricte du format audio (extension ET type MIME)
++    ext = Path(file.filename or "").suffix.lower()
++    ct = (file.content_type or "").lower().split(";")[0].strip()
++
++    if ext not in ALLOWED_AUDIO_EXTENSIONS or ct not in ALLOWED_AUDIO_MIMES:
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_AUDIO_FORMAT",
++                    "message": "Format audio non supporté. Formats acceptés : .mp3, .m4a, .ogg, .wav avec type MIME audio valide.",
++                }
++            },
++        )
++
++    if not ext:
++        ext = ".mp3"
++
++    content = await _read_upload_file(file, max_size=MAX_AUDIO_FILE_SIZE)
++
++    # Purge ancien fichier audio si présent
++    if step.audio_file_path:
++        try:
++            await storage.delete(step.audio_file_path)
++        except Exception as e:
++            logger.warning(f"Erreur purge ancien audio {step.audio_file_path}: {e}")
++
++    dest_path = f"territories/{storymap.territory_id}/storymaps/{storymap.id}/audio/{step.id}_{uuid.uuid4().hex[:8]}{ext}"
++    out_mime = ct if ct in ALLOWED_AUDIO_MIMES else "audio/mpeg"
++    await storage.save(content, dest_path, content_type=out_mime)
++
++    step.audio_file_path = dest_path
++    step.updated_at = datetime.now(timezone.utc)
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(step)
++
++    return StorymapStepRead.model_validate(step)
++
++
++@router.delete(
++    "/{id}/steps/{step_id}/audio",
++    response_model=StorymapStepRead,
++    summary="Supprimer le fichier audio d'une étape de storymap",
++)
++async def delete_storymap_step_audio(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    storage: StorageDriver = Depends(get_storage_driver),
++) -> StorymapStepRead:
++    """Supprime le document sonore associé à une étape et purge le fichier physique."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = (
++        select(StorymapStep)
++        .options(selectinload(StorymapStep.photo))
++        .where(StorymapStep.id == step_id, StorymapStep.storymap_id == id)
++    )
++    step_res = await db.execute(step_stmt)
++    step = step_res.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    if step.audio_file_path:
++        try:
++            await storage.delete(step.audio_file_path)
++        except Exception as e:
++            logger.warning(f"Erreur purge audio {step.audio_file_path}: {e}")
++        step.audio_file_path = None
++        step.updated_at = datetime.now(timezone.utc)
++        storymap.updated_at = datetime.now(timezone.utc)
++        await db.commit()
++        await db.refresh(step)
++
++    return StorymapStepRead.model_validate(step)
++
+--- /dev/null
++++ b/backend/tests/test_storymaps.py
+@@ -0,0 +1,1089 @@
++import uuid
++import pytest
++from httpx import AsyncClient, ASGITransport
++from sqlalchemy import select, delete
++
++from app.main import app
++from app.core.database import AsyncSessionLocal
++from app.core.auth import get_current_active_user
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++
++
++@pytest.fixture
++async def setup_storymaps_test_data():
++    """Prépare deux territoires, deux contributeurs et deux photos (une publiée, une brouillon) pour les tests."""
++    async with AsyncSessionLocal() as session:
++        t_a = Territory(
++            id=uuid.uuid4(),
++            slug=f"toulon-{uuid.uuid4().hex[:6]}",
++            name="Toulon Test",
++            center_lat=43.12,
++            center_lng=5.93,
++            default_zoom=13,
++        )
++        t_b = Territory(
++            id=uuid.uuid4(),
++            slug=f"marseille-{uuid.uuid4().hex[:6]}",
++            name="Marseille Test",
++            center_lat=43.29,
++            center_lng=5.37,
++            default_zoom=13,
++        )
++        session.add_all([t_a, t_b])
++        await session.commit()
++        await session.refresh(t_a)
++        await session.refresh(t_b)
++
++        u_a = User(
++            id=uuid.uuid4(),
++            email=f"contrib_a_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Jean Toulon",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        u_b = User(
++            id=uuid.uuid4(),
++            email=f"contrib_b_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Claire Marseille",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_b.id,
++            is_active=True,
++        )
++        super_admin = User(
++            id=uuid.uuid4(),
++            email=f"superadmin_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Admin Principal",
++            role=UserRole.SUPERADMIN,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        session.add_all([u_a, u_b, super_admin])
++        await session.commit()
++        await session.refresh(u_a)
++        await session.refresh(u_b)
++        await session.refresh(super_admin)
++
++        photo_pub_a = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo d'archive port 1900",
++            latitude=43.12,
++            longitude=5.93,
++            bearing=90,
++            field_of_view=60,
++            file_original_path="private/storage/original_photo.jpg",
++            file_display_path="private/storage/display_photo.webp",
++            file_thumb_path="private/storage/thumb_photo.webp",
++            status=PhotoStatus.PUBLISHED,
++        )
++        photo_draft_a = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo d'archive confidentielle non publiée",
++            latitude=43.12,
++            longitude=5.93,
++            file_display_path="private/storage/draft.webp",
++            status=PhotoStatus.DRAFT,
++        )
++        photo_pub_b = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo Marseille Vieux Port",
++            latitude=43.29,
++            longitude=5.37,
++            file_display_path="private/storage/marseille.webp",
++            status=PhotoStatus.PUBLISHED,
++        )
++        session.add_all([photo_pub_a, photo_draft_a, photo_pub_b])
++        await session.commit()
++        await session.refresh(photo_pub_a)
++        await session.refresh(photo_draft_a)
++        await session.refresh(photo_pub_b)
++
++    yield {
++        "t_a": t_a,
++        "t_b": t_b,
++        "u_a": u_a,
++        "u_b": u_b,
++        "super_admin": super_admin,
++        "photo": photo_pub_a,
++        "photo_draft": photo_draft_a,
++        "photo_b": photo_pub_b,
++    }
++
++    # Nettoyage en fin de test
++    async with AsyncSessionLocal() as session:
++        await session.execute(
++            delete(Storymap).where(Storymap.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(Photo).where(Photo.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(User).where(User.id.in_([u_a.id, u_b.id, super_admin.id]))
++        )
++        await session.execute(
++            delete(Territory).where(Territory.id.in_([t_a.id, t_b.id]))
++        )
++        await session.commit()
++
++
++@pytest.mark.asyncio
++async def test_admin_routes_require_authentication():
++    """Vérifie que les routes admin de storymaps rejettent les accès non authentifiés (401)."""
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        res = await client.get("/api/v1/admin/storymaps")
++        assert res.status_code == 401
++
++        res_post = await client.post("/api/v1/admin/storymaps", json={"title": "Test"})
++        assert res_post.status_code == 401
++
++
++@pytest.mark.asyncio
++async def test_create_storymap_draft_and_auto_slug(setup_storymaps_test_data):
++    """Vérifie la création d'une storymap en brouillon avec génération automatique de slug."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    t_a = data["t_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            payload = {
++                "title": "Histoire du Tramway Toulonnais (1886) !",
++                "summary": "Découvrez le développement des transports urbains au 19e siècle.",
++                "cover_image_path": "uploads/covers/tramway.webp",
++                "status": "draft",
++            }
++            res = await client.post("/api/v1/admin/storymaps", json=payload)
++            assert res.status_code == 201
++            body = res.json()
++
++            assert body["title"] == payload["title"]
++            assert body["summary"] == payload["summary"]
++            assert body["status"] == "draft"
++            assert body["slug"] == "histoire-du-tramway-toulonnais-1886"
++            assert body["territory_id"] == str(t_a.id)
++            assert body["author_user_id"] == str(u_a.id)
++            assert "cover_image_url" in body
++            assert body["steps"] == []
++            assert body["steps_count"] == 0
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_create_storymap_with_initial_steps_and_camera_validation(setup_storymaps_test_data):
++    """Vérifie la création avec étapes initiales et la validation stricte des coordonnées cartographiques."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    photo = data["photo"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Étape avec coordonnées caméra invalides (latitude hors borne > 90) -> 422
++            invalid_payload = {
++                "title": "Storymap Hors Bornes",
++                "steps": [
++                    {
++                        "title": "Étape Invalide",
++                        "camera_lat": 150.0,
++                        "camera_lng": 5.92,
++                    }
++                ],
++            }
++            res_invalid = await client.post("/api/v1/admin/storymaps", json=invalid_payload)
++            assert res_invalid.status_code == 422
++
++            # 2. Étape avec zoom hors borne (> 24) -> 422
++            invalid_zoom = {
++                "title": "Zoom Invalide",
++                "steps": [
++                    {
++                        "title": "Étape Invalide",
++                        "camera_lat": 43.12,
++                        "camera_lng": 5.92,
++                        "camera_zoom": 25.0,
++                    }
++                ],
++            }
++            res_zoom = await client.post("/api/v1/admin/storymaps", json=invalid_zoom)
++            assert res_zoom.status_code == 422
++
++            # 3. Payload valide avec 2 étapes ordonnées
++            valid_payload = {
++                "title": "Circuit Historique du Port",
++                "summary": "Parcours maritime",
++                "status": "published",
++                "steps": [
++                    {
++                        "title": "L'Arsenal",
++                        "content_markdown": "## Entrée monumentale\nConstruite en 1738.",
++                        "camera_lat": 43.1242,
++                        "camera_lng": 5.9280,
++                        "camera_zoom": 15.5,
++                        "camera_bearing": 120.0,
++                        "camera_pitch": 45.0,
++                        "audio_file_path": "audio/chapitre1.mp3",
++                        "photo_id": str(photo.id),
++                    },
++                    {
++                        "title": "Le Carré du Port",
++                        "content_markdown": "Vue panoramique des quais.",
++                        "camera_lat": 43.1210,
++                        "camera_lng": 5.9320,
++                        "camera_zoom": 16.0,
++                        "camera_bearing": 360.0,  # 360 doit être normalisé à 0
++                        "camera_pitch": 20.0,
++                    },
++                ],
++            }
++            res_valid = await client.post("/api/v1/admin/storymaps", json=valid_payload)
++            assert res_valid.status_code == 201
++            body = res_valid.json()
++
++            assert body["title"] == "Circuit Historique du Port"
++            assert body["steps_count"] == 2
++            assert len(body["steps"]) == 2
++
++            step1 = body["steps"][0]
++            assert step1["step_order"] == 0
++            assert step1["title"] == "L'Arsenal"
++            assert step1["camera_bearing"] == 120.0
++            assert step1["photo_id"] == str(photo.id)
++            assert "audio_url" in step1
++
++            step2 = body["steps"][1]
++            assert step2["step_order"] == 1
++            assert step2["title"] == "Le Carré du Port"
++            assert step2["camera_bearing"] == 0.0  # Normalisé
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_add_update_delete_steps(setup_storymaps_test_data):
++    """Vérifie l'ajout, la modification et la suppression unitaire d'étapes de storymap."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # Créer storymap sans étape
++            res_create = await client.post("/api/v1/admin/storymaps", json={"title": "Récit Étapes Test"})
++            assert res_create.status_code == 201
++            sm_id = res_create.json()["id"]
++
++            # 1. Ajouter une étape
++            res_step1 = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Première étape",
++                    "content_markdown": "Description introductive",
++                    "lat": 43.12,
++                    "lng": 5.92,
++                    "zoom": 14.0,
++                },
++            )
++            assert res_step1.status_code == 201
++            step1 = res_step1.json()
++            assert step1["title"] == "Première étape"
++            assert step1["step_order"] == 0
++            step1_id = step1["id"]
++
++            # 2. Ajouter une seconde étape (ordre séquentiel incrémenté)
++            res_step2 = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Deuxième étape",
++                    "lat": 43.13,
++                    "lng": 5.94,
++                },
++            )
++            assert res_step2.status_code == 201
++            step2 = res_step2.json()
++            assert step2["step_order"] == 1
++            step2_id = step2["id"]
++
++            # 3. Mettre à jour l'étape 1
++            res_up = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/{step1_id}",
++                json={
++                    "title": "Première étape renommée",
++                    "pitch": 60.0,
++                },
++            )
++            assert res_up.status_code == 200
++            assert res_up.json()["title"] == "Première étape renommée"
++            assert res_up.json()["camera_pitch"] == 60.0
++
++            # 4. Supprimer l'étape 2
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{sm_id}/steps/{step2_id}")
++            assert res_del.status_code == 204
++
++            # Vérifier la storymap
++            res_sm = await client.get(f"/api/v1/admin/storymaps/{sm_id}")
++            assert res_sm.status_code == 200
++            assert res_sm.json()["steps_count"] == 1
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_reorder_steps_atomically(setup_storymaps_test_data):
++    """Vérifie le réordonnancement atomique d'étapes via PUT /steps/reorder."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Réordonnancement",
++                    "steps": [
++                        {"title": "Étape Alpha", "lat": 43.1, "lng": 5.9},
++                        {"title": "Étape Bêta", "lat": 43.2, "lng": 5.8},
++                        {"title": "Étape Gamma", "lat": 43.3, "lng": 5.7},
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            sm = res_create.json()
++            sm_id = sm["id"]
++            id_alpha = sm["steps"][0]["id"]
++            id_beta = sm["steps"][1]["id"]
++            id_gamma = sm["steps"][2]["id"]
++
++            # Inverser l'ordre : Gamma (0), Alpha (1), Bêta (2)
++            res_reorder = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_alpha, id_beta]},
++            )
++            assert res_reorder.status_code == 200
++            updated_sm = res_reorder.json()
++
++            steps_res = updated_sm["steps"]
++            assert steps_res[0]["id"] == id_gamma
++            assert steps_res[0]["step_order"] == 0
++            assert steps_res[1]["id"] == id_alpha
++            assert steps_res[1]["step_order"] == 1
++            assert steps_res[2]["id"] == id_beta
++            assert steps_res[2]["step_order"] == 2
++
++            # Test d'erreur : liste incomplète -> 400
++            res_incomplete = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_alpha]},
++            )
++            assert res_incomplete.status_code == 400
++
++            # Test d'erreur : liste avec doublon -> 400
++            res_duplicate = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_gamma, id_beta]},
++            )
++            assert res_duplicate.status_code == 400
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_admin_list_storymaps_pagination_filters_and_isolation(setup_storymaps_test_data):
++    """Vérifie la route GET /api/v1/admin/storymaps :
++    - Pagination (page, page_size)
++    - Filtre par statut (draft, published)
++    - Filtre par recherche textuelle (titre/résumé)
++    - Isolation territoriale stricte entre contributeurs.
++    """
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    t_b = data["t_b"]
++    u_a = data["u_a"]
++    u_b = data["u_b"]
++
++    async with AsyncSessionLocal() as session:
++        sm1 = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="balade-rade-1",
++            title="Balade dans la Rade",
++            summary="Aperçu des forts militaires",
++            status=StorymapStatus.PUBLISHED,
++        )
++        sm2 = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="funiculaire-faron",
++            title="Le Funiculaire du Mont Faron",
++            summary="Histoire de la montée au sommet",
++            status=StorymapStatus.DRAFT,
++        )
++        sm_marseille = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            slug="notre-dame-garde",
++            title="Notre Dame de la Garde",
++            summary="Vue sur la cité phocéenne",
++            status=StorymapStatus.PUBLISHED,
++        )
++        session.add_all([sm1, sm2, sm_marseille])
++        await session.commit()
++
++    # Authentification sous Jean Toulon (u_a)
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Liste complète pour le territoire A (2 items attendus, pas celui de Marseille)
++            res = await client.get("/api/v1/admin/storymaps")
++            assert res.status_code == 200
++            data_res = res.json()
++            assert data_res["total"] == 2
++            slugs = [s["slug"] for s in data_res["items"]]
++            assert "balade-rade-1" in slugs
++            assert "funiculaire-faron" in slugs
++            assert "notre-dame-garde" not in slugs
++
++            # 2. Filtre par statut = published
++            res_pub = await client.get("/api/v1/admin/storymaps?status=published")
++            assert res_pub.status_code == 200
++            assert res_pub.json()["total"] == 1
++            assert res_pub.json()["items"][0]["slug"] == "balade-rade-1"
++
++            # 3. Filtre par recherche textuelle
++            res_search = await client.get("/api/v1/admin/storymaps?search=faron")
++            assert res_search.status_code == 200
++            assert res_search.json()["total"] == 1
++            assert res_search.json()["items"][0]["slug"] == "funiculaire-faron"
++
++            # 4. Pagination (page 1, limit 1)
++            res_page = await client.get("/api/v1/admin/storymaps?page=1&page_size=1")
++            assert res_page.status_code == 200
++            assert len(res_page.json()["items"]) == 1
++            assert res_page.json()["pages"] == 2
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_update_storymap_metadata_and_publishing(setup_storymaps_test_data):
++    """Vérifie la mise à jour des métadonnées, la réinitialisation de champs optionnels et la publication d'une storymap."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Créer une storymap initiale
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Histoire du Théâtre",
++                    "summary": "Résumé temporaire",
++                    "cover_image_path": "uploads/covers/theatre.webp",
++                    "status": "draft",
++                },
++            )
++            assert res_create.status_code == 201
++            sm_id = res_create.json()["id"]
++
++            # 2. Mettre à jour titre, publier, et effacer volontairement le résumé et la couverture (None)
++            res_update = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}",
++                json={
++                    "title": "L'Opéra de Toulon",
++                    "summary": None,
++                    "cover_image_path": None,
++                    "status": "published",
++                },
++            )
++            assert res_update.status_code == 200
++            body = res_update.json()
++            assert body["title"] == "L'Opéra de Toulon"
++            assert body["summary"] is None
++            assert body["cover_image_path"] is None
++            assert body["cover_image_url"] is None
++            assert body["status"] == "published"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_public_storymaps_access_isolation_and_privacy(setup_storymaps_test_data):
++    """Vérifie l'accès public aux storymaps :
++    - Récit publié accessible via son slug (200)
++    - Récit brouillon masqué (404)
++    - Récit d'un autre territoire masqué (404)
++    - Absence stricte de fuite de métadonnées sensibles (chemins internes, author_user_id)
++    """
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    t_b = data["t_b"]
++    u_a = data["u_a"]
++    u_b = data["u_b"]
++    photo = data["photo"]
++
++    # Créer 1 récit publié sur Territoire A
++    # Créer 1 récit brouillon sur Territoire A
++    # Créer 1 récit publié sur Territoire B
++    async with AsyncSessionLocal() as session:
++        sm_pub_a = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="decouverte-du-vieux-toulon",
++            title="Découverte du Vieux Toulon",
++            summary="Une balade à travers les ruelles médiévales.",
++            cover_image_path="internal/storage/covers/vieux_toulon.webp",
++            status=StorymapStatus.PUBLISHED,
++        )
++        step_pub = StorymapStep(
++            storymap=sm_pub_a,
++            photo_id=photo.id,
++            step_order=0,
++            title="Place Puget",
++            content_markdown="La fontaine des Trois Dauphins.",
++            audio_file_path="internal/storage/audio/puget.mp3",
++            camera_lat=43.125,
++            camera_lng=5.931,
++            camera_zoom=16.0,
++            camera_bearing=45.0,
++            camera_pitch=30.0,
++        )
++        sm_pub_a.steps.append(step_pub)
++
++        sm_draft_a = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="recit-en-preparation",
++            title="Récit en Préparation",
++            status=StorymapStatus.DRAFT,
++        )
++
++        sm_pub_b = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            slug="le-panier-marseillais",
++            title="Le Panier Marseillais",
++            status=StorymapStatus.PUBLISHED,
++        )
++
++        session.add_all([sm_pub_a, sm_draft_a, sm_pub_b])
++        await session.commit()
++
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        # 1. Consultation publique du récit publié sur Territoire A
++        res_pub = await client.get(
++            "/api/v1/storymaps/decouverte-du-vieux-toulon",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_pub.status_code == 200
++        item = res_pub.json()
++        assert item["slug"] == "decouverte-du-vieux-toulon"
++        assert item["title"] == "Découverte du Vieux Toulon"
++        assert item["status"] == "published"
++        assert "cover_image_url" in item
++        assert len(item["steps"]) == 1
++
++        # Vérification stricte de confidentialité (absence de chemins physiques et author_user_id)
++        assert "cover_image_path" not in item
++        assert "author_user_id" not in item
++        step_detail = item["steps"][0]
++        assert "audio_file_path" not in step_detail
++        assert "audio_url" in step_detail
++        assert step_detail["lat"] == 43.125
++        assert step_detail["lng"] == 5.931
++        assert step_detail["photo"] is not None
++        assert step_detail["photo"]["title"] == "Photo d'archive port 1900"
++        assert "file_original_path" not in step_detail["photo"]
++
++        # 2. Consultation d'une storymap en brouillon -> 404 (masque le brouillon)
++        res_draft = await client.get(
++            "/api/v1/storymaps/recit-en-preparation",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_draft.status_code == 404
++        assert res_draft.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++
++        # 3. Consultation d'un récit d'un autre territoire -> 404 (isolation multi-territoire)
++        res_other = await client.get(
++            "/api/v1/storymaps/le-panier-marseillais",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_other.status_code == 404
++
++        # 4. Catalogue public du territoire A : ne liste que le récit publié de Toulon
++        res_list = await client.get(
++            "/api/v1/storymaps",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_list.status_code == 200
++        catalogue = res_list.json()
++        assert catalogue["total"] == 1
++        assert catalogue["items"][0]["slug"] == "decouverte-du-vieux-toulon"
++
++
++@pytest.mark.asyncio
++async def test_public_storymaps_mask_draft_photos(setup_storymaps_test_data):
++    """Vérifie que les photos en statut draft liées à une étape sont totalement masquées dans les endpoints publics."""
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    u_a = data["u_a"]
++    photo_pub = data["photo"]
++    photo_draft = data["photo_draft"]
++
++    async with AsyncSessionLocal() as session:
++        sm = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="recit-photos-mixtes",
++            title="Récit avec photos mixtes",
++            status=StorymapStatus.PUBLISHED,
++        )
++        step1 = StorymapStep(
++            storymap=sm,
++            photo_id=photo_pub.id,
++            step_order=0,
++            title="Étape photo publiée",
++            camera_lat=43.12,
++            camera_lng=5.93,
++        )
++        step2 = StorymapStep(
++            storymap=sm,
++            photo_id=photo_draft.id,
++            step_order=1,
++            title="Étape photo brouillon",
++            camera_lat=43.13,
++            camera_lng=5.94,
++        )
++        sm.steps.extend([step1, step2])
++        session.add(sm)
++        await session.commit()
++
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        # 1. Détail public
++        res = await client.get(
++            "/api/v1/storymaps/recit-photos-mixtes",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res.status_code == 200
++        body = res.json()
++        s1 = body["steps"][0]
++        s2 = body["steps"][1]
++
++        assert s1["photo"] is not None
++        assert s1["photo_id"] == str(photo_pub.id)
++        # La photo en statut draft ne doit pas être visible
++        assert s2["photo"] is None
++        assert s2["photo_id"] is None
++
++        # 2. Liste publique (catalogue)
++        res_list = await client.get(
++            "/api/v1/storymaps",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_list.status_code == 200
++        matched = next(s for s in res_list.json()["items"] if s["slug"] == "recit-photos-mixtes")
++        assert matched["steps"][0]["photo"] is not None
++        assert matched["steps"][1]["photo"] is None
++        assert matched["steps"][1]["photo_id"] is None
++
++
++@pytest.mark.asyncio
++async def test_step_rejects_foreign_or_nonexistent_photo(setup_storymaps_test_data):
++    """Vérifie le rejet avec code 422 (INVALID_PHOTO) si une photo appartient à un autre territoire ou est introuvable."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    photo_b = data["photo_b"]
++    fake_photo_id = uuid.uuid4()
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Création initiale d'une storymap avec photo d'un autre territoire -> 422
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Photo Marseille dans Toulon",
++                    "steps": [
++                        {
++                            "title": "Étape rejetée",
++                            "lat": 43.12,
++                            "lng": 5.93,
++                            "photo_id": str(photo_b.id),
++                        }
++                    ],
++                },
++            )
++            assert res_create.status_code == 422
++            assert res_create.json()["error"]["code"] == "INVALID_PHOTO"
++
++            # 2. Créer une storymap valide sans étape
++            res_ok = await client.post(
++                "/api/v1/admin/storymaps",
++                json={"title": "Storymap Toulon Test Photo"},
++            )
++            assert res_ok.status_code == 201
++            sm_id = res_ok.json()["id"]
++
++            # 3. Ajout d'une étape avec une photo inexistante -> 422
++            res_add_fake = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Étape Photo Inexistante",
++                    "lat": 43.12,
++                    "lng": 5.93,
++                    "photo_id": str(fake_photo_id),
++                },
++            )
++            assert res_add_fake.status_code == 422
++            assert res_add_fake.json()["error"]["code"] == "INVALID_PHOTO"
++
++            # 4. Ajout d'une étape valide sans photo
++            res_step_ok = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={"title": "Étape Initiale", "lat": 43.12, "lng": 5.93},
++            )
++            assert res_step_ok.status_code == 201
++            step_id = res_step_ok.json()["id"]
++
++            # 5. Modification de l'étape pour lui associer la photo de Marseille -> 422
++            res_up_foreign = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/{step_id}",
++                json={"photo_id": str(photo_b.id)},
++            )
++            assert res_up_foreign.status_code == 422
++            assert res_up_foreign.json()["error"]["code"] == "INVALID_PHOTO"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_delete_storymap_cascades_to_steps(setup_storymaps_test_data):
++    """Vérifie que la suppression d'une storymap supprime en cascade toutes ses étapes."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap à Supprimer",
++                    "steps": [
++                        {"title": "Étape 1", "lat": 43.1, "lng": 5.9},
++                        {"title": "Étape 2", "lat": 43.2, "lng": 5.8},
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            sm_id = uuid.UUID(res_create.json()["id"])
++            step_ids = [uuid.UUID(s["id"]) for s in res_create.json()["steps"]]
++
++            # Vérifier que les étapes sont bien en base
++            async with AsyncSessionLocal() as session:
++                steps_db = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.storymap_id == sm_id)
++                    )
++                ).scalars().all()
++                assert len(steps_db) == 2
++
++            # Supprimer la storymap
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{sm_id}")
++            assert res_del.status_code == 204
++
++            # Vérifier que la storymap ET toutes ses étapes ont disparu de la BDD
++            async with AsyncSessionLocal() as session:
++                sm_check = (
++                    await session.execute(
++                        select(Storymap).where(Storymap.id == sm_id)
++                    )
++                ).scalar_one_or_none()
++                assert sm_check is None
++
++                steps_check = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.id.in_(step_ids))
++                    )
++                ).scalars().all()
++                assert len(steps_check) == 0
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_delete_photo_sets_null_on_step(setup_storymaps_test_data):
++    """Vérifie que la suppression d'une photo liée passe photo_id à NULL sans effacer l'étape (SET NULL)."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    t_a = data["t_a"]
++
++    # Créer une photo spécifique pour ce test
++    async with AsyncSessionLocal() as session:
++        tmp_photo = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo temporaire à supprimer",
++            latitude=43.12,
++            longitude=5.93,
++            status=PhotoStatus.PUBLISHED,
++        )
++        session.add(tmp_photo)
++        await session.commit()
++        await session.refresh(tmp_photo)
++        photo_id = tmp_photo.id
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Test Set Null",
++                    "steps": [
++                        {
++                            "title": "Étape avec photo",
++                            "lat": 43.1,
++                            "lng": 5.9,
++                            "photo_id": str(photo_id),
++                        }
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            step_id = uuid.UUID(res_create.json()["steps"][0]["id"])
++
++            # Supprimer la photo en BDD
++            async with AsyncSessionLocal() as session:
++                await session.execute(delete(Photo).where(Photo.id == photo_id))
++                await session.commit()
++
++            # Vérifier l'étape : elle doit toujours exister et son photo_id est devenu NULL
++            async with AsyncSessionLocal() as session:
++                step_db = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.id == step_id)
++                    )
++                ).scalar_one_or_none()
++                assert step_db is not None
++                assert step_db.photo_id is None
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_upload_and_delete_storymap_cover(setup_storymaps_test_data):
++    """Vérifie le téléversement d'une image de couverture, sa conversion WebP et sa suppression."""
++    u_a = setup_storymaps_test_data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={"title": "Récit avec couverture"},
++            )
++            assert res_create.status_code == 201
++            storymap_id = res_create.json()["id"]
++
++            # Création d'une image de test valide
++            import io
++            from PIL import Image
++            buf = io.BytesIO()
++            img = Image.new("RGB", (64, 64), color="red")
++            img.save(buf, format="PNG")
++            img_bytes = buf.getvalue()
++
++            # Upload de la couverture
++            res_upload = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/cover",
++                files={"file": ("cover.png", img_bytes, "image/png")},
++            )
++            assert res_upload.status_code == 200
++            data_upload = res_upload.json()
++            assert data_upload["cover_image_path"] is not None
++            assert data_upload["cover_image_path"].endswith(".webp")
++            assert data_upload["cover_image_url"] is not None
++
++            # Suppression de la couverture
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{storymap_id}/cover")
++            assert res_del.status_code == 200
++            data_del = res_del.json()
++            assert data_del["cover_image_path"] is None
++            assert data_del["cover_image_url"] is None
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_upload_and_delete_storymap_step_audio(setup_storymaps_test_data):
++    """Vérifie le téléversement d'un document sonore sur une étape et sa suppression."""
++    u_a = setup_storymaps_test_data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Récit sonore",
++                    "steps": [
++                        {
++                            "title": "Étape avec audio",
++                            "lat": 43.12,
++                            "lng": 5.93,
++                        }
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            storymap_id = res_create.json()["id"]
++            step_id = res_create.json()["steps"][0]["id"]
++
++            fake_audio = b"ID3\x03\x00\x00\x00\x00\x00#TSSE" + b"\x00" * 50
++
++            # Upload audio
++            res_audio = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/steps/{step_id}/audio",
++                files={"file": ("narration.mp3", fake_audio, "audio/mpeg")},
++            )
++            assert res_audio.status_code == 200
++            data_audio = res_audio.json()
++            assert data_audio["audio_file_path"] is not None
++            assert data_audio["audio_file_path"].endswith(".mp3")
++            assert data_audio["audio_url"] is not None
++
++            # Suppression audio
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{storymap_id}/steps/{step_id}/audio")
++            assert res_del.status_code == 200
++            data_del = res_del.json()
++            assert data_del["audio_file_path"] is None
++            assert data_del["audio_url"] is None
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_upload_media_validation_rejections(setup_storymaps_test_data):
++    """Vérifie le rejet des formats de fichiers non supportés."""
++    u_a = setup_storymaps_test_data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Récit validation médias",
++                    "steps": [{"title": "Étape", "lat": 43.1, "lng": 5.9}],
++                },
++            )
++            storymap_id = res_create.json()["id"]
++            step_id = res_create.json()["steps"][0]["id"]
++
++            # Rejet image invalide
++            res_bad_img = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/cover",
++                files={"file": ("corrupt.png", b"not-an-image", "image/png")},
++            )
++            assert res_bad_img.status_code == 400
++            assert res_bad_img.json()["error"]["code"] == "INVALID_IMAGE_FORMAT"
++
++            # Rejet format audio invalide (ex: exécutable ou texte)
++            res_bad_audio = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/steps/{step_id}/audio",
++                files={"file": ("script.sh", b"#!/bin/bash", "text/x-shellscript")},
++            )
++            assert res_bad_audio.status_code == 400
++            assert res_bad_audio.json()["error"]["code"] == "INVALID_AUDIO_FORMAT"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_media_cross_territory_isolation(setup_storymaps_test_data):
++    """Vérifie l'étanchéité multi-territoire : u_b ne peut pas téléverser ni supprimer de médias sur un récit de u_a."""
++    u_a = setup_storymaps_test_data["u_a"]
++    u_b = setup_storymaps_test_data["u_b"]
++
++    # Création du récit et de l'étape sur le territoire A par u_a
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Récit Territoire A",
++                    "steps": [{"title": "Étape A", "lat": 43.1, "lng": 5.9}],
++                },
++            )
++            assert res_create.status_code == 201
++            storymap_id = res_create.json()["id"]
++            step_id = res_create.json()["steps"][0]["id"]
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++    # Tentatives d'accès par u_b (territoire B) -> Doit retourner HTTP 404 (isolation stricte AD-2)
++    app.dependency_overrides[get_current_active_user] = lambda: u_b
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            import io
++            from PIL import Image
++            buf = io.BytesIO()
++            Image.new("RGB", (32, 32), color="green").save(buf, format="PNG")
++            img_bytes = buf.getvalue()
++            fake_audio = b"ID3\x03\x00\x00\x00\x00\x00#TSSE" + b"\x00" * 50
++
++            # 1. Upload couverture interdite
++            res_cover = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/cover",
++                files={"file": ("cover.png", img_bytes, "image/png")},
++            )
++            assert res_cover.status_code == 404
++            assert res_cover.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++
++            # 2. Suppression couverture interdite
++            res_del_cover = await client.delete(f"/api/v1/admin/storymaps/{storymap_id}/cover")
++            assert res_del_cover.status_code == 404
++            assert res_del_cover.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++
++            # 3. Upload audio interdit
++            res_audio = await client.post(
++                f"/api/v1/admin/storymaps/{storymap_id}/steps/{step_id}/audio",
++                files={"file": ("sound.mp3", fake_audio, "audio/mpeg")},
++            )
++            assert res_audio.status_code == 404
++            assert res_audio.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++
++            # 4. Suppression audio interdite
++            res_del_audio = await client.delete(
++                f"/api/v1/admin/storymaps/{storymap_id}/steps/{step_id}/audio"
++            )
++            assert res_del_audio.status_code == 404
++            assert res_del_audio.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
+--- /dev/null
++++ b/frontend/src/types/storymap.ts
+@@ -0,0 +1,110 @@
++import type { Photo } from './photo'
++
++export type StorymapStatus = 'draft' | 'published'
++
++export interface StorymapStep {
++  id: string
++  storymap_id: string
++  photo_id?: string | null
++  step_order: number
++  title: string
++  content_markdown?: string | null
++  audio_file_path?: string | null
++  audio_url?: string | null
++  camera_lat: number
++  camera_lng: number
++  camera_zoom: number
++  camera_bearing: number
++  camera_pitch: number
++  lat?: number
++  lng?: number
++  zoom?: number
++  bearing?: number
++  pitch?: number
++  created_at: string
++  updated_at?: string
++  photo?: Photo | null
++}
++
++export interface StorymapStepCreatePayload {
++  photo_id?: string | null
++  step_order?: number
++  title: string
++  content_markdown?: string | null
++  audio_file_path?: string | null
++  camera_lat: number
++  camera_lng: number
++  camera_zoom?: number
++  camera_bearing?: number
++  camera_pitch?: number
++  lat?: number
++  lng?: number
++  zoom?: number
++  bearing?: number
++  pitch?: number
++}
++
++export interface StorymapStepUpdatePayload {
++  photo_id?: string | null
++  step_order?: number
++  title?: string
++  content_markdown?: string | null
++  audio_file_path?: string | null
++  camera_lat?: number
++  camera_lng?: number
++  camera_zoom?: number
++  camera_bearing?: number
++  camera_pitch?: number
++  lat?: number
++  lng?: number
++  zoom?: number
++  bearing?: number
++  pitch?: number
++}
++
++export interface Storymap {
++  id: string
++  territory_id: string
++  author_user_id?: string | null
++  slug: string
++  title: string
++  summary?: string | null
++  cover_image_path?: string | null
++  cover_image_url?: string | null
++  status: StorymapStatus
++  created_at: string
++  updated_at: string
++  steps: StorymapStep[]
++  steps_count?: number
++}
++
++export interface StorymapCreatePayload {
++  title: string
++  summary?: string | null
++  slug?: string | null
++  cover_image_path?: string | null
++  status?: StorymapStatus
++  territory_id?: string | null
++  steps?: StorymapStepCreatePayload[]
++}
++
++export interface StorymapUpdatePayload {
++  title?: string
++  summary?: string | null
++  slug?: string | null
++  cover_image_path?: string | null
++  status?: StorymapStatus
++  territory_id?: string | null
++}
++
++export interface StorymapReorderPayload {
++  step_ids: string[]
++}
++
++export interface StorymapListResponse {
++  items: Storymap[]
++  total: number
++  page: number
++  page_size: number
++  pages: number
++}
+--- /dev/null
++++ b/frontend/src/services/api.ts
+@@ -0,0 +1,419 @@
++import type {
++  Photo,
++  PhotoCreatePayload,
++  PhotoUpdatePayload,
++  PhotoListResponse,
++  PhotoUploadResponse,
++  PhotoStatus,
++  PhotoGeoJsonFeatureCollection,
++} from '@/types/photo'
++import type {
++  Storymap,
++  StorymapStep,
++  StorymapStatus,
++  StorymapCreatePayload,
++  StorymapUpdatePayload,
++  StorymapStepCreatePayload,
++  StorymapStepUpdatePayload,
++  StorymapListResponse,
++} from '@/types/storymap'
++
++const TOKEN_STORAGE_KEY = 'hierici_access_token'
++
++export class ApiError extends Error {
++  code: string
++  status: number
++  details?: any
++
++  constructor(message: string, code = 'API_ERROR', status = 500, details?: any) {
++    super(message)
++    this.name = 'ApiError'
++    this.code = code
++    this.status = status
++    this.details = details
++  }
++}
++
++export function getAuthToken(): string | null {
++  return localStorage.getItem(TOKEN_STORAGE_KEY)
++}
++
++export function setAuthToken(token: string | null): void {
++  if (token) {
++    localStorage.setItem(TOKEN_STORAGE_KEY, token)
++  } else {
++    localStorage.removeItem(TOKEN_STORAGE_KEY)
++  }
++}
++
++export function hasAuthToken(): boolean {
++  return !!getAuthToken()
++}
++
++async function request<T>(
++  endpoint: string,
++  options: RequestInit = {}
++): Promise<T> {
++  const headers: Record<string, string> = {
++    ...(options.headers as Record<string, string> || {}),
++  }
++
++  const token = getAuthToken()
++  if (token && !headers['Authorization']) {
++    headers['Authorization'] = `Bearer ${token}`
++  }
++
++  // Si le body n'est pas un FormData, on ajoute Content-Type: application/json si non défini
++  if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
++    headers['Content-Type'] = 'application/json'
++  }
++
++  const response = await fetch(endpoint, {
++    ...options,
++    headers,
++  })
++
++  if (response.status === 204) {
++    return {} as T
++  }
++
++  let data: any = null
++  const contentType = response.headers.get('content-type')
++  if (contentType && contentType.includes('application/json')) {
++    try {
++      data = await response.json()
++    } catch {
++      data = null
++    }
++  }
++
++  if (!response.ok) {
++    let message = `Erreur HTTP ${response.status}`
++    let code = 'HTTP_ERROR'
++    let details = undefined
++
++    if (data?.error) {
++      code = data.error.code || code
++      message = data.error.message || message
++      details = data.error.details
++    } else if (data?.detail) {
++      if (typeof data.detail === 'string') {
++        message = data.detail
++      } else if (data.detail?.error) {
++        code = data.detail.error.code || code
++        message = data.detail.error.message || message
++        details = data.detail.error.details
++      } else if (Array.isArray(data.detail)) {
++        // FastAPI validation errors
++        message = data.detail.map((err: any) => `${err.loc?.join('.') || 'champ'}: ${err.msg}`).join(', ')
++      }
++    }
++
++    throw new ApiError(message, code, response.status, details)
++  }
++
++  return data as T
++}
++
++export const photoApi = {
++  /**
++   * Connexion avec email et mot de passe
++   */
++  async login(email: string, password: string): Promise<{ access_token: string; user: any }> {
++    const res = await request<{ access_token: string; token_type: string; user: any }>(
++      '/api/v1/auth/login',
++      {
++        method: 'POST',
++        body: JSON.stringify({ email, password }),
++      }
++    )
++    setAuthToken(res.access_token)
++    return res
++  },
++
++  /**
++   * Récupère le profil de l'utilisateur connecté
++   */
++  async getMe(): Promise<any> {
++    return request<any>('/api/v1/auth/me')
++  },
++
++  /**
++   * Liste paginée des photographies
++   */
++  async listPhotos(params?: {
++    page?: number
++    page_size?: number
++    status?: PhotoStatus
++    search?: string
++    territory_id?: string
++  }): Promise<PhotoListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.status) query.set('status', params.status)
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.territory_id) query.set('territory_id', params.territory_id)
++
++    const qs = query.toString()
++    return request<PhotoListResponse>(`/api/v1/admin/photos${qs ? `?${qs}` : ''}`)
++  },
++
++  /**
++   * Consultation du détail d'une photographie
++   */
++  async getPhoto(id: string): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`)
++  },
++
++  /**
++   * Création d'une nouvelle fiche photo
++   */
++  async createPhoto(payload: PhotoCreatePayload): Promise<Photo> {
++    return request<Photo>('/api/v1/admin/photos', {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour d'une fiche photo existante
++   */
++  async updatePhoto(id: string, payload: PhotoUpdatePayload): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression d'une fiche photo et de ses médias
++   */
++  async deletePhoto(id: string): Promise<void> {
++    await request<void>(`/api/v1/admin/photos/${id}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Téléversement d'image pour une photo existante
++   */
++  async uploadPhotoImage(photoId: string, file: File): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++
++    return request<PhotoUploadResponse>(`/api/v1/admin/photos/${photoId}/upload`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Téléversement direct créant une nouvelle photo avec image
++   */
++  async uploadPhotoDirect(file: File, title?: string): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++    if (title && title.trim()) {
++      formData.append('title', title.trim())
++    }
++
++    return request<PhotoUploadResponse>('/api/v1/admin/photos/upload', {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Récupération du territoire actif
++   */
++  async getCurrentTerritory(): Promise<{
++    id: string
++    slug: string
++    name: string
++    center_lat: number
++    center_lng: number
++    default_zoom: number
++  }> {
++    return request('/api/v1/territory/current')
++  },
++
++  /**
++   * Health check de l'API
++   */
++  async getHealth(): Promise<{ status: string; database: string }> {
++    return request('/api/health')
++  },
++
++  /**
++   * Récupère la collection GeoJSON des photos publiées du territoire actif
++   */
++  async getPublicPhotos(
++    params?: {
++      search?: string
++      year_min?: number
++      year_max?: number
++    },
++    signal?: AbortSignal
++  ): Promise<PhotoGeoJsonFeatureCollection> {
++    const query = new URLSearchParams()
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.year_min !== undefined && params.year_min !== null) {
++      query.set('year_min', params.year_min.toString())
++    }
++    if (params?.year_max !== undefined && params.year_max !== null) {
++      query.set('year_max', params.year_max.toString())
++    }
++
++    const qs = query.toString()
++    return request<PhotoGeoJsonFeatureCollection>(`/api/v1/photos${qs ? `?${qs}` : ''}`, { signal })
++  },
++
++  /**
++   * Récupère la fiche détaillée d'une photo publique
++   */
++  async getPublicPhoto(id: string): Promise<Photo> {
++    return request<Photo>(`/api/v1/photos/${id}`)
++  },
++}
++
++export const storymapApi = {
++  /**
++   * Liste paginée des storymaps du territoire
++   */
++  async listStorymaps(params?: {
++    page?: number
++    page_size?: number
++    status?: StorymapStatus
++    search?: string
++    territory_id?: string
++  }): Promise<StorymapListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.status) query.set('status', params.status)
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.territory_id) query.set('territory_id', params.territory_id)
++
++    const qs = query.toString()
++    return request<StorymapListResponse>(`/api/v1/admin/storymaps${qs ? `?${qs}` : ''}`)
++  },
++
++  /**
++   * Consultation du détail d'une storymap avec ses étapes ordonnées
++   */
++  async getStorymap(id: string): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}`)
++  },
++
++  /**
++   * Création d'une nouvelle storymap
++   */
++  async createStorymap(payload: StorymapCreatePayload): Promise<Storymap> {
++    return request<Storymap>('/api/v1/admin/storymaps', {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour des métadonnées d'une storymap
++   */
++  async updateStorymap(id: string, payload: StorymapUpdatePayload): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression définitive d'une storymap et cascade sur ses étapes
++   */
++  async deleteStorymap(id: string): Promise<void> {
++    await request<void>(`/api/v1/admin/storymaps/${id}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Téléversement et association d'une image de couverture
++   */
++  async uploadCover(id: string, file: File): Promise<Storymap> {
++    const formData = new FormData()
++    formData.append('file', file)
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/cover`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Suppression de l'image de couverture
++   */
++  async deleteCover(id: string): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/cover`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Ajout d'une étape / chapitre à une storymap
++   */
++  async addStep(id: string, payload: StorymapStepCreatePayload): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps`, {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour d'un chapitre / étape
++   */
++  async updateStep(id: string, stepId: string, payload: StorymapStepUpdatePayload): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression d'une étape d'une storymap
++   */
++  async deleteStep(id: string, stepId: string): Promise<void> {
++    await request<void>(`/api/v1/admin/storymaps/${id}/steps/${stepId}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Réordonnancement atomique de l'ensemble des étapes
++   */
++  async reorderSteps(id: string, stepIds: string[]): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/steps/reorder`, {
++      method: 'PUT',
++      body: JSON.stringify({ step_ids: stepIds }),
++    })
++  },
++
++  /**
++   * Téléversement d'un document sonore (MP3, etc.) pour une étape
++   */
++  async uploadStepAudio(id: string, stepId: string, file: File): Promise<StorymapStep> {
++    const formData = new FormData()
++    formData.append('file', file)
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}/audio`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Suppression du fichier audio d'une étape
++   */
++  async deleteStepAudio(id: string, stepId: string): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}/audio`, {
++      method: 'DELETE',
++    })
++  },
++}
++
+--- /dev/null
++++ b/frontend/src/utils/storymapStudio.ts
+@@ -0,0 +1,164 @@
++/**
++ * Utilitaires purs pour le Studio d'édition et d'ordonnancement des Storymaps
++ */
++
++/**
++ * Normalise un azimut cartographique dans l'intervalle [0, 360[
++ */
++export function normalizeBearing(val: number): number {
++  if (isNaN(val)) return 0
++  let b = val % 360
++  if (b < 0) b += 360
++  return b === 360 ? 0 : b
++}
++
++/**
++ * Contraint une valeur numérique entre des bornes min et max
++ */
++export function clamp(val: number, min: number, max: number): number {
++  if (isNaN(val)) return min
++  return Math.min(Math.max(val, min), max)
++}
++
++/**
++ * Borne et normalise l'ensemble des paramètres d'une caméra MapLibre GL
++ */
++export function clampCameraCoordinates(
++  lat: number,
++  lng: number,
++  zoom: number,
++  bearing: number,
++  pitch: number
++): {
++  camera_lat: number
++  camera_lng: number
++  camera_zoom: number
++  camera_bearing: number
++  camera_pitch: number
++} {
++  return {
++    camera_lat: clamp(Number(lat.toFixed(6)), -90, 90),
++    camera_lng: clamp(Number(lng.toFixed(6)), -180, 180),
++    camera_zoom: clamp(Number(zoom.toFixed(2)), 0, 24),
++    camera_bearing: Number(normalizeBearing(bearing).toFixed(1)),
++    camera_pitch: clamp(Number(pitch.toFixed(1)), 0, 85),
++  }
++}
++
++/**
++ * Réordonne localement les étapes d'un récit et met à jour séquentiellement step_order
++ */
++export function reorderStepsLocally<T extends { step_order?: number }>(
++  steps: T[],
++  fromIndex: number,
++  toIndex: number
++): T[] {
++  if (
++    fromIndex < 0 ||
++    fromIndex >= steps.length ||
++    toIndex < 0 ||
++    toIndex >= steps.length ||
++    fromIndex === toIndex
++  ) {
++    return [...steps]
++  }
++
++  const result = [...steps]
++  const [moved] = result.splice(fromIndex, 1)
++  result.splice(toIndex, 0, moved)
++
++  return result.map((step, idx) => ({
++    ...step,
++    step_order: idx,
++  }))
++}
++
++/**
++ * Détache la photo d'archive liée à une étape sans modifier les autres attributs
++ */
++export function detachPhotoFromStep<T extends { photo_id?: any; photo?: any }>(step: T): T {
++  return {
++    ...step,
++    photo_id: null,
++    photo: null,
++  }
++}
++
++/**
++ * Valide un document sonore téléversé (format, extension et taille limite de 50 Mo)
++ */
++export function validateAudioFile(file: {
++  name: string
++  size: number
++  type?: string
++}): { valid: boolean; error?: string } {
++  const MAX_SIZE = 50 * 1024 * 1024 // 50 Mo
++
++  if (file.size > MAX_SIZE) {
++    return {
++      valid: false,
++      error: 'Le fichier audio dépasse la taille maximale autorisée de 50 Mo.',
++    }
++  }
++
++  const ext = (file.name.split('.').pop() || '').toLowerCase()
++  const allowedExtensions = ['mp3', 'm4a', 'ogg', 'wav']
++  if (!allowedExtensions.includes(ext)) {
++    return {
++      valid: false,
++      error: 'Format audio non supporté. Formats acceptés : .mp3, .m4a, .ogg, .wav.',
++    }
++  }
++
++  const allowedMimes = [
++    'audio/mpeg',
++    'audio/mp3',
++    'audio/mp4',
++    'audio/x-m4a',
++    'audio/aac',
++    'audio/ogg',
++    'audio/wav',
++    'audio/x-wav',
++    'audio/wave',
++    'application/ogg',
++  ]
++
++  if (file.type && file.type.trim()) {
++    const cleanType = file.type.toLowerCase().split(';')[0].trim()
++    if (!allowedMimes.includes(cleanType)) {
++      return {
++        valid: false,
++        error: 'Type MIME audio non valide.',
++      }
++    }
++  }
++
++  return { valid: true }
++}
++
++/**
++ * Rendu sécurisé d'un aperçu Markdown
++ */
++export function renderMarkdownPreview(markdown: string | null | undefined): string {
++  if (!markdown || !markdown.trim()) {
++    return '<p class="text-slate-500 italic">Aucun texte rédigé pour le moment.</p>'
++  }
++
++  let text = markdown
++    .replace(/&/g, '&amp;')
++    .replace(/</g, '&lt;')
++    .replace(/>/g, '&gt;')
++
++  return text
++    .replace(/^### (.*$)/gim, '<h3 class="text-base font-bold text-white mt-3 mb-1">$1</h3>')
++    .replace(/^## (.*$)/gim, '<h2 class="text-lg font-bold text-sky-300 mt-4 mb-2">$1</h2>')
++    .replace(/^# (.*$)/gim, '<h1 class="text-xl font-extrabold text-white mt-4 mb-2">$1</h1>')
++    .replace(/\*\*(.*?)\*\*/gim, '<strong class="text-white font-bold">$1</strong>')
++    .replace(/\*(.*?)\*/gim, '<em class="text-slate-300 italic">$1</em>')
++    .replace(
++      /^(&gt;|>)\s?(.*$)/gim,
++      '<blockquote class="border-l-4 border-sky-500 pl-3 py-1 my-2 text-slate-300 italic bg-slate-800/40 rounded-r">$2</blockquote>'
++    )
++    .replace(/^[-*]\s(.*$)/gim, '<li class="ml-4 list-disc text-slate-200">$1</li>')
++    .replace(/\n$/gim, '<br />')
++}
+--- /dev/null
++++ b/frontend/src/components/admin/StorymapCameraPicker.vue
+@@ -0,0 +1,356 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted, watch, nextTick } from 'vue'
++import maplibregl from 'maplibre-gl'
++import { clampCameraCoordinates, normalizeBearing } from '@/utils/storymapStudio'
++
++const props = withDefaults(
++  defineProps<{
++    cameraLat: number
++    cameraLng: number
++    cameraZoom?: number
++    cameraBearing?: number
++    cameraPitch?: number
++    defaultCenter?: { lat: number; lng: number; zoom?: number } | null
++  }>(),
++  {
++    cameraZoom: 13,
++    cameraBearing: 0,
++    cameraPitch: 0,
++    defaultCenter: () => ({ lat: 43.1242, lng: 5.9328, zoom: 13 }),
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'update:cameraLat', val: number): void
++  (e: 'update:cameraLng', val: number): void
++  (e: 'update:cameraZoom', val: number): void
++  (e: 'update:cameraBearing', val: number): void
++  (e: 'update:cameraPitch', val: number): void
++  (
++    e: 'capture',
++    val: {
++      camera_lat: number
++      camera_lng: number
++      camera_zoom: number
++      camera_bearing: number
++      camera_pitch: number
++    }
++  ): void
++}>()
++
++const mapContainerRef = ref<HTMLDivElement | null>(null)
++let map: maplibregl.Map | null = null
++let resizeObserver: ResizeObserver | null = null
++
++const isMapReady = ref(false)
++const capturedFeedback = ref(false)
++let feedbackTimeout: ReturnType<typeof setTimeout> | null = null
++
++// Coordonnées en temps réel lues depuis la caméra
++const liveLat = ref(props.cameraLat)
++const liveLng = ref(props.cameraLng)
++const liveZoom = ref(props.cameraZoom)
++const liveBearing = ref(props.cameraBearing)
++const livePitch = ref(props.cameraPitch)
++
++// Style raster libre OpenStreetMap
++const OSM_STYLE: maplibregl.StyleSpecification = {
++  version: 8,
++  sources: {
++    osm: {
++      type: 'raster',
++      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
++      tileSize: 256,
++      attribution:
++        '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributeurs',
++      maxzoom: 19,
++    },
++  },
++  layers: [
++    {
++      id: 'osm-tiles',
++      type: 'raster',
++      source: 'osm',
++      minzoom: 0,
++      maxzoom: 19,
++    },
++  ],
++}
++
++function updateLiveCameraState() {
++  if (!map) return
++  const center = map.getCenter()
++  const coords = clampCameraCoordinates(
++    center.lat,
++    center.lng,
++    map.getZoom(),
++    map.getBearing(),
++    map.getPitch()
++  )
++  liveLat.value = coords.camera_lat
++  liveLng.value = coords.camera_lng
++  liveZoom.value = coords.camera_zoom
++  liveBearing.value = coords.camera_bearing
++  livePitch.value = coords.camera_pitch
++}
++
++/**
++ * Capture instantanément les paramètres caméra de la vue actuelle
++ */
++function captureCurrentView() {
++  if (!map) return
++  updateLiveCameraState()
++
++  emit('update:cameraLat', liveLat.value)
++  emit('update:cameraLng', liveLng.value)
++  emit('update:cameraZoom', liveZoom.value)
++  emit('update:cameraBearing', liveBearing.value)
++  emit('update:cameraPitch', livePitch.value)
++
++  emit('capture', {
++    camera_lat: liveLat.value,
++    camera_lng: liveLng.value,
++    camera_zoom: liveZoom.value,
++    camera_bearing: liveBearing.value,
++    camera_pitch: livePitch.value,
++  })
++
++  // Feedback visuel temporaire
++  capturedFeedback.value = true
++  if (feedbackTimeout) clearTimeout(feedbackTimeout)
++  feedbackTimeout = setTimeout(() => {
++    capturedFeedback.value = false
++  }, 2200)
++}
++
++/**
++ * Teste le rendu cinématique via MapLibre flyTo
++ */
++function testFramingAnimation() {
++  if (!map) return
++  map.flyTo({
++    center: [props.cameraLng, props.cameraLat],
++    zoom: props.cameraZoom,
++    bearing: props.cameraBearing,
++    pitch: props.cameraPitch,
++    duration: 1500,
++    essential: true,
++  })
++}
++
++/**
++ * Ajuste manuellement le pitch ou le bearing via curseur
++ */
++function onSliderPitchChange(e: Event) {
++  const target = e.target as HTMLInputElement
++  const newPitch = Number(target.value)
++  if (map && !isNaN(newPitch)) {
++    map.setPitch(newPitch)
++  }
++}
++
++function onSliderBearingChange(e: Event) {
++  const target = e.target as HTMLInputElement
++  const newBearing = Number(target.value)
++  if (map && !isNaN(newBearing)) {
++    map.setBearing(newBearing)
++  }
++}
++
++function initMap() {
++  if (!mapContainerRef.value || map) return
++
++  const initialLat = props.cameraLat ?? props.defaultCenter?.lat ?? 43.1242
++  const initialLng = props.cameraLng ?? props.defaultCenter?.lng ?? 5.9328
++  const initialZoom = props.cameraZoom ?? props.defaultCenter?.zoom ?? 13
++  const initialBearing = props.cameraBearing ?? 0
++  const initialPitch = props.cameraPitch ?? 0
++
++  map = new maplibregl.Map({
++    container: mapContainerRef.value,
++    style: OSM_STYLE,
++    center: [initialLng, initialLat],
++    zoom: initialZoom,
++    bearing: initialBearing,
++    pitch: initialPitch,
++    maxPitch: 85,
++    attributionControl: false,
++  })
++
++  map.addControl(new maplibregl.NavigationControl({ visualizePitch: true }), 'top-right')
++  map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
++
++  map.on('move', () => {
++    updateLiveCameraState()
++  })
++
++  map.on('load', () => {
++    isMapReady.value = true
++    updateLiveCameraState()
++    map?.resize()
++  })
++}
++
++// Synchroniser la carte si les props changent depuis l'extérieur (ex: bascule de chapitre)
++watch(
++  () => [props.cameraLat, props.cameraLng, props.cameraZoom, props.cameraBearing, props.cameraPitch],
++  ([lat, lng, zoom, bearing, pitch]) => {
++    if (!map || !isMapReady.value) return
++    const curCenter = map.getCenter()
++    const dist = Math.abs(curCenter.lat - (lat as number)) + Math.abs(curCenter.lng - (lng as number))
++    const zoomDiff = Math.abs(map.getZoom() - (zoom as number))
++    const bearingDiff = Math.abs(map.getBearing() - (bearing as number))
++    const pitchDiff = Math.abs(map.getPitch() - (pitch as number))
++
++    // Si la cible diffère substantiellement (position, zoom, bearing ou pitch), recentrer
++    if (dist > 0.0001 || zoomDiff > 0.1 || bearingDiff > 1 || pitchDiff > 1) {
++      map.jumpTo({
++        center: [lng as number, lat as number],
++        zoom: zoom as number,
++        bearing: bearing as number,
++        pitch: pitch as number,
++      })
++      updateLiveCameraState()
++    }
++  }
++)
++
++onMounted(() => {
++  nextTick(() => {
++    initMap()
++    if (mapContainerRef.value) {
++      resizeObserver = new ResizeObserver(() => {
++        map?.resize()
++      })
++      resizeObserver.observe(mapContainerRef.value)
++    }
++  })
++})
++
++onUnmounted(() => {
++  if (feedbackTimeout) clearTimeout(feedbackTimeout)
++  if (resizeObserver) resizeObserver.disconnect()
++  if (map) {
++    map.remove()
++    map = null
++  }
++})
++</script>
++
++<template>
++  <div class="relative flex flex-col rounded-xl overflow-hidden border border-slate-800 bg-slate-900 shadow-inner">
++    <!-- Barre d'outils et de contrôle du cadrage -->
++    <div class="px-4 py-2.5 bg-slate-900/95 border-b border-slate-800 flex flex-wrap items-center justify-between gap-3 text-xs">
++      <div class="flex items-center gap-2">
++        <span class="text-base">🎥</span>
++        <span class="font-semibold text-slate-200">Cadrage cartographique 3D</span>
++        <span class="text-[11px] text-slate-400 hidden sm:inline">
++          (Ajustez la vue, l'inclinaison et l'orientation)
++        </span>
++      </div>
++
++      <div class="flex items-center gap-2">
++        <!-- Bouton Tester flyTo -->
++        <button
++          type="button"
++          class="px-2.5 py-1.5 rounded-lg font-medium text-sky-300 bg-sky-950/80 hover:bg-sky-900/80 border border-sky-800/80 transition-all flex items-center gap-1.5 shadow-sm"
++          title="Simuler l'animation cinématographique flyTo vers le cadrage enregistré"
++          @click="testFramingAnimation"
++        >
++          <span>🚀</span>
++          <span>Tester le cadrage</span>
++        </button>
++
++        <!-- Bouton Capturer la vue actuelle -->
++        <button
++          type="button"
++          class="px-3.5 py-1.5 rounded-lg font-semibold text-white transition-all flex items-center gap-1.5 shadow-md"
++          :class="capturedFeedback ? 'bg-emerald-600 scale-105' : 'bg-amber-600 hover:bg-amber-500 shadow-amber-900/30'"
++          title="Enregistrer le centre, zoom, azimut et inclinaison actuels pour cette étape"
++          @click="captureCurrentView"
++        >
++          <span v-if="capturedFeedback">✓</span>
++          <span v-else>📸</span>
++          <span>{{ capturedFeedback ? 'Vue capturée !' : 'Capturer la vue actuelle' }}</span>
++        </button>
++      </div>
++    </div>
++
++    <!-- Conteneur MapLibre GL avec réticule central -->
++    <div class="relative w-full h-80 sm:h-96">
++      <div ref="mapContainerRef" class="w-full h-full"></div>
++
++      <!-- Réticule central pour viser précisément -->
++      <div class="absolute inset-0 pointer-events-none flex items-center justify-center">
++        <div class="relative w-8 h-8 flex items-center justify-center">
++          <div class="w-2 h-2 rounded-full bg-amber-400 border border-slate-950 shadow-md"></div>
++          <div class="absolute w-6 h-0.5 bg-amber-400/60"></div>
++          <div class="absolute h-6 w-0.5 bg-amber-400/60"></div>
++        </div>
++      </div>
++
++      <!-- Badge Feedback de capture -->
++      <transition
++        enter-active-class="transition duration-200 ease-out"
++        enter-from-class="opacity-0 translate-y-2 scale-95"
++        enter-to-class="opacity-100 translate-y-0 scale-100"
++        leave-active-class="transition duration-200 ease-in"
++        leave-from-class="opacity-100 translate-y-0 scale-100"
++        leave-to-class="opacity-0 translate-y-2 scale-95"
++      >
++        <div
++          v-if="capturedFeedback"
++          class="absolute top-4 left-1/2 -translate-x-1/2 z-10 px-4 py-2 bg-emerald-900/95 border border-emerald-500 text-emerald-100 rounded-xl shadow-2xl flex items-center gap-2 text-xs font-semibold backdrop-blur-md"
++        >
++          <span>✓</span>
++          <span>Cadrage caméra enregistré avec succès</span>
++        </div>
++      </transition>
++
++      <!-- Contrôles d'ajustement fin 3D (Pitch & Bearing) -->
++      <div class="absolute bottom-3 left-3 z-10 bg-slate-950/90 backdrop-blur-md border border-slate-800 rounded-xl p-2.5 shadow-xl space-y-2 text-[11px] text-slate-300 w-52 sm:w-60">
++        <div class="flex items-center justify-between font-mono text-[10px] text-slate-400">
++          <span>Inclinaison 3D (Pitch)</span>
++          <span class="text-amber-400 font-bold">{{ livePitch }}°</span>
++        </div>
++        <input
++          type="range"
++          min="0"
++          max="85"
++          step="1"
++          :value="livePitch"
++          class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-amber-500"
++          @input="onSliderPitchChange"
++        />
++
++        <div class="flex items-center justify-between font-mono text-[10px] text-slate-400 pt-1">
++          <span>Orientation (Bearing)</span>
++          <span class="text-sky-400 font-bold">{{ liveBearing }}°</span>
++        </div>
++        <input
++          type="range"
++          min="0"
++          max="359"
++          step="1"
++          :value="liveBearing"
++          class="w-full h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer accent-sky-500"
++          @input="onSliderBearingChange"
++        />
++      </div>
++    </div>
++
++    <!-- Récapitulatif des paramètres caméra enregistrés pour l'étape -->
++    <div class="px-4 py-2 bg-slate-950 border-t border-slate-800/80 flex flex-wrap items-center justify-between gap-3 text-[11px] text-slate-400 font-mono">
++      <div class="flex items-center gap-3">
++        <span class="text-slate-300 font-sans font-medium">Cadrage actif :</span>
++        <span>Lat: <strong class="text-white">{{ cameraLat?.toFixed(4) ?? '0.0000' }}</strong></span>
++        <span>Lng: <strong class="text-white">{{ cameraLng?.toFixed(4) ?? '0.0000' }}</strong></span>
++        <span>Zoom: <strong class="text-white">{{ cameraZoom?.toFixed(1) ?? '13.0' }}</strong></span>
++      </div>
++      <div class="flex items-center gap-3">
++        <span>Azimut: <strong class="text-sky-400">{{ cameraBearing?.toFixed(1) ?? '0.0' }}°</strong></span>
++        <span>Inclinaison: <strong class="text-amber-400">{{ cameraPitch?.toFixed(1) ?? '0.0' }}°</strong></span>
++      </div>
++    </div>
++  </div>
++</template>
+--- /dev/null
++++ b/frontend/src/components/admin/StorymapEditorModal.vue
+@@ -0,0 +1,1047 @@
++<script setup lang="ts">
++import { ref, computed, watch, onMounted, nextTick } from 'vue'
++import { storymapApi, photoApi } from '@/services/api'
++import type { Storymap, StorymapStep, StorymapStatus } from '@/types/storymap'
++import type { Photo } from '@/types/photo'
++import {
++  reorderStepsLocally,
++  detachPhotoFromStep as detachPhotoUtil,
++  validateAudioFile,
++  renderMarkdownPreview,
++} from '@/utils/storymapStudio'
++import StorymapCameraPicker from './StorymapCameraPicker.vue'
++
++const props = withDefaults(
++  defineProps<{
++    isOpen: boolean
++    storymapId?: string | null
++    territoryCenter?: { lat: number; lng: number; zoom?: number } | null
++    territoryId?: string | null
++  }>(),
++  {
++    storymapId: null,
++    territoryCenter: () => ({ lat: 43.1242, lng: 5.9328, zoom: 13 }),
++    territoryId: null,
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'close'): void
++  (e: 'saved', storymap: Storymap): void
++  (e: 'deleted', id: string): void
++}>()
++
++// État général du formulaire
++const loading = ref(false)
++const saving = ref(false)
++const errorMessage = ref<string | null>(null)
++const successMessage = ref<string | null>(null)
++
++// Métadonnées globales du récit
++const currentStorymap = ref<Storymap | null>(null)
++const title = ref('')
++const summary = ref('')
++const slug = ref('')
++const status = ref<StorymapStatus>('draft')
++const coverImageUrl = ref<string | null>(null)
++const isUploadingCover = ref(false)
++
++// Étapes du récit
++const steps = ref<StorymapStep[]>([])
++const activeStepIndex = ref(0)
++const activeStep = computed(() => steps.value[activeStepIndex.value] || null)
++
++// Markdown : bascule vue code / aperçu
++const showMarkdownPreview = ref(false)
++
++// Drag and drop state
++const draggedStepIndex = ref<number | null>(null)
++const dragOverStepIndex = ref<number | null>(null)
++
++// Sélecteur modal de photos
++const isPhotoSelectorOpen = ref(false)
++const territoryPhotos = ref<Photo[]>([])
++const photoSearchQuery = ref('')
++const isLoadingPhotos = ref(false)
++
++// Téléversement audio
++const isUploadingAudio = ref(false)
++const audioInputRef = ref<HTMLInputElement | null>(null)
++const coverInputRef = ref<HTMLInputElement | null>(null)
++
++function defaultCoordinates() {
++  return {
++    camera_lat: props.territoryCenter?.lat ?? 43.1242,
++    camera_lng: props.territoryCenter?.lng ?? 5.9328,
++    camera_zoom: props.territoryCenter?.zoom ?? 13,
++    camera_bearing: 0,
++    camera_pitch: 0,
++  }
++}
++
++/**
++ * Initialise le formulaire (mode création ou édition)
++ */
++async function loadStorymapData() {
++  errorMessage.value = null
++  successMessage.value = null
++
++  if (props.storymapId) {
++    loading.value = true
++    try {
++      const data = await storymapApi.getStorymap(props.storymapId)
++      currentStorymap.value = data
++      title.value = data.title
++      summary.value = data.summary || ''
++      slug.value = data.slug
++      status.value = data.status
++      coverImageUrl.value = data.cover_image_url || null
++      steps.value = (data.steps || []).map((s, idx) => ({
++        ...s,
++        step_order: s.step_order ?? idx,
++      }))
++      activeStepIndex.value = 0
++    } catch (err: any) {
++      errorMessage.value = err.message || 'Impossible de charger le récit.'
++    } finally {
++      loading.value = false
++    }
++  } else {
++    // Mode création vierge
++    currentStorymap.value = null
++    title.value = ''
++    summary.value = ''
++    slug.value = ''
++    status.value = 'draft'
++    coverImageUrl.value = null
++
++    // Initialiser avec une première étape par défaut
++    const def = defaultCoordinates()
++    steps.value = [
++      {
++        id: `temp-${Date.now()}-0`,
++        storymap_id: '',
++        step_order: 0,
++        title: 'Prologue',
++        content_markdown: 'Rédigez ici le récit narratif de ce premier chapitre...',
++        photo_id: null,
++        audio_file_path: null,
++        audio_url: null,
++        camera_lat: def.camera_lat,
++        camera_lng: def.camera_lng,
++        camera_zoom: def.camera_zoom,
++        camera_bearing: def.camera_bearing,
++        camera_pitch: def.camera_pitch,
++        created_at: new Date().toISOString(),
++      },
++    ]
++    activeStepIndex.value = 0
++  }
++}
++
++watch(
++  () => [props.isOpen, props.storymapId],
++  ([isOpen]) => {
++    if (isOpen) {
++      loadStorymapData()
++    }
++  },
++  { immediate: true }
++)
++
++/**
++ * Sauvegarde globale de la storymap (création ou mise à jour)
++ */
++async function handleSaveStorymap() {
++  if (!title.value.trim()) {
++    errorMessage.value = 'Le titre du récit est obligatoire.'
++    return
++  }
++
++  saving.value = true
++  errorMessage.value = null
++  successMessage.value = null
++
++  try {
++    let savedStorymap: Storymap
++
++    if (currentStorymap.value?.id) {
++      // 1. Mise à jour des métadonnées du récit
++      savedStorymap = await storymapApi.updateStorymap(currentStorymap.value.id, {
++        title: title.value.trim(),
++        summary: summary.value.trim() || null,
++        slug: slug.value.trim() || undefined,
++        status: status.value,
++      })
++
++      // 2. Synchroniser les étapes modifiées
++      for (let i = 0; i < steps.value.length; i++) {
++        const step = steps.value[i]
++        const stepPayload = {
++          title: step.title.trim() || `Chapitre ${i + 1}`,
++          content_markdown: step.content_markdown || null,
++          photo_id: step.photo_id ?? null,
++          step_order: i,
++          camera_lat: step.camera_lat,
++          camera_lng: step.camera_lng,
++          camera_zoom: step.camera_zoom,
++          camera_bearing: step.camera_bearing,
++          camera_pitch: step.camera_pitch,
++        }
++
++        if (step.id.startsWith('temp-')) {
++          // Nouvelle étape ajoutée en cours d'édition
++          const createdStep = await storymapApi.addStep(savedStorymap.id, stepPayload)
++          steps.value[i] = createdStep
++        } else {
++          // Étape existante mise à jour
++          const updatedStep = await storymapApi.updateStep(savedStorymap.id, step.id, stepPayload)
++          steps.value[i] = updatedStep
++        }
++      }
++
++      // Recharger la version finale consolidée
++      savedStorymap = await storymapApi.getStorymap(savedStorymap.id)
++      currentStorymap.value = savedStorymap
++      steps.value = savedStorymap.steps
++    } else {
++      // Mode création complet
++      const def = defaultCoordinates()
++      const initialSteps = steps.value.map((s, idx) => ({
++        title: s.title.trim() || `Chapitre ${idx + 1}`,
++        content_markdown: s.content_markdown || null,
++        photo_id: s.photo_id ?? null,
++        step_order: idx,
++        camera_lat: s.camera_lat ?? def.camera_lat,
++        camera_lng: s.camera_lng ?? def.camera_lng,
++        camera_zoom: s.camera_zoom ?? def.camera_zoom,
++        camera_bearing: s.camera_bearing ?? def.camera_bearing,
++        camera_pitch: s.camera_pitch ?? def.camera_pitch,
++      }))
++
++      savedStorymap = await storymapApi.createStorymap({
++        title: title.value.trim(),
++        summary: summary.value.trim() || null,
++        slug: slug.value.trim() || undefined,
++        status: status.value,
++        steps: initialSteps,
++      })
++
++      currentStorymap.value = savedStorymap
++      steps.value = savedStorymap.steps
++    }
++
++    successMessage.value = 'Récit enregistré avec succès !'
++    emit('saved', savedStorymap)
++    setTimeout(() => {
++      successMessage.value = null
++    }, 2500)
++  } catch (err: any) {
++    errorMessage.value = err.message || "Erreur lors de l'enregistrement du récit."
++  } finally {
++    saving.value = false
++  }
++}
++
++/**
++ * Ajout d'une nouvelle étape
++ */
++function handleAddStep() {
++  const def = defaultCoordinates()
++  const newIndex = steps.value.length
++  const newStep: StorymapStep = {
++    id: `temp-${Date.now()}-${newIndex}`,
++    storymap_id: currentStorymap.value?.id || '',
++    step_order: newIndex,
++    title: `Chapitre ${newIndex + 1}`,
++    content_markdown: '',
++    photo_id: null,
++    audio_file_path: null,
++    audio_url: null,
++    camera_lat: def.camera_lat,
++    camera_lng: def.camera_lng,
++    camera_zoom: def.camera_zoom,
++    camera_bearing: def.camera_bearing,
++    camera_pitch: def.camera_pitch,
++    created_at: new Date().toISOString(),
++  }
++
++  steps.value.push(newStep)
++  activeStepIndex.value = newIndex
++}
++
++/**
++ * Suppression d'une étape
++ */
++async function handleDeleteStep(index: number) {
++  if (steps.value.length <= 1) {
++    errorMessage.value = 'Une storymap doit comporter au moins une étape.'
++    return
++  }
++
++  const stepToDelete = steps.value[index]
++  if (!confirm(`Supprimer l'étape "${stepToDelete.title}" ?`)) return
++
++  try {
++    if (currentStorymap.value?.id && !stepToDelete.id.startsWith('temp-')) {
++      await storymapApi.deleteStep(currentStorymap.value.id, stepToDelete.id)
++    }
++
++    steps.value.splice(index, 1)
++    // Réordonner les index locaux
++    steps.value.forEach((s, idx) => {
++      s.step_order = idx
++    })
++
++    if (activeStepIndex.value >= steps.value.length) {
++      activeStepIndex.value = Math.max(0, steps.value.length - 1)
++    }
++
++    // Persister le réordonnancement si enregistré
++    if (currentStorymap.value?.id) {
++      const persistedIds = steps.value.filter((s) => !s.id.startsWith('temp-')).map((s) => s.id)
++      if (persistedIds.length === steps.value.length) {
++        await storymapApi.reorderSteps(currentStorymap.value.id, persistedIds)
++      }
++    }
++  } catch (err: any) {
++    errorMessage.value = err.message || "Impossible de supprimer l'étape."
++  }
++}
++
++/**
++ * Réordonnancement par boutons haut / bas
++ */
++async function moveStep(fromIdx: number, toIdx: number) {
++  if (toIdx < 0 || toIdx >= steps.value.length || fromIdx === toIdx) return
++
++  const originalOrder = [...steps.value]
++  const previousActiveIndex = activeStepIndex.value
++
++  steps.value = reorderStepsLocally(steps.value, fromIdx, toIdx)
++  activeStepIndex.value = toIdx
++
++  // Si storymap déjà persistée et que toutes les étapes ont un ID réel, synchroniser l'API
++  if (currentStorymap.value?.id) {
++    const hasTemp = steps.value.some((s) => s.id.startsWith('temp-'))
++    if (!hasTemp) {
++      try {
++        await storymapApi.reorderSteps(
++          currentStorymap.value.id,
++          steps.value.map((s) => s.id)
++        )
++      } catch (err: any) {
++        // Rollback de l'ordre ET de l'index de chapitre actif en cas d'échec
++        steps.value = originalOrder
++        activeStepIndex.value = previousActiveIndex
++        errorMessage.value = 'Échec de synchronisation du réordonnancement.'
++      }
++    }
++  }
++}
++
++/**
++ * Drag and Drop HTML5 natif
++ */
++function onDragStart(idx: number, e: DragEvent) {
++  draggedStepIndex.value = idx
++  if (e.dataTransfer) {
++    e.dataTransfer.effectAllowed = 'move'
++    e.dataTransfer.setData('text/plain', idx.toString())
++  }
++}
++
++function onDragOver(idx: number, e: DragEvent) {
++  e.preventDefault()
++  if (e.dataTransfer) {
++    e.dataTransfer.dropEffect = 'move'
++  }
++  dragOverStepIndex.value = idx
++}
++
++async function onDrop(targetIdx: number, e: DragEvent) {
++  e.preventDefault()
++  const fromIdx = draggedStepIndex.value
++  draggedStepIndex.value = null
++  dragOverStepIndex.value = null
++
++  if (fromIdx !== null && fromIdx !== targetIdx) {
++    await moveStep(fromIdx, targetIdx)
++  }
++}
++
++function onDragEnd() {
++  draggedStepIndex.value = null
++  dragOverStepIndex.value = null
++}
++
++/**
++ * Gestion de l'image de couverture
++ */
++async function handleCoverFileChange(e: Event) {
++  const target = e.target as HTMLInputElement
++  const file = target.files?.[0]
++  if (!file) return
++
++  if (!currentStorymap.value?.id) {
++    // Si la storymap n'est pas encore enregistrée, inviter à sauvegarder d'abord
++    errorMessage.value = "Veuillez d'abord enregistrer le récit avant d'ajouter une couverture."
++    return
++  }
++
++  isUploadingCover.value = true
++  errorMessage.value = null
++  try {
++    const updated = await storymapApi.uploadCover(currentStorymap.value.id, file)
++    currentStorymap.value = updated
++    coverImageUrl.value = updated.cover_image_url || null
++    successMessage.value = 'Couverture téléversée avec succès.'
++  } catch (err: any) {
++    errorMessage.value = err.message || 'Erreur lors du téléversement de la couverture.'
++  } finally {
++    isUploadingCover.value = false
++    if (coverInputRef.value) coverInputRef.value.value = ''
++  }
++}
++
++async function handleRemoveCover() {
++  if (!currentStorymap.value?.id) {
++    coverImageUrl.value = null
++    return
++  }
++
++  isUploadingCover.value = true
++  try {
++    const updated = await storymapApi.deleteCover(currentStorymap.value.id)
++    currentStorymap.value = updated
++    coverImageUrl.value = null
++  } catch (err: any) {
++    errorMessage.value = err.message || 'Impossible de supprimer la couverture.'
++  } finally {
++    isUploadingCover.value = false
++  }
++}
++
++/**
++ * Gestion du document sonore de l'étape active
++ */
++async function handleAudioFileChange(e: Event) {
++  const target = e.target as HTMLInputElement
++  const file = target.files?.[0]
++  if (!file || !activeStep.value) return
++
++  // Validation du fichier audio via l'utilitaire partagé
++  const validation = validateAudioFile({
++    name: file.name,
++    size: file.size,
++    type: file.type,
++  })
++  if (!validation.valid) {
++    errorMessage.value = validation.error || 'Fichier audio non valide.'
++    return
++  }
++
++  if (!currentStorymap.value?.id || activeStep.value.id.startsWith('temp-')) {
++    errorMessage.value = "Veuillez enregistrer le récit avant de téléverser un fichier audio sur cette étape."
++    return
++  }
++
++  isUploadingAudio.value = true
++  errorMessage.value = null
++  try {
++    const updatedStep = await storymapApi.uploadStepAudio(
++      currentStorymap.value.id,
++      activeStep.value.id,
++      file
++    )
++    const idx = steps.value.findIndex((s) => s.id === updatedStep.id)
++    if (idx !== -1) {
++      steps.value[idx] = updatedStep
++    }
++    successMessage.value = 'Document sonore associé avec succès.'
++  } catch (err: any) {
++    errorMessage.value = err.message || "Erreur lors de l'upload audio."
++  } finally {
++    isUploadingAudio.value = false
++    if (audioInputRef.value) audioInputRef.value.value = ''
++  }
++}
++
++async function handleRemoveAudio() {
++  if (!activeStep.value) return
++  if (!currentStorymap.value?.id || activeStep.value.id.startsWith('temp-')) {
++    activeStep.value.audio_file_path = null
++    activeStep.value.audio_url = null
++    return
++  }
++
++  isUploadingAudio.value = true
++  try {
++    const updatedStep = await storymapApi.deleteStepAudio(
++      currentStorymap.value.id,
++      activeStep.value.id
++    )
++    const idx = steps.value.findIndex((s) => s.id === updatedStep.id)
++    if (idx !== -1) {
++      steps.value[idx] = updatedStep
++    }
++  } catch (err: any) {
++    errorMessage.value = err.message || "Impossible de supprimer l'audio."
++  } finally {
++    isUploadingAudio.value = false
++  }
++}
++
++/**
++ * Sélecteur de photo d'archive du territoire
++ */
++async function openPhotoSelector() {
++  isPhotoSelectorOpen.value = true
++  isLoadingPhotos.value = true
++  try {
++    const res = await photoApi.listPhotos({
++      status: 'published',
++      page_size: 100,
++      territory_id: props.territoryId || undefined,
++    })
++    territoryPhotos.value = res.items || []
++  } catch (err: any) {
++    errorMessage.value = "Impossible de charger la photothèque du territoire."
++  } finally {
++    isLoadingPhotos.value = false
++  }
++}
++
++const filteredTerritoryPhotos = computed(() => {
++  if (!photoSearchQuery.value.trim()) return territoryPhotos.value
++  const q = photoSearchQuery.value.toLowerCase().trim()
++  return territoryPhotos.value.filter(
++    (p) =>
++      p.title.toLowerCase().includes(q) ||
++      (p.archive_ref && p.archive_ref.toLowerCase().includes(q)) ||
++      (p.photographer && p.photographer.toLowerCase().includes(q))
++  )
++})
++
++function selectPhotoForStep(photo: Photo) {
++  if (!activeStep.value) return
++  activeStep.value.photo_id = photo.id
++  activeStep.value.photo = photo
++  isPhotoSelectorOpen.value = false
++}
++
++function detachPhotoFromStep() {
++  if (!activeStep.value) return
++  const updated = detachPhotoUtil(activeStep.value)
++  activeStep.value.photo_id = updated.photo_id
++  activeStep.value.photo = updated.photo
++}
++
++/**
++ * Mise à jour des coordonnées caméra capturées
++ */
++function onCameraCapture(coords: {
++  camera_lat: number
++  camera_lng: number
++  camera_zoom: number
++  camera_bearing: number
++  camera_pitch: number
++}) {
++  if (!activeStep.value) return
++  activeStep.value.camera_lat = coords.camera_lat
++  activeStep.value.camera_lng = coords.camera_lng
++  activeStep.value.camera_zoom = coords.camera_zoom
++  activeStep.value.camera_bearing = coords.camera_bearing
++  activeStep.value.camera_pitch = coords.camera_pitch
++}
++</script>
++
++<template>
++  <div
++    v-if="isOpen"
++    class="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto"
++  >
++    <div
++      class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-7xl max-h-[96vh] flex flex-col shadow-2xl overflow-hidden font-sans"
++    >
++      <!-- En-tête supérieur du Studio -->
++      <header class="px-6 py-4 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between gap-4 sticky top-0 z-20">
++        <div class="flex items-center gap-3">
++          <span class="text-2xl">📖</span>
++          <div>
++            <h2 class="text-lg font-bold text-white flex items-center gap-2">
++              <span>{{ currentStorymap ? 'Éditer le récit' : 'Nouveau récit territorial' }}</span>
++              <span
++                class="text-[10px] uppercase font-mono px-2 py-0.5 rounded-full"
++                :class="status === 'published' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-amber-950 text-amber-400 border border-amber-800'"
++              >
++                {{ status === 'published' ? 'Publié' : 'Brouillon' }}
++              </span>
++            </h2>
++            <p class="text-xs text-slate-400">
++              {{ steps.length }} chapitre{{ steps.length > 1 ? 's' : '' }} ordonné{{ steps.length > 1 ? 's' : '' }}
++            </p>
++          </div>
++        </div>
++
++        <div class="flex items-center gap-3">
++          <!-- Bascule statut de publication -->
++          <div class="flex items-center bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs">
++            <button
++              type="button"
++              class="px-3 py-1 rounded-lg font-medium transition-colors"
++              :class="status === 'draft' ? 'bg-amber-600 text-white' : 'text-slate-400 hover:text-white'"
++              @click="status = 'draft'"
++            >
++              Brouillon
++            </button>
++            <button
++              type="button"
++              class="px-3 py-1 rounded-lg font-medium transition-colors"
++              :class="status === 'published' ? 'bg-emerald-600 text-white' : 'text-slate-400 hover:text-white'"
++              @click="status = 'published'"
++            >
++              Publier
++            </button>
++          </div>
++
++          <!-- Bouton Enregistrer -->
++          <button
++            type="button"
++            class="px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold shadow-md flex items-center gap-2 transition-all disabled:opacity-50"
++            :disabled="saving"
++            @click="handleSaveStorymap"
++          >
++            <span v-if="saving" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++            <span>{{ saving ? 'Enregistrement...' : 'Enregistrer le récit' }}</span>
++          </button>
++
++          <!-- Bouton Fermer -->
++          <button
++            type="button"
++            class="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++            @click="emit('close')"
++          >
++            ✕
++          </button>
++        </div>
++      </header>
++
++      <!-- Alertes d'état -->
++      <div v-if="errorMessage" class="mx-6 mt-3 p-3 rounded-xl bg-rose-950/80 border border-rose-800 text-xs text-rose-300 flex items-center justify-between">
++        <span>⚠️ {{ errorMessage }}</span>
++        <button type="button" class="text-rose-400 hover:text-white" @click="errorMessage = null">✕</button>
++      </div>
++
++      <div v-if="successMessage" class="mx-6 mt-3 p-3 rounded-xl bg-emerald-950/80 border border-emerald-800 text-xs text-emerald-300 flex items-center justify-between">
++        <span>✓ {{ successMessage }}</span>
++        <button type="button" class="text-emerald-400 hover:text-white" @click="successMessage = null">✕</button>
++      </div>
++
++      <!-- Corps du Studio scindé en deux volets -->
++      <div class="flex-1 flex flex-col lg:flex-row overflow-hidden">
++        <!-- VOLET GAUCHE : Stepper & Métadonnées globales -->
++        <aside class="w-full lg:w-80 border-b lg:border-b-0 lg:border-r border-slate-800 bg-slate-950/60 p-4 flex flex-col overflow-y-auto space-y-5">
++          <!-- Métadonnées globales pliables -->
++          <div class="bg-slate-900 border border-slate-800 rounded-xl p-3.5 space-y-3">
++            <h3 class="text-xs font-bold text-slate-300 flex items-center gap-2">
++              <span>📋</span>
++              <span>Informations Générales</span>
++            </h3>
++
++            <div>
++              <label class="block text-[11px] font-medium text-slate-400 mb-1">Titre du récit *</label>
++              <input
++                v-model="title"
++                type="text"
++                placeholder="ex: Le Tramway et les mutations du port"
++                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
++              />
++            </div>
++
++            <div>
++              <label class="block text-[11px] font-medium text-slate-400 mb-1">Résumé introductif</label>
++              <textarea
++                v-model="summary"
++                rows="2"
++                placeholder="Courte présentation de l'itinéraire patrimonial..."
++                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500 resize-none"
++              ></textarea>
++            </div>
++
++            <div>
++              <label class="block text-[11px] font-medium text-slate-400 mb-1">Slug URL</label>
++              <input
++                v-model="slug"
++                type="text"
++                placeholder="laisser vide pour auto-génération"
++                class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-1.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500 font-mono text-[11px]"
++              />
++            </div>
++
++            <!-- Image de couverture du récit -->
++            <div class="pt-2 border-t border-slate-800">
++              <label class="block text-[11px] font-medium text-slate-400 mb-2">Image de couverture</label>
++              <div v-if="coverImageUrl" class="relative group rounded-lg overflow-hidden border border-slate-700">
++                <img :src="coverImageUrl" alt="Couverture" class="w-full h-24 object-cover" />
++                <button
++                  type="button"
++                  class="absolute top-1 right-1 p-1 bg-rose-900/90 hover:bg-rose-800 text-white rounded text-xs opacity-90 transition-opacity"
++                  title="Supprimer la couverture"
++                  @click="handleRemoveCover"
++                >
++                  ✕
++                </button>
++              </div>
++              <div v-else class="flex items-center gap-2">
++                <input
++                  ref="coverInputRef"
++                  type="file"
++                  accept="image/jpeg,image/png,image/webp"
++                  class="hidden"
++                  @change="handleCoverFileChange"
++                />
++                <button
++                  type="button"
++                  class="w-full py-2 px-3 border border-dashed border-slate-700 hover:border-sky-500 rounded-lg text-slate-400 hover:text-white text-xs flex items-center justify-center gap-2 transition-colors"
++                  :disabled="isUploadingCover"
++                  @click="coverInputRef?.click()"
++                >
++                  <span v-if="isUploadingCover" class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++                  <span v-else>🖼️</span>
++                  <span>{{ isUploadingCover ? 'Téléversement...' : 'Téléverser une couverture' }}</span>
++                </button>
++              </div>
++            </div>
++          </div>
++
++          <!-- Stepper ordonné des chapitres avec Drag & Drop -->
++          <div class="flex-1 flex flex-col space-y-2">
++            <div class="flex items-center justify-between pb-1">
++              <h3 class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
++                <span>📑</span>
++                <span>Séquence des Chapitres</span>
++              </h3>
++              <button
++                type="button"
++                class="px-2 py-1 rounded-md bg-sky-950 hover:bg-sky-900 border border-sky-800 text-sky-300 text-[11px] font-medium flex items-center gap-1 transition-colors"
++                @click="handleAddStep"
++              >
++                <span>+</span>
++                <span>Ajouter</span>
++              </button>
++            </div>
++
++            <!-- Liste des cartes de chapitres -->
++            <div class="space-y-1.5 overflow-y-auto pr-1">
++              <div
++                v-for="(step, idx) in steps"
++                :key="step.id"
++                draggable="true"
++                class="group relative rounded-xl border p-2.5 transition-all flex items-center gap-2.5 cursor-pointer select-none"
++                :class="[
++                  activeStepIndex === idx
++                    ? 'bg-slate-800 border-sky-500 shadow-md ring-1 ring-sky-500/50'
++                    : 'bg-slate-900/80 border-slate-800 hover:bg-slate-850 hover:border-slate-700',
++                  draggedStepIndex === idx ? 'opacity-40' : '',
++                  dragOverStepIndex === idx ? 'border-t-2 border-t-amber-400' : '',
++                ]"
++                @click="activeStepIndex = idx"
++                @dragstart="onDragStart(idx, $event)"
++                @dragover="onDragOver(idx, $event)"
++                @drop="onDrop(idx, $event)"
++                @dragend="onDragEnd"
++              >
++                <!-- Poignée de glissement -->
++                <span class="text-slate-500 hover:text-slate-300 cursor-grab active:cursor-grabbing text-sm font-mono px-0.5">
++                  ⠿
++                </span>
++
++                <!-- Numéro d'ordre -->
++                <span class="w-5 h-5 rounded-full bg-slate-950 border border-slate-700 text-[10px] font-bold flex items-center justify-center text-slate-300 flex-shrink-0">
++                  {{ idx + 1 }}
++                </span>
++
++                <!-- Miniature photo liée si présente -->
++                <div v-if="step.photo?.thumb_url || step.photo?.image_thumb_url" class="w-8 h-8 rounded bg-slate-950 overflow-hidden flex-shrink-0 border border-slate-700">
++                  <img
++                    :src="step.photo.thumb_url || step.photo.image_thumb_url || ''"
++                    alt=""
++                    class="w-full h-full object-cover"
++                  />
++                </div>
++                <div v-else class="w-8 h-8 rounded bg-slate-950 border border-slate-800 flex items-center justify-center text-xs text-slate-600 flex-shrink-0">
++                  📷
++                </div>
++
++                <!-- Titre & Badges média -->
++                <div class="flex-1 min-w-0">
++                  <h4 class="text-xs font-semibold text-white truncate">
++                    {{ step.title || `Chapitre ${idx + 1}` }}
++                  </h4>
++                  <div class="flex items-center gap-1.5 text-[10px] text-slate-400 mt-0.5">
++                    <span v-if="step.audio_file_path" title="Piste sonore associée">🎵</span>
++                    <span title="Cadrage caméra">🎥 {{ step.camera_zoom?.toFixed(0) || '13' }}x</span>
++                  </div>
++                </div>
++
++                <!-- Contrôles Haut/Bas & Suppression -->
++                <div class="flex items-center gap-1 opacity-80 group-hover:opacity-100">
++                  <button
++                    type="button"
++                    class="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 text-[10px] disabled:opacity-20"
++                    :disabled="idx === 0"
++                    title="Monter"
++                    @click.stop="moveStep(idx, idx - 1)"
++                  >
++                    ▲
++                  </button>
++                  <button
++                    type="button"
++                    class="p-1 rounded text-slate-400 hover:text-white hover:bg-slate-700 text-[10px] disabled:opacity-20"
++                    :disabled="idx === steps.length - 1"
++                    title="Descendre"
++                    @click.stop="moveStep(idx, idx + 1)"
++                  >
++                    ▼
++                  </button>
++                  <button
++                    type="button"
++                    class="p-1 rounded text-slate-500 hover:text-rose-400 hover:bg-rose-950/60 text-[10px]"
++                    title="Supprimer cette étape"
++                    @click.stop="handleDeleteStep(idx)"
++                  >
++                    🗑️
++                  </button>
++                </div>
++              </div>
++            </div>
++          </div>
++        </aside>
++
++        <!-- VOLET DROIT : Éditeur du chapitre actif -->
++        <main v-if="activeStep" class="flex-1 p-6 overflow-y-auto space-y-6">
++          <!-- Titre du chapitre actif -->
++          <div class="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-800 pb-4">
++            <div class="flex-1">
++              <label class="block text-xs font-medium text-slate-400 mb-1">
++                Titre de l'étape {{ activeStepIndex + 1 }}
++              </label>
++              <input
++                v-model="activeStep.title"
++                type="text"
++                placeholder="Titre accrocheur du chapitre..."
++                class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2 text-sm text-white font-semibold placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
++              />
++            </div>
++          </div>
++
++          <!-- Section Scindée : Texte Narratif Markdown & Photo liée -->
++          <div class="grid grid-cols-1 lg:grid-cols-2 gap-6">
++            <!-- 1. Éditeur de texte narratif Markdown -->
++            <div class="space-y-2 flex flex-col">
++              <div class="flex items-center justify-between">
++                <label class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
++                  <span>✍️</span>
++                  <span>Texte narratif (Markdown)</span>
++                </label>
++                <div class="flex items-center gap-2">
++                  <button
++                    type="button"
++                    class="text-[11px] px-2 py-0.5 rounded text-slate-400 hover:text-white hover:bg-slate-800 transition-colors"
++                    :class="showMarkdownPreview ? 'bg-slate-800 text-sky-400 font-semibold' : ''"
++                    @click="showMarkdownPreview = !showMarkdownPreview"
++                  >
++                    {{ showMarkdownPreview ? 'Mode Éditeur' : 'Aperçu Rendu' }}
++                  </button>
++                </div>
++              </div>
++
++              <!-- Zone de saisie Markdown -->
++              <div v-if="!showMarkdownPreview" class="flex-1">
++                <textarea
++                  v-model="activeStep.content_markdown"
++                  rows="8"
++                  placeholder="Racontez l'histoire de ce lieu, le contexte historique, les anecdotes..."
++                  class="w-full h-56 bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 font-mono leading-relaxed resize-none"
++                ></textarea>
++              </div>
++
++              <!-- Zone d'aperçu Markdown -->
++              <div
++                v-else
++                class="w-full h-56 bg-slate-950 border border-slate-800 rounded-xl p-3 text-xs text-slate-200 overflow-y-auto prose prose-invert max-w-none"
++                v-html="renderMarkdownPreview(activeStep.content_markdown)"
++              ></div>
++            </div>
++
++            <!-- 2. Cliché d'archive associé & Bande sonore -->
++            <div class="space-y-4">
++              <!-- Cliché photographique territorial -->
++              <div class="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
++                <div class="flex items-center justify-between">
++                  <label class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
++                    <span>📸</span>
++                    <span>Cliché photographique d'archive</span>
++                  </label>
++                  <button
++                    v-if="!activeStep.photo_id"
++                    type="button"
++                    class="px-2.5 py-1 bg-sky-950 hover:bg-sky-900 border border-sky-800 text-sky-300 rounded-lg text-xs font-medium flex items-center gap-1.5 transition-colors"
++                    @click="openPhotoSelector"
++                  >
++                    <span>Choisir une photo</span>
++                  </button>
++                  <button
++                    v-else
++                    type="button"
++                    class="text-xs text-rose-400 hover:text-rose-300 hover:underline"
++                    @click="detachPhotoFromStep"
++                  >
++                    Retirer la photo
++                  </button>
++                </div>
++
++                <!-- Aperçu de la photo attachée -->
++                <div v-if="activeStep.photo || activeStep.photo_id" class="flex items-start gap-3 bg-slate-900/80 p-2.5 rounded-lg border border-slate-800">
++                  <img
++                    :src="activeStep.photo?.thumb_url || activeStep.photo?.display_url || activeStep.photo?.image_thumb_url || '/placeholder.png'"
++                    alt=""
++                    class="w-20 h-20 object-cover rounded-lg border border-slate-700 flex-shrink-0"
++                  />
++                  <div class="flex-1 min-w-0 text-xs">
++                    <h5 class="font-bold text-white truncate">
++                      {{ activeStep.photo?.title || 'Photo associée' }}
++                    </h5>
++                    <p class="text-[11px] text-slate-400 mt-0.5">
++                      {{ activeStep.photo?.archive_source || 'Archives' }}
++                      <span v-if="activeStep.photo?.archive_ref">({{ activeStep.photo.archive_ref }})</span>
++                    </p>
++                    <p v-if="activeStep.photo?.year_taken" class="text-[10px] text-sky-400 mt-0.5 font-mono">
++                      Année : {{ activeStep.photo.year_taken }}
++                    </p>
++                  </div>
++                </div>
++
++                <div v-else class="text-center py-4 border border-dashed border-slate-800 rounded-lg text-slate-500 text-xs">
++                  Aucun cliché associé à ce chapitre (optionnel)
++                </div>
++              </div>
++
++              <!-- Document sonore narratif MP3 -->
++              <div class="bg-slate-950 border border-slate-800 rounded-xl p-4 space-y-3">
++                <div class="flex items-center justify-between">
++                  <label class="text-xs font-bold text-slate-300 flex items-center gap-1.5">
++                    <span>🎙️</span>
++                    <span>Document sonore (MP3, M4A, OGG, WAV)</span>
++                  </label>
++                  <button
++                    v-if="activeStep.audio_file_path"
++                    type="button"
++                    class="text-xs text-rose-400 hover:text-rose-300 hover:underline"
++                    @click="handleRemoveAudio"
++                  >
++                    Supprimer l'audio
++                  </button>
++                </div>
++
++                <!-- Lecteur de pré-écoute si audio présent -->
++                <div v-if="activeStep.audio_url || activeStep.audio_file_path" class="space-y-2">
++                  <audio :src="activeStep.audio_url || undefined" controls class="w-full h-9 rounded-lg bg-slate-900"></audio>
++                </div>
++
++                <div v-else class="flex items-center gap-2">
++                  <input
++                    ref="audioInputRef"
++                    type="file"
++                    accept=".mp3,.m4a,.ogg,.wav,audio/*"
++                    class="hidden"
++                    @change="handleAudioFileChange"
++                  />
++                  <button
++                    type="button"
++                    class="w-full py-2 px-3 border border-dashed border-slate-800 hover:border-sky-500 rounded-lg text-slate-400 hover:text-white text-xs flex items-center justify-center gap-2 transition-colors"
++                    :disabled="isUploadingAudio"
++                    @click="audioInputRef?.click()"
++                  >
++                    <span v-if="isUploadingAudio" class="w-3 h-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++                    <span v-else>🎵</span>
++                    <span>{{ isUploadingAudio ? 'Téléversement...' : 'Téléverser un document sonore (max 50Mo)' }}</span>
++                  </button>
++                </div>
++              </div>
++            </div>
++          </div>
++
++          <!-- Section Caméra Cartographique Interactive MapLibre GL -->
++          <div class="space-y-2">
++            <StorymapCameraPicker
++              v-model:camera-lat="activeStep.camera_lat"
++              v-model:camera-lng="activeStep.camera_lng"
++              v-model:camera-zoom="activeStep.camera_zoom"
++              v-model:camera-bearing="activeStep.camera_bearing"
++              v-model:camera-pitch="activeStep.camera_pitch"
++              :default-center="territoryCenter"
++              @capture="onCameraCapture"
++            />
++          </div>
++        </main>
++      </div>
++    </div>
++
++    <!-- Modale de sélection de photo territoriale -->
++    <div
++      v-if="isPhotoSelectorOpen"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isPhotoSelectorOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-3xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden">
++        <div class="p-4 border-b border-slate-800 flex items-center justify-between gap-4">
++          <h3 class="text-sm font-bold text-white flex items-center gap-2">
++            <span>📷</span>
++            <span>Sélectionner une photo d'archive du territoire</span>
++          </h3>
++          <button type="button" class="text-slate-400 hover:text-white" @click="isPhotoSelectorOpen = false">✕</button>
++        </div>
++
++        <div class="p-4 border-b border-slate-800">
++          <input
++            v-model="photoSearchQuery"
++            type="text"
++            placeholder="Rechercher par titre, photographe, référence..."
++            class="w-full bg-slate-950 border border-slate-700 rounded-xl px-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500"
++          />
++        </div>
++
++        <div class="flex-1 p-4 overflow-y-auto">
++          <div v-if="isLoadingPhotos" class="text-center py-8 text-xs text-slate-400">
++            Chargement des clichés...
++          </div>
++          <div v-else-if="filteredTerritoryPhotos.length === 0" class="text-center py-8 text-xs text-slate-500">
++            Aucun cliché trouvé dans ce territoire.
++          </div>
++          <div v-else class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
++            <div
++              v-for="photo in filteredTerritoryPhotos"
++              :key="photo.id"
++              class="group relative rounded-xl overflow-hidden border border-slate-800 bg-slate-950 hover:border-sky-500 cursor-pointer transition-all shadow-sm flex flex-col"
++              @click="selectPhotoForStep(photo)"
++            >
++              <img
++                :src="photo.thumb_url || photo.display_url || photo.image_thumb_url || ''"
++                alt=""
++                class="w-full h-28 object-cover group-hover:scale-105 transition-transform"
++              />
++              <div class="p-2 text-[11px] flex-1 flex flex-col justify-between">
++                <span class="font-semibold text-white line-clamp-2 leading-tight">{{ photo.title }}</span>
++                <span v-if="photo.year_taken" class="text-[10px] text-sky-400 font-mono mt-1">
++                  {{ photo.year_taken }}
++                </span>
++              </div>
++            </div>
++          </div>
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
+--- /dev/null
++++ b/frontend/src/components/admin/StorymapAdminCatalog.vue
+@@ -0,0 +1,423 @@
++<script setup lang="ts">
++import { ref, onMounted, watch } from 'vue'
++import type { Storymap, StorymapStatus } from '@/types/storymap'
++import { storymapApi } from '@/services/api'
++import StorymapEditorModal from './StorymapEditorModal.vue'
++
++const props = withDefaults(
++  defineProps<{
++    territoryCenter?: { lat: number; lng: number; zoom?: number } | null
++    territoryId?: string | null
++  }>(),
++  {
++    territoryCenter: () => ({ lat: 43.1242, lng: 5.9328, zoom: 13 }),
++    territoryId: null,
++  }
++)
++
++// État de la liste
++const storymaps = ref<Storymap[]>([])
++const totalStorymaps = ref(0)
++const currentPage = ref(1)
++const pageSize = ref(12)
++const totalPages = ref(1)
++const isLoading = ref(false)
++const errorMessage = ref<string | null>(null)
++
++// Filtres
++const searchQuery = ref('')
++const statusFilter = ref<StorymapStatus | ''>('')
++let searchDebounceTimeout: any = null
++
++// Modale d'édition
++const isEditorModalOpen = ref(false)
++const selectedStorymapId = ref<string | null>(null)
++
++// Confirmation de suppression
++const isDeleteModalOpen = ref(false)
++const storymapToDelete = ref<Storymap | null>(null)
++const isDeleting = ref(false)
++
++// Notifications Toast
++interface Toast {
++  id: number
++  message: string
++  type: 'success' | 'error' | 'info'
++}
++const toasts = ref<Toast[]>([])
++let toastCounter = 0
++
++function addToast(message: string, type: 'success' | 'error' | 'info' = 'info') {
++  const id = ++toastCounter
++  toasts.value.push({ id, message, type })
++  setTimeout(() => {
++    toasts.value = toasts.value.filter((t) => t.id !== id)
++  }, 4000)
++}
++
++/**
++ * Charge les storymaps depuis l'API
++ */
++async function loadStorymaps() {
++  isLoading.value = true
++  errorMessage.value = null
++
++  try {
++    const res = await storymapApi.listStorymaps({
++      page: currentPage.value,
++      page_size: pageSize.value,
++      status: statusFilter.value || undefined,
++      search: searchQuery.value || undefined,
++    })
++
++    storymaps.value = res.items
++    totalStorymaps.value = res.total
++    totalPages.value = res.pages || 1
++    currentPage.value = res.page
++  } catch (err: any) {
++    errorMessage.value = err.message || 'Impossible de charger les storymaps.'
++    addToast(errorMessage.value || 'Erreur', 'error')
++  } finally {
++    isLoading.value = false
++  }
++}
++
++// Filtre debounce
++watch(searchQuery, () => {
++  clearTimeout(searchDebounceTimeout)
++  searchDebounceTimeout = setTimeout(() => {
++    currentPage.value = 1
++    loadStorymaps()
++  }, 350)
++})
++
++watch(statusFilter, () => {
++  currentPage.value = 1
++  loadStorymaps()
++})
++
++function changePage(newPage: number) {
++  if (newPage >= 1 && newPage <= totalPages.value) {
++    currentPage.value = newPage
++    loadStorymaps()
++  }
++}
++
++// Actions
++function openCreateModal() {
++  selectedStorymapId.value = null
++  isEditorModalOpen.value = true
++}
++
++function openEditModal(storymap: Storymap) {
++  selectedStorymapId.value = storymap.id
++  isEditorModalOpen.value = true
++}
++
++function onStorymapSaved(saved: Storymap) {
++  addToast(`Récit "${saved.title}" enregistré avec succès.`, 'success')
++  loadStorymaps()
++}
++
++function confirmDelete(storymap: Storymap) {
++  storymapToDelete.value = storymap
++  isDeleteModalOpen.value = true
++}
++
++async function handleDeleteConfirmed() {
++  if (!storymapToDelete.value) return
++  isDeleting.value = true
++  try {
++    await storymapApi.deleteStorymap(storymapToDelete.value.id)
++    addToast(`Récit "${storymapToDelete.value.title}" supprimé.`, 'info')
++    isDeleteModalOpen.value = false
++    storymapToDelete.value = null
++    await loadStorymaps()
++  } catch (err: any) {
++    addToast(err.message || 'Erreur lors de la suppression.', 'error')
++  } finally {
++    isDeleting.value = false
++  }
++}
++
++function formatDate(iso: string): string {
++  try {
++    return new Date(iso).toLocaleDateString('fr-FR', {
++      day: 'numeric',
++      month: 'short',
++      year: 'numeric',
++    })
++  } catch {
++    return iso
++  }
++}
++
++onMounted(() => {
++  loadStorymaps()
++})
++</script>
++
++<template>
++  <div class="space-y-6 font-sans">
++    <!-- Barre de contrôle supérieure -->
++    <div class="flex flex-col md:flex-row md:items-center justify-between gap-4 bg-slate-900/60 p-5 rounded-2xl border border-slate-800 backdrop-blur-md shadow-lg">
++      <div>
++        <h2 class="text-xl font-black text-white flex items-center gap-2">
++          <span>📖</span>
++          <span>Storymaps & Récits Territoriaux</span>
++          <span class="text-xs font-mono font-medium px-2.5 py-0.5 rounded-full bg-slate-800 text-sky-400 border border-slate-700">
++            {{ totalStorymaps }} récit{{ totalStorymaps > 1 ? 's' : '' }}
++          </span>
++        </h2>
++        <p class="text-xs text-slate-400 mt-1">
++          Composez des parcours immersifs associant chapitres narratifs, cadrages 3D MapLibre et documents sonores.
++        </p>
++      </div>
++
++      <button
++        type="button"
++        class="px-4 py-2.5 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold shadow-md shadow-sky-900/40 flex items-center justify-center gap-2 transition-all self-start md:self-auto"
++        @click="openCreateModal"
++      >
++        <span class="text-base font-bold">+</span>
++        <span>Nouveau récit</span>
++      </button>
++    </div>
++
++    <!-- Barre de Recherche & Filtres -->
++    <div class="flex flex-col sm:flex-row items-center justify-between gap-3 bg-slate-900/40 p-3 rounded-xl border border-slate-800/80">
++      <div class="w-full sm:w-80 relative">
++        <input
++          v-model="searchQuery"
++          type="text"
++          placeholder="Rechercher par titre, résumé..."
++          class="w-full bg-slate-950 border border-slate-800 rounded-xl pl-9 pr-4 py-2 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-1 focus:ring-sky-500"
++        />
++        <span class="absolute left-3 top-2.5 text-xs text-slate-500">🔍</span>
++      </div>
++
++      <!-- Filtres Statut -->
++      <div class="flex items-center gap-1.5 bg-slate-950 p-1 rounded-xl border border-slate-800 text-xs w-full sm:w-auto">
++        <button
++          type="button"
++          class="flex-1 sm:flex-none px-3 py-1 rounded-lg font-medium transition-colors"
++          :class="statusFilter === '' ? 'bg-sky-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'"
++          @click="statusFilter = ''"
++        >
++          Tous
++        </button>
++        <button
++          type="button"
++          class="flex-1 sm:flex-none px-3 py-1 rounded-lg font-medium transition-colors"
++          :class="statusFilter === 'published' ? 'bg-emerald-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'"
++          @click="statusFilter = 'published'"
++        >
++          Publiés
++        </button>
++        <button
++          type="button"
++          class="flex-1 sm:flex-none px-3 py-1 rounded-lg font-medium transition-colors"
++          :class="statusFilter === 'draft' ? 'bg-amber-600 text-white shadow-sm' : 'text-slate-400 hover:text-white'"
++          @click="statusFilter = 'draft'"
++        >
++          Brouillons
++        </button>
++      </div>
++    </div>
++
++    <!-- État de chargement -->
++    <div v-if="isLoading" class="text-center py-16 space-y-3">
++      <div class="w-8 h-8 border-3 border-sky-500 border-t-transparent rounded-full animate-spin mx-auto"></div>
++      <p class="text-xs text-slate-400">Chargement des récits...</p>
++    </div>
++
++    <!-- Aucun récit trouvé -->
++    <div
++      v-else-if="storymaps.length === 0"
++      class="text-center py-16 bg-slate-900/30 rounded-2xl border border-dashed border-slate-800 p-8 space-y-3"
++    >
++      <span class="text-4xl">🗺️</span>
++      <h3 class="text-base font-bold text-white">Aucune storymap trouvée</h3>
++      <p class="text-xs text-slate-400 max-w-md mx-auto">
++        {{ searchQuery || statusFilter ? 'Aucun résultat ne correspond à vos filtres de recherche.' : 'Commencez par concevoir votre première visite narrative en scrollytelling.' }}
++      </p>
++      <button
++        v-if="!searchQuery && !statusFilter"
++        type="button"
++        class="mt-2 px-4 py-2 bg-sky-600 hover:bg-sky-500 text-white rounded-xl text-xs font-semibold shadow-md transition-colors"
++        @click="openCreateModal"
++      >
++        Créer un récit
++      </button>
++    </div>
++
++    <!-- Grille des Storymaps -->
++    <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-5">
++      <div
++        v-for="story in storymaps"
++        :key="story.id"
++        class="group bg-slate-900/70 border border-slate-800 hover:border-slate-700 rounded-2xl overflow-hidden shadow-md hover:shadow-xl transition-all flex flex-col justify-between"
++      >
++        <!-- Couverture & Badges -->
++        <div>
++          <div class="relative h-44 bg-slate-950 overflow-hidden">
++            <img
++              v-if="story.cover_image_url"
++              :src="story.cover_image_url"
++              :alt="story.title"
++              class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
++            />
++            <div v-else class="w-full h-full flex items-center justify-center text-3xl text-slate-700 bg-gradient-to-br from-slate-900 to-slate-950">
++              🧭
++            </div>
++
++            <!-- Badges superposés -->
++            <div class="absolute top-3 left-3 flex items-center gap-2">
++              <span
++                class="px-2.5 py-1 rounded-full text-[10px] font-mono font-semibold uppercase backdrop-blur-md shadow-sm"
++                :class="story.status === 'published' ? 'bg-emerald-950/90 text-emerald-300 border border-emerald-800' : 'bg-amber-950/90 text-amber-300 border border-amber-800'"
++              >
++                {{ story.status === 'published' ? 'Publié' : 'Brouillon' }}
++              </span>
++            </div>
++
++            <div class="absolute bottom-3 right-3">
++              <span class="px-2.5 py-1 rounded-full text-[10px] font-semibold bg-slate-950/85 backdrop-blur-md text-slate-200 border border-slate-800 flex items-center gap-1.5 shadow-sm">
++                <span>📑</span>
++                <span>{{ story.steps_count ?? story.steps?.length ?? 0 }} chapitre{{ (story.steps_count ?? story.steps?.length ?? 0) > 1 ? 's' : '' }}</span>
++              </span>
++            </div>
++          </div>
++
++          <!-- Contenu descriptif -->
++          <div class="p-4 space-y-2">
++            <h3 class="text-sm font-bold text-white line-clamp-1 group-hover:text-sky-400 transition-colors" :title="story.title">
++              {{ story.title }}
++            </h3>
++            <p class="text-[11px] font-mono text-slate-500">
++              /{{ story.slug }}
++            </p>
++            <p class="text-xs text-slate-400 line-clamp-2 leading-relaxed">
++              {{ story.summary || 'Aucun résumé disponible pour ce parcours historique.' }}
++            </p>
++          </div>
++        </div>
++
++        <!-- Pied de carte avec actions -->
++        <div class="px-4 py-3 bg-slate-950/60 border-t border-slate-800/80 flex items-center justify-between text-xs">
++          <span class="text-[11px] text-slate-500">
++            Mis à jour le {{ formatDate(story.updated_at) }}
++          </span>
++
++          <div class="flex items-center gap-2">
++            <button
++              type="button"
++              class="px-2.5 py-1 rounded-lg font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 transition-colors"
++              @click="openEditModal(story)"
++            >
++              Éditer
++            </button>
++            <button
++              type="button"
++              class="p-1 rounded-lg text-slate-500 hover:text-rose-400 hover:bg-rose-950/50 transition-colors"
++              title="Supprimer ce récit"
++              @click="confirmDelete(story)"
++            >
++              🗑️
++            </button>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- Pagination -->
++    <div v-if="totalPages > 1" class="flex items-center justify-center gap-2 pt-4">
++      <button
++        type="button"
++        class="px-3 py-1.5 rounded-lg text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30"
++        :disabled="currentPage === 1"
++        @click="changePage(currentPage - 1)"
++      >
++        Précédent
++      </button>
++      <span class="text-xs text-slate-400 font-mono px-3">
++        {{ currentPage }} / {{ totalPages }}
++      </span>
++      <button
++        type="button"
++        class="px-3 py-1.5 rounded-lg text-xs bg-slate-900 border border-slate-800 text-slate-300 hover:text-white disabled:opacity-30"
++        :disabled="currentPage === totalPages"
++        @click="changePage(currentPage + 1)"
++      >
++        Suivant
++      </button>
++    </div>
++
++    <!-- Modale Éditeur de Storymap -->
++    <StorymapEditorModal
++      :is-open="isEditorModalOpen"
++      :storymap-id="selectedStorymapId"
++      :territory-center="territoryCenter"
++      :territory-id="territoryId"
++      @close="isEditorModalOpen = false"
++      @saved="onStorymapSaved"
++    />
++
++    <!-- Modale de Confirmation de Suppression -->
++    <div
++      v-if="isDeleteModalOpen && storymapToDelete"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isDeleteModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
++        <h3 class="text-base font-bold text-white flex items-center gap-2">
++          <span>⚠️</span>
++          <span>Confirmer la suppression</span>
++        </h3>
++        <p class="text-xs text-slate-300 leading-relaxed">
++          Êtes-vous sûr de vouloir supprimer définitivement le récit
++          <strong class="text-white">"{{ storymapToDelete.title }}"</strong> ?
++          Toutes ses étapes associées seront également effacées (suppression en cascade).
++        </p>
++
++        <div class="flex items-center justify-end gap-3 pt-3">
++          <button
++            type="button"
++            class="px-3.5 py-1.5 text-xs text-slate-400 hover:text-white"
++            @click="isDeleteModalOpen = false"
++          >
++            Annuler
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 bg-rose-600 hover:bg-rose-500 text-white rounded-lg text-xs font-semibold shadow-md flex items-center gap-1.5"
++            :disabled="isDeleting"
++            @click="handleDeleteConfirmed"
++          >
++            <span v-if="isDeleting" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++            <span>Supprimer définitivement</span>
++          </button>
++        </div>
++      </div>
++    </div>
++
++    <!-- Notifications Toasts flottantes -->
++    <div class="fixed bottom-4 right-4 z-50 space-y-2 pointer-events-none">
++      <div
++        v-for="t in toasts"
++        :key="t.id"
++        class="pointer-events-auto px-4 py-2.5 rounded-xl text-xs font-semibold shadow-xl border backdrop-blur-md transition-all flex items-center gap-2"
++        :class="[
++          t.type === 'success' ? 'bg-emerald-950/90 text-emerald-300 border-emerald-800' : '',
++          t.type === 'error' ? 'bg-rose-950/90 text-rose-300 border-rose-800' : '',
++          t.type === 'info' ? 'bg-sky-950/90 text-sky-300 border-sky-800' : '',
++        ]"
++      >
++        <span v-if="t.type === 'success'">✓</span>
++        <span v-else-if="t.type === 'error'">⚠️</span>
++        <span v-else>ℹ️</span>
++        <span>{{ t.message }}</span>
++      </div>
++    </div>
++  </div>
++</template>
+--- /dev/null
++++ b/frontend/src/App.vue
+@@ -0,0 +1,322 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted } from 'vue'
++import { photoApi, setAuthToken, hasAuthToken } from './services/api'
++import PhotoAdminCatalog from './components/admin/PhotoAdminCatalog.vue'
++import StorymapAdminCatalog from './components/admin/StorymapAdminCatalog.vue'
++import PublicMapViewer from './components/public/PublicMapViewer.vue'
++
++const currentTab = ref<'decouverte' | 'studio'>('studio')
++const studioSubTab = ref<'photos' | 'storymaps'>('photos')
++
++const apiHealth = ref<{ status: string; database: string } | null>(null)
++const territory = ref<{ slug: string; name: string; center_lat: number; center_lng: number; default_zoom: number } | null>(null)
++const currentUser = ref<{ email: string; full_name?: string; role: string; territory_id?: string } | null>(null)
++const loading = ref(true)
++const error = ref<string | null>(null)
++
++// Modal de connexion
++const isLoginModalOpen = ref(false)
++const loginEmail = ref('admin@hierici.local')
++const loginPassword = ref('admin_hierici_2026')
++const loginError = ref<string | null>(null)
++const isLoggingIn = ref(false)
++
++async function authenticate() {
++  try {
++    if (hasAuthToken()) {
++      try {
++        currentUser.value = await photoApi.getMe()
++        return
++      } catch {
++        setAuthToken(null)
++      }
++    }
++
++    // Tentative d'auto-authentification avec le compte de développement local
++    const loginRes = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = loginRes.user
++  } catch (err: any) {
++    console.warn('Authentification requise pour le Studio:', err.message)
++  }
++}
++
++async function handleManualLogin() {
++  loginError.value = null
++  isLoggingIn.value = true
++
++  try {
++    const res = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = res.user
++    isLoginModalOpen.value = false
++  } catch (err: any) {
++    loginError.value = err.message || 'Identifiants invalides'
++  } finally {
++    isLoggingIn.value = false
++  }
++}
++
++function handleLogout() {
++  setAuthToken(null)
++  currentUser.value = null
++}
++
++function checkUrlForPhotoTab() {
++  const urlParams = new URLSearchParams(window.location.search)
++  if (urlParams.has('photo') && urlParams.get('photo')) {
++    currentTab.value = 'decouverte'
++  }
++}
++
++onMounted(async () => {
++  checkUrlForPhotoTab()
++  window.addEventListener('popstate', checkUrlForPhotoTab)
++
++  try {
++    const [healthRes, territoryRes] = await Promise.all([
++      photoApi.getHealth().catch(() => null),
++      photoApi.getCurrentTerritory().catch(() => null),
++    ])
++
++    if (healthRes) apiHealth.value = healthRes
++    if (territoryRes) territory.value = territoryRes
++
++    // Connexion automatique initiale pour le studio
++    await authenticate()
++  } catch (e: any) {
++    error.value = "Impossible de contacter l'API backend"
++  } finally {
++    loading.value = false
++  }
++})
++
++onUnmounted(() => {
++  window.removeEventListener('popstate', checkUrlForPhotoTab)
++})
++</script>
++
++<template>
++  <main class="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500 selection:text-white">
++    <!-- En-tête Global -->
++    <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur-md sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg">
++      <div class="flex items-center space-x-6">
++        <div class="flex items-center space-x-3 cursor-pointer" @click="currentTab = 'studio'">
++          <span class="text-2xl drop-shadow">🧭</span>
++          <div>
++            <h1 class="text-lg font-black tracking-tight text-white flex items-center gap-2">
++              <span>HierIci</span>
++              <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
++                Studio 2.0
++              </span>
++            </h1>
++            <p class="text-[11px] text-slate-400">Patrimoine géohistorique & archives territoriales</p>
++          </div>
++        </div>
++
++        <!-- Onglets de Navigation Principale -->
++        <nav class="hidden md:flex items-center space-x-1 bg-slate-950/70 p-1 rounded-xl border border-slate-800 text-xs">
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'studio' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'studio'"
++          >
++            <span>🗂️</span>
++            <span>Studio Admin</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="currentTab = 'decouverte'"
++          >
++            <span>🗺️</span>
++            <span>Découverte Publique</span>
++          </button>
++        </nav>
++      </div>
++
++      <!-- Informations de session & statut -->
++      <div class="flex items-center space-x-3 text-xs">
++        <!-- Badge Territoire -->
++        <span
++          v-if="territory"
++          class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-medium bg-slate-800/80 text-slate-300 border border-slate-700"
++          :title="`Centre : ${territory.center_lat.toFixed(4)}, ${territory.center_lng.toFixed(4)}`"
++        >
++          📍 {{ territory.name }}
++        </span>
++
++        <!-- Badge Santé API -->
++        <span
++          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium"
++          :class="apiHealth?.database === 'connected' ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800' : 'bg-amber-950/80 text-amber-400 border border-amber-800'"
++        >
++          <span class="w-1.5 h-1.5 rounded-full" :class="apiHealth?.database === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
++          {{ apiHealth?.database === 'connected' ? 'API Connectée' : 'Connexion...' }}
++        </span>
++
++        <!-- Utilisateur connecté -->
++        <div v-if="currentUser" class="flex items-center gap-2 pl-2 border-l border-slate-800">
++          <div class="hidden lg:block text-right">
++            <div class="text-[11px] font-semibold text-white leading-tight">
++              {{ currentUser.full_name || currentUser.email }}
++            </div>
++            <div class="text-[10px] text-slate-400 capitalize">
++              {{ currentUser.role }}
++            </div>
++          </div>
++          <button
++            type="button"
++            class="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++            title="Se déconnecter"
++            @click="handleLogout"
++          >
++            🚪
++          </button>
++        </div>
++        <button
++          v-else
++          type="button"
++          class="px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg font-medium transition-colors"
++          @click="isLoginModalOpen = true"
++        >
++          Connexion
++        </button>
++      </div>
++    </header>
++
++    <!-- Navigation mobile sous l'en-tête -->
++    <div class="md:hidden border-b border-slate-800 bg-slate-900 px-6 py-2 flex items-center justify-center space-x-2 text-xs">
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'studio' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'studio'"
++      >
++        🗂️ Studio Admin
++      </button>
++      <button
++        type="button"
++        class="flex-1 py-2 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="currentTab = 'decouverte'"
++      >
++        🗺️ Découverte
++      </button>
++    </div>
++
++    <!-- Contenu Principal -->
++    <div :class="currentTab === 'decouverte' ? 'flex-1 w-full px-4 sm:px-6 py-4' : 'flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8'">
++      <!-- VUE STUDIO ADMIN (Story 2.3 & Story 4.2) -->
++      <section v-if="currentTab === 'studio'" class="space-y-6">
++        <!-- Sous-navigation Studio : Photothèque vs Storymaps -->
++        <div class="flex items-center gap-2 border-b border-slate-800 pb-3">
++          <button
++            type="button"
++            class="px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2"
++            :class="studioSubTab === 'photos' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="studioSubTab = 'photos'"
++          >
++            <span>📸</span>
++            <span>Photothèque</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2"
++            :class="studioSubTab === 'storymaps' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="studioSubTab = 'storymaps'"
++          >
++            <span>📖</span>
++            <span>Storymaps & Récits</span>
++          </button>
++        </div>
++
++        <PhotoAdminCatalog v-if="studioSubTab === 'photos'" />
++        <StorymapAdminCatalog
++          v-else-if="studioSubTab === 'storymaps'"
++          :territory-center="territory ? { lat: territory.center_lat, lng: territory.center_lng, zoom: territory.default_zoom } : null"
++          :territory-id="currentUser?.territory_id"
++        />
++      </section>
++
++      <!-- VUE DÉCOUVERTE PUBLIQUE (Story 3.1) -->
++      <section v-else-if="currentTab === 'decouverte'" class="w-full">
++        <PublicMapViewer
++          :territory-center="territory ? [territory.center_lng, territory.center_lat] : [5.93, 43.12]"
++          :default-zoom="territory?.default_zoom ?? 13"
++          :territory-name="territory?.name ?? 'Territoire'"
++          @select-photo="(id) => console.log('Photo sélectionnée:', id)"
++        />
++      </section>
++    </div>
++
++    <!-- Modale de connexion manuelle -->
++    <div
++      v-if="isLoginModalOpen"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isLoginModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4">
++        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
++          <h3 class="text-base font-bold text-white">Connexion au Studio</h3>
++          <button
++            type="button"
++            class="text-slate-400 hover:text-white"
++            @click="isLoginModalOpen = false"
++          >
++            ✕
++          </button>
++        </div>
++
++        <div v-if="loginError" class="p-2.5 rounded-lg bg-rose-950/80 border border-rose-800 text-xs text-rose-300">
++          {{ loginError }}
++        </div>
++
++        <form class="space-y-4" @submit.prevent="handleManualLogin">
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Email</label>
++            <input
++              v-model="loginEmail"
++              type="email"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Mot de passe</label>
++            <input
++              v-model="loginPassword"
++              type="password"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div class="flex items-center justify-end gap-2 pt-2">
++            <button
++              type="button"
++              class="px-3 py-1.5 text-xs text-slate-400 hover:text-white"
++              @click="isLoginModalOpen = false"
++            >
++              Annuler
++            </button>
++            <button
++              type="submit"
++              class="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-md flex items-center gap-1.5"
++              :disabled="isLoggingIn"
++            >
++              <span v-if="isLoggingIn" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++              <span>Connexion</span>
++            </button>
++          </div>
++        </form>
++      </div>
++    </div>
++
++    <!-- Pied de page -->
++    <footer class="border-t border-slate-800/80 bg-slate-950 px-6 py-4 text-center text-xs text-slate-500">
++      HierIci — Studio d'Administration & Métadonnées d'Archives (Story 2.3)
++    </footer>
++  </main>
++</template>
+--- /dev/null
++++ b/frontend/tests/storymap_studio_logic.test.mjs
+@@ -0,0 +1,159 @@
++import assert from 'node:assert/strict'
++import { test, describe } from 'node:test'
++import {
++  normalizeBearing,
++  clampCameraCoordinates,
++  reorderStepsLocally,
++  detachPhotoFromStep,
++  validateAudioFile,
++  renderMarkdownPreview,
++} from '../src/utils/storymapStudio.ts'
++
++// ============================================================================
++// SUITE DE TESTS - Logique du Studio Storymap
++// ============================================================================
++
++describe('Story 4.2 - Logique de réordonnancement des chapitres', () => {
++  const sampleSteps = [
++    { id: 'step-1', title: 'Prologue', step_order: 0 },
++    { id: 'step-2', title: 'Le Port Militaire', step_order: 1 },
++    { id: 'step-3', title: "L'Arsenal Maritime", step_order: 2 },
++    { id: 'step-4', title: 'Épilogue', step_order: 3 },
++  ]
++
++  test("Déplace l'étape 3 vers la position 1 (glisser-déposer)", () => {
++    const reordered = reorderStepsLocally(sampleSteps, 2, 0)
++    assert.equal(reordered.length, 4)
++    assert.equal(reordered[0].id, 'step-3')
++    assert.equal(reordered[0].step_order, 0)
++    assert.equal(reordered[1].id, 'step-1')
++    assert.equal(reordered[1].step_order, 1)
++    assert.equal(reordered[2].id, 'step-2')
++    assert.equal(reordered[2].step_order, 2)
++    assert.equal(reordered[3].id, 'step-4')
++    assert.equal(reordered[3].step_order, 3)
++  })
++
++  test("Déplace une étape d'un cran vers le haut (bouton monter)", () => {
++    const reordered = reorderStepsLocally(sampleSteps, 1, 0)
++    assert.equal(reordered[0].id, 'step-2')
++    assert.equal(reordered[1].id, 'step-1')
++    assert.equal(reordered[0].step_order, 0)
++    assert.equal(reordered[1].step_order, 1)
++  })
++
++  test('Ignore les déplacements hors limites (toIndex < 0 ou toIndex >= length)', () => {
++    const unchanged1 = reorderStepsLocally(sampleSteps, 0, -1)
++    assert.deepEqual(unchanged1, sampleSteps)
++
++    const unchanged2 = reorderStepsLocally(sampleSteps, 3, 4)
++    assert.deepEqual(unchanged2, sampleSteps)
++  })
++
++  test("Garantit que la liste des IDs extraite pour l'API reorder est ordonnée sans perte", () => {
++    const reordered = reorderStepsLocally(sampleSteps, 3, 1)
++    const payloadIds = reordered.map((s) => s.id)
++    assert.deepEqual(payloadIds, ['step-1', 'step-4', 'step-2', 'step-3'])
++  })
++})
++
++describe('Story 4.2 - Validation et capture de la caméra cartographique 3D', () => {
++  test('Borne les coordonnées extrêmes et normalise le bearing', () => {
++    const captured = clampCameraCoordinates(95.5, 192.3, 26.5, 360.0, 95.0)
++    assert.equal(captured.camera_lat, 90.0)
++    assert.equal(captured.camera_lng, 180.0)
++    assert.equal(captured.camera_zoom, 24.0)
++    assert.equal(captured.camera_bearing, 0.0)
++    assert.equal(captured.camera_pitch, 85.0)
++  })
++
++  test("Normalise les angles d'azimut négatifs ou supérieurs à 360°", () => {
++    assert.equal(normalizeBearing(-45), 315)
++    assert.equal(normalizeBearing(450), 90)
++    assert.equal(normalizeBearing(360), 0)
++    assert.equal(normalizeBearing(0), 0)
++  })
++
++  test('Valide les cadrages conformes', () => {
++    const coords = clampCameraCoordinates(43.1242, 5.9328, 14.5, 120.0, 45.0)
++    assert.equal(coords.camera_lat, 43.1242)
++    assert.equal(coords.camera_lng, 5.9328)
++    assert.equal(coords.camera_zoom, 14.5)
++    assert.equal(coords.camera_bearing, 120.0)
++    assert.equal(coords.camera_pitch, 45.0)
++  })
++
++  test('Rejette les inclinaisons pitch supérieures à 85° en les bornant', () => {
++    const coords = clampCameraCoordinates(43.12, 5.93, 12.0, 0.0, 89.0)
++    assert.equal(coords.camera_pitch, 85.0)
++  })
++})
++
++describe("Story 4.2 - Documents sonores & dissociation de photos d'archives", () => {
++  test('Accepte les fichiers audio conformes (.mp3, .m4a, .ogg, .wav <= 50Mo)', () => {
++    const mp3 = validateAudioFile({ name: 'narration_chapitre1.mp3', size: 12 * 1024 * 1024, type: 'audio/mpeg' })
++    assert.equal(mp3.valid, true)
++
++    const wav = validateAudioFile({ name: 'ambiance_port.WAV', size: 45 * 1024 * 1024, type: 'audio/wav' })
++    assert.equal(wav.valid, true)
++
++    const ogg = validateAudioFile({ name: 'guide_vocal.ogg', size: 5 * 1024 * 1024, type: 'audio/ogg' })
++    assert.equal(ogg.valid, true)
++  })
++
++  test('Rejette les fichiers audio dépassant 50 Mo', () => {
++    const tooLarge = validateAudioFile({ name: 'long_audio.mp3', size: 52 * 1024 * 1024, type: 'audio/mpeg' })
++    assert.equal(tooLarge.valid, false)
++    assert.match(tooLarge.error, /50 Mo/i)
++  })
++
++  test("Rejette les formats d'extension non autorisés", () => {
++    const exe = validateAudioFile({ name: 'malware.exe', size: 1024, type: 'application/octet-stream' })
++    assert.equal(exe.valid, false)
++
++    const sh = validateAudioFile({ name: 'script.sh', size: 500, type: 'text/x-shellscript' })
++    assert.equal(sh.valid, false)
++  })
++
++  test('Rejette les types MIME incompatibles', () => {
++    const fakeAudio = validateAudioFile({ name: 'fake.mp3', size: 1024, type: 'image/png' })
++    assert.equal(fakeAudio.valid, false)
++    assert.match(fakeAudio.error, /MIME/i)
++  })
++
++  test("Détache proprement une photo liée sans altérer les autres attributs de l'étape", () => {
++    const stepWithPhoto = {
++      id: 'step-10',
++      title: 'Quai Cronstadt',
++      content_markdown: 'Texte narratif',
++      photo_id: 'photo-uuid-123',
++      photo: { id: 'photo-uuid-123', title: 'Le Port en 1900' },
++      camera_lat: 43.12,
++      camera_lng: 5.93,
++    }
++    const detached = detachPhotoFromStep(stepWithPhoto)
++    assert.equal(detached.photo_id, null)
++    assert.equal(detached.photo, null)
++    assert.equal(detached.title, 'Quai Cronstadt')
++    assert.equal(detached.camera_lat, 43.12)
++  })
++})
++
++describe('Story 4.2 - Sécurité et rendu Markdown', () => {
++  test('Neutralise les balises scripts malveillantes', () => {
++    const malicious = '<script>alert("hack")</script>'
++    const rendered = renderMarkdownPreview(malicious)
++    assert.ok(!rendered.includes('<script>'))
++    assert.ok(rendered.includes('&lt;script&gt;'))
++  })
++
++  test('Rend les enrichissements typographiques (titres, gras, italique, listes, citations)', () => {
++    const md = '## Titre 2\nTexte **important** et *subtil*.\n- Item liste\n> Citation'
++    const rendered = renderMarkdownPreview(md)
++    assert.ok(rendered.includes('<h2 class="text-lg font-bold text-sky-300 mt-4 mb-2">Titre 2</h2>'))
++    assert.ok(rendered.includes('<strong class="text-white font-bold">important</strong>'))
++    assert.ok(rendered.includes('<em class="text-slate-300 italic">subtil</em>'))
++    assert.ok(rendered.includes('<li class="ml-4 list-disc text-slate-200">Item liste</li>'))
++    assert.ok(rendered.includes('<blockquote class="border-l-4 border-sky-500 pl-3 py-1 my-2 text-slate-300 italic bg-slate-800/40 rounded-r">Citation</blockquote>'))
++  })
++})
+--- /dev/null
++++ b/frontend/tests/loader.mjs
+@@ -0,0 +1,15 @@
++import fs from 'node:fs'
++import esbuild from 'esbuild'
++
++export async function load(url, context, nextLoad) {
++  if (url.endsWith('.ts')) {
++    const raw = fs.readFileSync(new URL(url), 'utf8')
++    const { code } = esbuild.transformSync(raw, { loader: 'ts', format: 'esm' })
++    return {
++      format: 'module',
++      shortCircuit: true,
++      source: code,
++    }
++  }
++  return nextLoad(url, context)
++}

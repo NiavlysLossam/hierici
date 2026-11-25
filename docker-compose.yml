@@ -1,0 +1,72 @@
+services:
+  # Base de données spatiale PostgreSQL 16 + PostGIS 3.4
+  hierici-db:
+    image: postgis/postgis:16-3.4-alpine
+    container_name: hierici-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-hierici}
+      POSTGRES_USER: ${POSTGRES_USER:-hierici}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hierici_secret_password}
+    ports:
+      - "${POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hierici} -d ${POSTGRES_DB:-hierici}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - hierici-network
+
+  # Backend API FastAPI (Python 3.12)
+  hierici-backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: hierici-backend
+    restart: unless-stopped
+    depends_on:
+      hierici-db:
+        condition: service_healthy
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hierici}:${POSTGRES_PASSWORD:-hierici_secret_password}@hierici-db:5432/${POSTGRES_DB:-hierici}
+      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
+      LOCAL_STORAGE_PATH: ${LOCAL_STORAGE_PATH:-/app/uploads}
+      DEFAULT_TERRITORY_SLUG: ${DEFAULT_TERRITORY_SLUG:-territoire-pilote}
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./backend:/app
+      - uploads_data:/app/uploads
+    networks:
+      - hierici-network
+
+  # Frontend Web Vue 3 / Vite
+  hierici-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: hierici-frontend
+    restart: unless-stopped
+    depends_on:
+      - hierici-backend
+    ports:
+      - "5173:80"
+    networks:
+      - hierici-network
+
+volumes:
+  pgdata:
+    name: hierici_pgdata
+  uploads_data:
+    name: hierici_uploads_data
+
+networks:
+  hierici-network:
+    name: hierici-network
+    driver: bridge
+

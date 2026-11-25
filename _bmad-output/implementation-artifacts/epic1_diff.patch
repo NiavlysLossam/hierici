@@ -1,0 +1,1819 @@
+diff --git a/.env.example b/.env.example
+new file mode 100644
+index 0000000..ff9b9d0
+--- /dev/null
++++ b/.env.example
+@@ -0,0 +1,35 @@
++# ==============================================================================
++# Environnement HierIci - Fichier d'exemple (.env.example)
++# Copier ce fichier sous le nom .env et adapter les variables selon l'environnement
++# ==============================================================================
++
++# Configuration Générale
++PROJECT_NAME="HierIci"
++ENVIRONMENT="development"
++DEFAULT_TERRITORY_SLUG="territoire-pilote"
++SECRET_KEY="change_this_to_a_secure_random_key_in_production"
++
++# Base de Données PostgreSQL + PostGIS
++POSTGRES_HOST=hierici-db
++POSTGRES_PORT=5433
++POSTGRES_DB=hierici
++POSTGRES_USER=hierici
++POSTGRES_PASSWORD=hierici_secret_password
++
++# URL de connexion async pour FastAPI (SQLAlchemy asyncpg)
++DATABASE_URL=postgresql+asyncpg://hierici:hierici_secret_password@hierici-db:5432/hierici
++
++# Stockage Multimédia (local ou s3)
++STORAGE_DRIVER=local
++LOCAL_STORAGE_PATH=/app/uploads
++
++# Configuration S3 (optionnelle, active si STORAGE_DRIVER=s3)
++# S3_ENDPOINT_URL=https://s3.fr-par.scw.cloud
++# S3_ACCESS_KEY_ID=
++# S3_SECRET_ACCESS_KEY=
++# S3_BUCKET_NAME=hierici-media
++# S3_REGION=fr-par
++
++# Frontend & CORS
++CORS_ORIGINS=["http://localhost:5173", "http://localhost:80", "http://localhost"]
++
+diff --git a/.gitignore b/.gitignore
+new file mode 100644
+index 0000000..2216ab2
+--- /dev/null
++++ b/.gitignore
+@@ -0,0 +1,52 @@
++# Python
++__pycache__/
++*.py[cod]
++*$py.class
++*.so
++.Python
++env/
++build/
++develop-eggs/
++dist/
++downloads/
++eggs/
++.eggs/
++lib/
++lib64/
++parts/
++sdist/
++var/
++wheels/
++*.egg-info/
++.installed.cfg
++*.egg
++.venv/
++venv/
++ENV/
++
++# Node
++node_modules/
++npm-debug.log*
++yarn-debug.log*
++yarn-error.log*
++.pnpm-debug.log*
++dist/
++dist-ssr/
++*.local
++
++# Environment & Secrets
++.env
++*.env.local
++
++# Docker & local storage
++uploads/
++pgdata/
++
++# IDE & OS
++.vscode/
++.idea/
++*.swp
++*.swo
++.DS_Store
++Thumbs.db
++
+diff --git a/Dockerfile.backend b/Dockerfile.backend
+new file mode 100644
+index 0000000..337232e
+--- /dev/null
++++ b/Dockerfile.backend
+@@ -0,0 +1,33 @@
++# Image officielle Python 3.12 slim
++FROM python:3.12-slim
++
++# Variables d'environnement Python
++ENV PYTHONUNBUFFERED=1 \
++    PYTHONDONTWRITEBYTECODE=1 \
++    PIP_NO_CACHE_DIR=1 \
++    PIP_DISABLE_PIP_VERSION_CHECK=1
++
++WORKDIR /app
++
++# Dépendances système pour psycopg2, PostGIS client et Pillow
++RUN apt-get update && apt-get install -y --no-install-recommends \
++    build-essential \
++    libpq-dev \
++    curl \
++    && rm -rf /var/lib/apt/lists/*
++
++# Installation des dépendances Python
++COPY backend/requirements.txt /app/requirements.txt
++RUN pip install --no-cache-dir -r requirements.txt
++
++# Copie du code applicatif
++COPY backend/ /app/
++
++# Création du dossier d'upload local
++RUN mkdir -p /app/uploads
++
++EXPOSE 8000
++
++# Commande de démarrage avec Uvicorn
++CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
++
+diff --git a/Dockerfile.frontend b/Dockerfile.frontend
+new file mode 100644
+index 0000000..2cd24fe
+--- /dev/null
++++ b/Dockerfile.frontend
+@@ -0,0 +1,21 @@
++# Étape 1 : Build Vite avec Node.js
++FROM node:20-alpine AS build-stage
++
++WORKDIR /app
++
++COPY frontend/package.json ./
++RUN npm install
++
++COPY frontend/ ./
++RUN npm run build
++
++# Étape 2 : Serveur web Nginx léger pour servir les fichiers statiques
++FROM nginx:alpine AS production-stage
++
++COPY --from=build-stage /app/dist /usr/share/nginx/html
++COPY frontend/nginx.conf /etc/nginx/conf.d/default.conf
++
++EXPOSE 80
++
++CMD ["nginx", "-g", "daemon off;"]
++
+diff --git a/backend/app/api/v1/admin/base.py b/backend/app/api/v1/admin/base.py
+new file mode 100644
+index 0000000..58b9b10
+--- /dev/null
++++ b/backend/app/api/v1/admin/base.py
+@@ -0,0 +1,32 @@
++from fastapi import APIRouter, Depends
++from app.core.auth import get_current_active_user, require_role
++from app.models.user import User, UserRole
++
++router = APIRouter(prefix="/admin", tags=["Administration & Sécurité"])
++
++
++@router.get("/status")
++async def get_admin_status(
++    current_user: User = Depends(get_current_active_user),
++):
++    """Route protégée vérifiant que l'utilisateur est authentifié (Contributeur ou Superadmin)."""
++    return {
++        "status": "authorized",
++        "user_id": str(current_user.id),
++        "email": current_user.email,
++        "role": current_user.role.value,
++        "territory_id": str(current_user.territory_id) if current_user.territory_id else None,
++    }
++
++
++@router.get("/superadmin/overview")
++async def get_superadmin_overview(
++    current_user: User = Depends(require_role(UserRole.SUPERADMIN)),
++):
++    """Route strictement réservée au rôle Superadmin."""
++    return {
++        "status": "ok",
++        "message": "Accès réservé au Superadmin validé",
++        "admin_email": current_user.email,
++    }
++
+diff --git a/backend/app/api/v1/auth.py b/backend/app/api/v1/auth.py
+new file mode 100644
+index 0000000..2fb0bd2
+--- /dev/null
++++ b/backend/app/api/v1/auth.py
+@@ -0,0 +1,70 @@
++from fastapi import APIRouter, Depends, HTTPException, status
++from fastapi.security import OAuth2PasswordRequestForm
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++from app.core.database import get_db
++from app.core.security import verify_password, create_access_token
++from app.core.auth import get_current_active_user
++from app.models.user import User
++from app.schemas.auth import LoginRequest, Token
++from app.schemas.user import UserRead
++
++router = APIRouter(prefix="/auth", tags=["Authentification"])
++
++
++@router.post("/login", response_model=Token)
++async def login(
++    login_data: LoginRequest,
++    db: AsyncSession = Depends(get_db),
++):
++    """Connexion avec email et mot de passe (format JSON). Retourne le token JWT."""
++    query = select(User).where(User.email == login_data.email.lower().strip())
++    result = await db.execute(query)
++    user = result.scalar_one_or_none()
++
++    if not user or not verify_password(login_data.password, user.password_hash):
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail={"error": {"code": "INVALID_CREDENTIALS", "message": "Email ou mot de passe incorrect."}},
++            headers={"WWW-Authenticate": "Bearer"},
++        )
++
++    if not user.is_active:
++        raise HTTPException(
++            status_code=status.HTTP_403_FORBIDDEN,
++            detail={"error": {"code": "ACCOUNT_DISABLED", "message": "Ce compte a été désactivé."}},
++        )
++
++    access_token = create_access_token(
++        subject=user.id,
++        email=user.email,
++        role=user.role.value,
++        territory_id=str(user.territory_id) if user.territory_id else None,
++    )
++
++    return {
++        "access_token": access_token,
++        "token_type": "bearer",
++        "user": user,
++    }
++
++
++@router.post("/login/form", response_model=Token, include_in_schema=False)
++async def login_oauth2_form(
++    form_data: OAuth2PasswordRequestForm = Depends(),
++    db: AsyncSession = Depends(get_db),
++):
++    """Endpoint pour la compatibilité avec le bouton Authorize de Swagger UI."""
++    return await login(
++        LoginRequest(email=form_data.username, password=form_data.password),
++        db=db,
++    )
++
++
++@router.get("/me", response_model=UserRead)
++async def get_my_profile(
++    current_user: User = Depends(get_current_active_user),
++):
++    """Retourne les informations du compte utilisateur actuellement authentifié."""
++    return current_user
++
+diff --git a/backend/app/api/v1/public/territory.py b/backend/app/api/v1/public/territory.py
+new file mode 100644
+index 0000000..b18da72
+--- /dev/null
++++ b/backend/app/api/v1/public/territory.py
+@@ -0,0 +1,15 @@
++from fastapi import APIRouter, Depends
++from app.models.territory import Territory
++from app.schemas.territory import TerritoryRead
++from app.core.territory import get_current_territory
++
++router = APIRouter(prefix="/territory", tags=["Territoire"])
++
++
++@router.get("/current", response_model=TerritoryRead)
++async def get_current_active_territory(
++    territory: Territory = Depends(get_current_territory),
++):
++    """Retourne les métadonnées et le cadrage cartographique du territoire actif."""
++    return territory
++
+diff --git a/backend/app/config.py b/backend/app/config.py
+new file mode 100644
+index 0000000..23eb925
+--- /dev/null
++++ b/backend/app/config.py
+@@ -0,0 +1,45 @@
++from typing import List, Union
++from pydantic import AnyHttpUrl, field_validator
++from pydantic_settings import BaseSettings, SettingsConfigDict
++
++
++class Settings(BaseSettings):
++    PROJECT_NAME: str = "HierIci"
++    ENVIRONMENT: str = "development"
++    DEFAULT_TERRITORY_SLUG: str = "territoire-pilote"
++    SECRET_KEY: str = "hierici-default-insecure-secret-key-change-in-prod"
++    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24  # 24 heures par défaut
++    
++    # Compte administrateur initial par défaut
++    ADMIN_EMAIL: str = "admin@hierici.local"
++    ADMIN_PASSWORD: str = "admin_hierici_2026"
++    ADMIN_FULL_NAME: str = "Super Administrateur"
++    
++    # Database
++    DATABASE_URL: str = "postgresql+asyncpg://hierici:hierici_secret_password@hierici-db:5432/hierici"
++    
++    # Storage
++    STORAGE_DRIVER: str = "local"
++    LOCAL_STORAGE_PATH: str = "/app/uploads"
++    S3_ENDPOINT_URL: str | None = None
++    S3_ACCESS_KEY_ID: str | None = None
++    S3_SECRET_ACCESS_KEY: str | None = None
++    S3_BUCKET_NAME: str | None = None
++    S3_REGION: str = "fr-par"
++    
++    # CORS
++    CORS_ORIGINS: List[str] = [
++        "http://localhost:5173",
++        "http://localhost:80",
++        "http://localhost",
++    ]
++
++    model_config = SettingsConfigDict(
++        env_file=".env",
++        env_file_encoding="utf-8",
++        extra="ignore"
++    )
++
++
++settings = Settings()
++
+diff --git a/backend/app/core/auth.py b/backend/app/core/auth.py
+new file mode 100644
+index 0000000..6f00aa6
+--- /dev/null
++++ b/backend/app/core/auth.py
+@@ -0,0 +1,80 @@
++import uuid
++from typing import Annotated
++from fastapi import Depends, HTTPException, status
++from fastapi.security import OAuth2PasswordBearer
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++from app.core.database import get_db
++from app.core.security import decode_access_token
++from app.models.user import User, UserRole
++
++oauth2_scheme = OAuth2PasswordBearer(
++    tokenUrl="/api/v1/auth/login",
++    auto_error=True,
++)
++
++
++async def get_current_user(
++    token: Annotated[str, Depends(oauth2_scheme)],
++    db: AsyncSession = Depends(get_db),
++) -> User:
++    """Dépendance validant le jeton JWT et retournant l'utilisateur correspondant."""
++    credentials_exception = HTTPException(
++        status_code=status.HTTP_401_UNAUTHORIZED,
++        detail={"error": {"code": "INVALID_CREDENTIALS", "message": "Jeton d'authentification invalide ou expiré"}},
++        headers={"WWW-Authenticate": "Bearer"},
++    )
++
++    payload = decode_access_token(token)
++    if payload is None:
++        raise credentials_exception
++
++    user_id_str: str | None = payload.get("sub")
++    if user_id_str is None:
++        raise credentials_exception
++
++    try:
++        user_uuid = uuid.UUID(user_id_str)
++    except ValueError:
++        raise credentials_exception
++
++    query = select(User).where(User.id == user_uuid)
++    result = await db.execute(query)
++    user = result.scalar_one_or_none()
++
++    if user is None:
++        raise credentials_exception
++
++    return user
++
++
++async def get_current_active_user(
++    current_user: Annotated[User, Depends(get_current_user)],
++) -> User:
++    """Vérifie que le compte de l'utilisateur est actif."""
++    if not current_user.is_active:
++        raise HTTPException(
++            status_code=status.HTTP_403_FORBIDDEN,
++            detail={"error": {"code": "ACCOUNT_DISABLED", "message": "Ce compte utilisateur a été désactivé."}},
++        )
++    return current_user
++
++
++def require_role(required_role: UserRole):
++    """Générateur de dépendance vérifiant que l'utilisateur possède le rôle requis."""
++    async def role_checker(
++        current_user: Annotated[User, Depends(get_current_active_user)],
++    ) -> User:
++        # Le superadmin a toujours accès à tout
++        if current_user.role == UserRole.SUPERADMIN:
++            return current_user
++
++        if current_user.role != required_role:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={"error": {"code": "INSUFFICIENT_PERMISSIONS", "message": "Droits insuffisants pour cette action."}},
++            )
++        return current_user
++
++    return role_checker
++
+diff --git a/backend/app/core/database.py b/backend/app/core/database.py
+new file mode 100644
+index 0000000..fbd0e57
+--- /dev/null
++++ b/backend/app/core/database.py
+@@ -0,0 +1,50 @@
++from collections.abc import AsyncGenerator
++from sqlalchemy.ext.asyncio import (
++    AsyncSession,
++    async_sessionmaker,
++    create_async_engine,
++)
++from sqlalchemy.orm import DeclarativeBase
++from sqlalchemy import text
++from app.config import settings
++
++# Create async engine for PostgreSQL
++engine = create_async_engine(
++    settings.DATABASE_URL,
++    echo=(settings.ENVIRONMENT == "development"),
++    future=True,
++    pool_pre_ping=True,
++)
++
++# Async session factory
++AsyncSessionLocal = async_sessionmaker(
++    bind=engine,
++    class_=AsyncSession,
++    expire_on_commit=False,
++    autoflush=False,
++)
++
++
++class Base(DeclarativeBase):
++    """Base model class for all SQLAlchemy declarative models."""
++    pass
++
++
++async def get_db() -> AsyncGenerator[AsyncSession, None]:
++    """Dependency for providing database sessions to FastAPI routes."""
++    async with AsyncSessionLocal() as session:
++        try:
++            yield session
++        finally:
++            await session.close()
++
++
++async def check_db_connection() -> bool:
++    """Verifies that the database is reachable and responsive."""
++    try:
++        async with engine.connect() as conn:
++            await conn.execute(text("SELECT 1"))
++        return True
++    except Exception:
++        return False
++
+diff --git a/backend/app/core/init_db.py b/backend/app/core/init_db.py
+new file mode 100644
+index 0000000..8cff96b
+--- /dev/null
++++ b/backend/app/core/init_db.py
+@@ -0,0 +1,69 @@
++import logging
++from sqlalchemy import text, select
++from app.core.database import engine, AsyncSessionLocal, Base
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.core.security import hash_password
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++async def init_db() -> None:
++    """Initialise l'extension PostGIS, crée les tables et le territoire initial + superadmin si besoin."""
++    async with engine.begin() as conn:
++        try:
++            # Active l'extension PostGIS
++            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
++            logger.info("Extension PostGIS vérifiée / activée avec succès.")
++        except Exception as e:
++            logger.warning(f"Note sur l'activation PostGIS: {e}")
++
++        # Crée toutes les tables déclarées (territories, users, etc.) si elles n'existent pas
++        await conn.run_sync(Base.metadata.create_all)
++        logger.info("Schéma des tables de la base de données synchronisé.")
++
++    # Vérification et initialisation des données de base
++    async with AsyncSessionLocal() as session:
++        # 1. Territoire pilote
++        result_territory = await session.execute(
++            select(Territory).where(Territory.slug == settings.DEFAULT_TERRITORY_SLUG)
++        )
++        existing_territory = result_territory.scalar_one_or_none()
++
++        if not existing_territory:
++            default_territory = Territory(
++                slug=settings.DEFAULT_TERRITORY_SLUG,
++                name="Territoire Pilote",
++                center_lat=43.1242,
++                center_lng=5.9280,
++                default_zoom=13,
++            )
++            session.add(default_territory)
++            await session.commit()
++            await session.refresh(default_territory)
++            existing_territory = default_territory
++            logger.info(f"Territoire par défaut créé: '{settings.DEFAULT_TERRITORY_SLUG}'.")
++        else:
++            logger.info(f"Territoire '{settings.DEFAULT_TERRITORY_SLUG}' déjà existant.")
++
++        # 2. Compte Superadmin initial
++        result_user = await session.execute(
++            select(User).where(User.email == settings.ADMIN_EMAIL)
++        )
++        existing_admin = result_user.scalar_one_or_none()
++
++        if not existing_admin:
++            admin_user = User(
++                email=settings.ADMIN_EMAIL,
++                password_hash=hash_password(settings.ADMIN_PASSWORD),
++                full_name=settings.ADMIN_FULL_NAME,
++                role=UserRole.SUPERADMIN,
++                territory_id=existing_territory.id,
++                is_active=True,
++            )
++            session.add(admin_user)
++            await session.commit()
++            logger.info(f"Compte Superadmin initial créé: '{settings.ADMIN_EMAIL}'.")
++        else:
++            logger.info(f"Compte Superadmin '{settings.ADMIN_EMAIL}' déjà existant.")
+diff --git a/backend/app/core/security.py b/backend/app/core/security.py
+new file mode 100644
+index 0000000..e1dcd4e
+--- /dev/null
++++ b/backend/app/core/security.py
+@@ -0,0 +1,56 @@
++from datetime import datetime, timedelta, timezone
++from typing import Any, Union
++from jose import jwt, JWTError
++from passlib.context import CryptContext
++from app.config import settings
++
++# Contexte de hachage de mot de passe (bcrypt)
++pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
++
++ALGORITHM = "HS256"
++
++
++def verify_password(plain_password: str, hashed_password: str) -> bool:
++    """Vérifie si un mot de passe en clair correspond au hash."""
++    return pwd_context.verify(plain_password, hashed_password)
++
++
++def hash_password(password: str) -> str:
++    """Génère un hash bcrypt sécurisé pour un mot de passe."""
++    return pwd_context.hash(password)
++
++
++def create_access_token(
++    subject: Union[str, Any],
++    email: str,
++    role: str,
++    territory_id: Union[str, None] = None,
++    expires_delta: timedelta | None = None,
++) -> str:
++    """Crée un jeton JWT d'accès signé."""
++    now = datetime.now(timezone.utc)
++    if expires_delta:
++        expire = now + expires_delta
++    else:
++        expire = now + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
++
++    to_encode = {
++        "sub": str(subject),
++        "email": email,
++        "role": role,
++        "territory_id": str(territory_id) if territory_id else None,
++        "iat": now,
++        "exp": expire,
++    }
++    encoded_jwt = jwt.encode(to_encode, settings.SECRET_KEY, algorithm=ALGORITHM)
++    return encoded_jwt
++
++
++def decode_access_token(token: str) -> dict[str, Any] | None:
++    """Décode et valide un jeton JWT d'accès."""
++    try:
++        payload = jwt.decode(token, settings.SECRET_KEY, algorithms=[ALGORITHM])
++        return payload
++    except JWTError:
++        return None
++
+diff --git a/backend/app/core/territory.py b/backend/app/core/territory.py
+new file mode 100644
+index 0000000..b53f560
+--- /dev/null
++++ b/backend/app/core/territory.py
+@@ -0,0 +1,56 @@
++from fastapi import Request, HTTPException, Depends, status
++from sqlalchemy import select
++from sqlalchemy.ext.asyncio import AsyncSession
++from app.core.database import get_db
++from app.models.territory import Territory
++from app.config import settings
++
++
++def extract_territory_slug_from_request(request: Request) -> str:
++    """Extrait le slug de territoire selon la priorité :
++    1. En-tête HTTP 'X-Territory-Slug'
++    2. Sous-domaine hôte (ex: 'toulon.hierici.fr' -> 'toulon')
++    3. Fallback variable DEFAULT_TERRITORY_SLUG
++    """
++    # 1. En-tête direct
++    header_slug = request.headers.get("X-Territory-Slug")
++    if header_slug and header_slug.strip():
++        return header_slug.strip().lower()
++
++    # 2. Sous-domaine (exclut localhost, 127.0.0.1 ou noms sans sous-domaine)
++    host = request.headers.get("host", "").split(":")[0]
++    parts = host.split(".")
++    if len(parts) >= 3 and parts[0] not in ("www", "api"):
++        return parts[0].lower()
++
++    # 3. Fallback variable d'environnement
++    return settings.DEFAULT_TERRITORY_SLUG.lower()
++
++
++async def get_current_territory(
++    request: Request,
++    db: AsyncSession = Depends(get_db),
++) -> Territory:
++    """Dépendance FastAPI injectant et vérifiant le territoire actif pour les requêtes."""
++    slug = extract_territory_slug_from_request(request)
++
++    query = select(Territory).where(Territory.slug == slug)
++    result = await db.execute(query)
++    territory = result.scalar_one_or_none()
++
++    if not territory:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "TERRITORY_NOT_FOUND",
++                    "message": f"Le territoire '{slug}' est introuvable ou n'est pas configuré.",
++                    "slug": slug,
++                }
++            },
++        )
++
++    # Injection dans le state de la requête pour réutilisation dans les routes suivantes
++    request.state.territory = territory
++    return territory
++
+diff --git a/backend/app/main.py b/backend/app/main.py
+new file mode 100644
+index 0000000..b599d08
+--- /dev/null
++++ b/backend/app/main.py
+@@ -0,0 +1,87 @@
++import logging
++from contextlib import asynccontextmanager
++from fastapi import FastAPI, status
++from fastapi.responses import JSONResponse
++from fastapi.staticfiles import StaticFiles
++from fastapi.middleware.cors import CORSMiddleware
++from pathlib import Path
++from app.config import settings
++from app.core.database import check_db_connection, engine
++from app.core.init_db import init_db
++from app.api.v1 import api_v1_router
++
++logging.basicConfig(level=logging.INFO)
++logger = logging.getLogger(__name__)
++
++
++@asynccontextmanager
++async def lifespan(app: FastAPI):
++    # Startup: initialisation de la base de données et du territoire par défaut
++    logger.info("Démarrage de l'API HierIci...")
++    try:
++        await init_db()
++    except Exception as e:
++        logger.error(f"Erreur lors de l'initialisation de la BDD : {e}")
++    yield
++    # Shutdown: fermeture propre des connexions
++    logger.info("Arrêt de l'API HierIci...")
++    await engine.dispose()
++
++
++app = FastAPI(
++    title=settings.PROJECT_NAME,
++    description="API REST & Géospatiale pour la plateforme HierIci",
++    version="0.1.0",
++    lifespan=lifespan,
++)
++
++# Configuration CORS
++app.add_middleware(
++    CORSMiddleware,
++    allow_origins=settings.CORS_ORIGINS,
++    allow_credentials=True,
++    allow_methods=["*"],
++    allow_headers=["*"],
++)
++
++# Inclusion des routes v1
++app.include_router(api_v1_router)
++
++# Montage du stockage local pour servir les médias statiques
++if settings.STORAGE_DRIVER == "local":
++    upload_path = Path(settings.LOCAL_STORAGE_PATH)
++    upload_path.mkdir(parents=True, exist_ok=True)
++    app.mount("/uploads", StaticFiles(directory=str(upload_path)), name="uploads")
++
++
++
++@app.get("/api/health", tags=["Système"])
++async def health_check():
++    """Vérification de l'état de l'API et de la connexion à la base de données."""
++    is_db_connected = await check_db_connection()
++    if is_db_connected:
++        return {
++            "status": "ok",
++            "database": "connected",
++            "environment": settings.ENVIRONMENT,
++            "default_territory": settings.DEFAULT_TERRITORY_SLUG,
++        }
++    else:
++        return JSONResponse(
++            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
++            content={
++                "status": "error",
++                "database": "disconnected",
++                "environment": settings.ENVIRONMENT,
++            },
++        )
++
++
++@app.get("/", tags=["Racine"])
++async def root():
++    return {
++        "message": f"Bienvenue sur l'API {settings.PROJECT_NAME}",
++        "docs_url": "/docs",
++        "health_check": "/api/health",
++        "territory_current": "/api/v1/territory/current",
++    }
+diff --git a/backend/app/models/territory.py b/backend/app/models/territory.py
+new file mode 100644
+index 0000000..b29745e
+--- /dev/null
++++ b/backend/app/models/territory.py
+@@ -0,0 +1,50 @@
++import uuid
++from datetime import datetime, timezone
++from sqlalchemy import String, Float, Integer, DateTime
++from sqlalchemy.dialects.postgresql import UUID
++from sqlalchemy.orm import Mapped, mapped_column
++from app.core.database import Base
++
++
++class Territory(Base):
++    __tablename__ = "territories"
++
++    id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        primary_key=True,
++        default=uuid.uuid4,
++    )
++    slug: Mapped[str] = mapped_column(
++        String(100),
++        unique=True,
++        index=True,
++        nullable=False,
++    )
++    name: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    center_lat: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++        default=43.1242,
++    )
++    center_lng: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++        default=5.9280,
++    )
++    default_zoom: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        default=13,
++    )
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++
++    def __repr__(self) -> str:
++        return f"<Territory(slug='{self.slug}', name='{self.name}')>"
++
+diff --git a/backend/app/models/user.py b/backend/app/models/user.py
+new file mode 100644
+index 0000000..1152357
+--- /dev/null
++++ b/backend/app/models/user.py
+@@ -0,0 +1,64 @@
++import uuid
++from datetime import datetime, timezone
++import enum
++from sqlalchemy import String, Boolean, DateTime, Enum, ForeignKey
++from sqlalchemy.dialects.postgresql import UUID
++from sqlalchemy.orm import Mapped, mapped_column, relationship
++from app.core.database import Base
++
++
++class UserRole(str, enum.Enum):
++    SUPERADMIN = "superadmin"
++    CONTRIBUTOR = "contributor"
++
++
++class User(Base):
++    __tablename__ = "users"
++
++    id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        primary_key=True,
++        default=uuid.uuid4,
++    )
++    territory_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("territories.id", ondelete="SET NULL"),
++        nullable=True,
++        index=True,
++    )
++    email: Mapped[str] = mapped_column(
++        String(255),
++        unique=True,
++        index=True,
++        nullable=False,
++    )
++    password_hash: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    full_name: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    role: Mapped[UserRole] = mapped_column(
++        Enum(UserRole, name="user_role_enum"),
++        default=UserRole.CONTRIBUTOR,
++        nullable=False,
++    )
++    is_active: Mapped[bool] = mapped_column(
++        Boolean,
++        default=True,
++        nullable=False,
++    )
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++
++    # Relations
++    territory = relationship("Territory", backref="users", lazy="selectin")
++
++    def __repr__(self) -> str:
++        return f"<User(email='{self.email}', role='{self.role}')>"
++
+diff --git a/backend/app/schemas/auth.py b/backend/app/schemas/auth.py
+new file mode 100644
+index 0000000..5318baa
+--- /dev/null
++++ b/backend/app/schemas/auth.py
+@@ -0,0 +1,22 @@
++import uuid
++from pydantic import BaseModel, EmailStr
++from app.schemas.user import UserRead
++
++
++class LoginRequest(BaseModel):
++    email: EmailStr
++    password: str
++
++
++class Token(BaseModel):
++    access_token: str
++    token_type: str = "bearer"
++    user: UserRead
++
++
++class TokenPayload(BaseModel):
++    sub: str | None = None
++    email: str | None = None
++    role: str | None = None
++    territory_id: str | None = None
++
+diff --git a/backend/app/schemas/territory.py b/backend/app/schemas/territory.py
+new file mode 100644
+index 0000000..18e60bc
+--- /dev/null
++++ b/backend/app/schemas/territory.py
+@@ -0,0 +1,23 @@
++import uuid
++from datetime import datetime
++from pydantic import BaseModel, ConfigDict, Field
++
++
++class TerritoryBase(BaseModel):
++    slug: str = Field(..., max_length=100, description="Identifiant unique d'URL du territoire")
++    name: str = Field(..., max_length=255, description="Nom d'affichage du territoire")
++    center_lat: float = Field(..., ge=-90.0, le=90.0, description="Latitude du centre par défaut")
++    center_lng: float = Field(..., ge=-180.0, le=180.0, description="Longitude du centre par défaut")
++    default_zoom: int = Field(default=13, ge=1, le=22, description="Niveau de zoom cartographique par défaut")
++
++
++class TerritoryCreate(TerritoryBase):
++    pass
++
++
++class TerritoryRead(TerritoryBase):
++    id: uuid.UUID
++    created_at: datetime
++
++    model_config = ConfigDict(from_attributes=True)
++
+diff --git a/backend/app/schemas/user.py b/backend/app/schemas/user.py
+new file mode 100644
+index 0000000..9d5b045
+--- /dev/null
++++ b/backend/app/schemas/user.py
+@@ -0,0 +1,28 @@
++import uuid
++from datetime import datetime
++from pydantic import BaseModel, EmailStr, ConfigDict
++from app.models.user import UserRole
++
++
++class UserBase(BaseModel):
++    email: EmailStr
++    full_name: str
++    role: UserRole = UserRole.CONTRIBUTOR
++    territory_id: uuid.UUID | None = None
++    is_active: bool = True
++
++
++class UserCreate(BaseModel):
++    email: EmailStr
++    password: str
++    full_name: str
++    role: UserRole = UserRole.CONTRIBUTOR
++    territory_id: uuid.UUID | None = None
++
++
++class UserRead(UserBase):
++    id: uuid.UUID
++    created_at: datetime
++
++    model_config = ConfigDict(from_attributes=True)
++
+diff --git a/backend/app/services/storage/__init__.py b/backend/app/services/storage/__init__.py
+new file mode 100644
+index 0000000..cfb29f6
+--- /dev/null
++++ b/backend/app/services/storage/__init__.py
+@@ -0,0 +1,23 @@
++from functools import lru_cache
++from app.config import settings
++from app.services.storage.base import StorageDriver
++from app.services.storage.local import LocalStorageDriver
++from app.services.storage.s3 import S3StorageDriver
++
++
++@lru_cache()
++def get_storage_driver() -> StorageDriver:
++    """Factory instanciant le pilote de stockage configuré par variable d'environnement."""
++    driver_type = settings.STORAGE_DRIVER.lower().strip()
++    if driver_type == "s3":
++        return S3StorageDriver()
++    return LocalStorageDriver()
++
++
++__all__ = [
++    "StorageDriver",
++    "LocalStorageDriver",
++    "S3StorageDriver",
++    "get_storage_driver",
++]
++
+diff --git a/backend/app/services/storage/base.py b/backend/app/services/storage/base.py
+new file mode 100644
+index 0000000..b91d889
+--- /dev/null
++++ b/backend/app/services/storage/base.py
+@@ -0,0 +1,36 @@
++from abc import ABC, abstractmethod
++
++
++class StorageDriver(ABC):
++    """Interface abstraite définissant le contrat pour tous les pilotes de stockage média."""
++
++    @abstractmethod
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        """Enregistre le contenu binaire à la destination spécifiée et renvoie l'URL d'accès."""
++        pass
++
++    @abstractmethod
++    async def read(self, path: str) -> bytes:
++        """Lit et retourne le contenu binaire du fichier situé au chemin indiqué."""
++        pass
++
++    @abstractmethod
++    async def delete(self, path: str) -> bool:
++        """Supprime le fichier du stockage. Renvoie True si supprimé, False s'il n'existait pas."""
++        pass
++
++    @abstractmethod
++    async def exists(self, path: str) -> bool:
++        """Indique si le fichier existe dans le stockage."""
++        pass
++
++    @abstractmethod
++    async def get_url(self, path: str) -> str:
++        """Génère l'URL d'accès public ou relative pour le fichier."""
++        pass
++
+diff --git a/backend/app/services/storage/local.py b/backend/app/services/storage/local.py
+new file mode 100644
+index 0000000..7d1b414
+--- /dev/null
++++ b/backend/app/services/storage/local.py
+@@ -0,0 +1,71 @@
++import os
++import asyncio
++from pathlib import Path
++from app.services.storage.base import StorageDriver
++from app.config import settings
++
++
++class LocalStorageDriver(StorageDriver):
++    """Pilote de stockage écrivant sur le système de fichiers local / volume persistant Docker."""
++
++    def __init__(self, base_dir: str | None = None):
++        self.base_dir = Path(base_dir or settings.LOCAL_STORAGE_PATH).resolve()
++        self.base_dir.mkdir(parents=True, exist_ok=True)
++
++    def _resolve_path(self, relative_path: str) -> Path:
++        # Sécurise contre les traversées de répertoire
++        clean_rel = Path(relative_path.lstrip("/"))
++        full_path = (self.base_dir / clean_rel).resolve()
++        if not str(full_path).startswith(str(self.base_dir)):
++            raise ValueError(f"Tentative de traversée de répertoire non autorisée : {relative_path}")
++        return full_path
++
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        target_path = self._resolve_path(destination_path)
++        target_path.parent.mkdir(parents=True, exist_ok=True)
++
++        def _write():
++            with open(target_path, "wb") as f:
++                f.write(content)
++
++        await asyncio.to_thread(_write)
++        return await self.get_url(destination_path)
++
++    async def read(self, path: str) -> bytes:
++        target_path = self._resolve_path(path)
++        if not target_path.is_file():
++            raise FileNotFoundError(f"Fichier introuvable sur le stockage local : {path}")
++
++        def _read():
++            with open(target_path, "rb") as f:
++                return f.read()
++
++        return await asyncio.to_thread(_read)
++
++    async def delete(self, path: str) -> bool:
++        target_path = self._resolve_path(path)
++        if not target_path.exists():
++            return False
++
++        def _delete():
++            try:
++                target_path.unlink()
++                return True
++            except OSError:
++                return False
++
++        return await asyncio.to_thread(_delete)
++
++    async def exists(self, path: str) -> bool:
++        target_path = self._resolve_path(path)
++        return target_path.is_file()
++
++    async def get_url(self, path: str) -> str:
++        clean_path = path.lstrip("/")
++        return f"/uploads/{clean_path}"
++
+diff --git a/backend/app/services/storage/s3.py b/backend/app/services/storage/s3.py
+new file mode 100644
+index 0000000..11bb622
+--- /dev/null
++++ b/backend/app/services/storage/s3.py
+@@ -0,0 +1,108 @@
++import asyncio
++from typing import Any
++import boto3
++from botocore.exceptions import ClientError
++from app.services.storage.base import StorageDriver
++from app.config import settings
++
++
++class S3StorageDriver(StorageDriver):
++    """Pilote de stockage pour S3 et compatibles (MinIO, Cloudflare R2, Scaleway, AWS)."""
++
++    def __init__(
++        self,
++        bucket_name: str | None = None,
++        endpoint_url: str | None = None,
++        access_key_id: str | None = None,
++        secret_access_key: str | None = None,
++        region: str | None = None,
++    ):
++        self.bucket_name = bucket_name or settings.S3_BUCKET_NAME or "hierici-media"
++        self.endpoint_url = endpoint_url or settings.S3_ENDPOINT_URL
++        self.access_key_id = access_key_id or settings.S3_ACCESS_KEY_ID
++        self.secret_access_key = secret_access_key or settings.S3_SECRET_ACCESS_KEY
++        self.region = region or settings.S3_REGION or "fr-par"
++
++        self._client: Any = None
++
++    def _get_client(self):
++        if self._client is None:
++            self._client = boto3.client(
++                "s3",
++                endpoint_url=self.endpoint_url,
++                aws_access_key_id=self.access_key_id,
++                aws_secret_access_key=self.secret_access_key,
++                region_name=self.region,
++            )
++        return self._client
++
++    def _clean_path(self, path: str) -> str:
++        return path.lstrip("/")
++
++    async def save(
++        self,
++        content: bytes,
++        destination_path: str,
++        content_type: str = "application/octet-stream",
++    ) -> str:
++        key = self._clean_path(destination_path)
++        client = self._get_client()
++
++        def _upload():
++            client.put_object(
++                Bucket=self.bucket_name,
++                Key=key,
++                Body=content,
++                ContentType=content_type,
++            )
++
++        await asyncio.to_thread(_upload)
++        return await self.get_url(key)
++
++    async def read(self, path: str) -> bytes:
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _download():
++            try:
++                response = client.get_object(Bucket=self.bucket_name, Key=key)
++                return response["Body"].read()
++            except ClientError as e:
++                if e.response["Error"]["Code"] in ("404", "NoSuchKey"):
++                    raise FileNotFoundError(f"Objet introuvable dans le bucket S3 : {path}")
++                raise
++
++        return await asyncio.to_thread(_download)
++
++    async def delete(self, path: str) -> bool:
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _delete():
++            try:
++                client.delete_object(Bucket=self.bucket_name, Key=key)
++                return True
++            except ClientError:
++                return False
++
++        return await asyncio.to_thread(_delete)
++
++    async def exists(self, path: str) -> bool:
++        key = self._clean_path(path)
++        client = self._get_client()
++
++        def _head():
++            try:
++                client.head_object(Bucket=self.bucket_name, Key=key)
++                return True
++            except ClientError:
++                return False
++
++        return await asyncio.to_thread(_head)
++
++    async def get_url(self, path: str) -> str:
++        key = self._clean_path(path)
++        if self.endpoint_url:
++            return f"{self.endpoint_url.rstrip('/')}/{self.bucket_name}/{key}"
++        return f"https://{self.bucket_name}.s3.{self.region}.amazonaws.com/{key}"
++
+diff --git a/backend/tests/test_auth.py b/backend/tests/test_auth.py
+new file mode 100644
+index 0000000..8d1748a
+--- /dev/null
++++ b/backend/tests/test_auth.py
+@@ -0,0 +1,90 @@
++import uuid
++from datetime import datetime, timezone
++import pytest
++from unittest.mock import patch, AsyncMock
++from fastapi.testclient import TestClient
++from app.main import app
++from app.models.user import User, UserRole
++from app.core.security import hash_password, create_access_token
++
++client = TestClient(app)
++
++
++@pytest.fixture
++def mock_users():
++    superadmin = User(
++        id=uuid.uuid4(),
++        email="superadmin@hierici.local",
++        password_hash=hash_password("SuperSecret123"),
++        full_name="Super Admin",
++        role=UserRole.SUPERADMIN,
++        is_active=True,
++        created_at=datetime.now(timezone.utc),
++    )
++    contributor = User(
++        id=uuid.uuid4(),
++        email="contributor@hierici.local",
++        password_hash=hash_password("ContributorSecret123"),
++        full_name="Jean Contributeur",
++        role=UserRole.CONTRIBUTOR,
++        is_active=True,
++        created_at=datetime.now(timezone.utc),
++    )
++    return {"superadmin": superadmin, "contributor": contributor}
++
++
++def test_protected_route_without_token():
++    response = client.get("/api/v1/admin/status")
++    assert response.status_code == 401
++    assert "WWW-Authenticate" in response.headers
++
++
++@patch("app.core.auth.get_current_active_user")
++def test_admin_status_with_contributor(mock_get_user, mock_users):
++    mock_get_user.return_value = mock_users["contributor"]
++    token = create_access_token(
++        subject=mock_users["contributor"].id,
++        email=mock_users["contributor"].email,
++        role="contributor",
++    )
++    response = client.get(
++        "/api/v1/admin/status",
++        headers={"Authorization": f"Bearer {token}"},
++    )
++    assert response.status_code == 200
++    data = response.json()
++    assert data["status"] == "authorized"
++    assert data["role"] == "contributor"
++
++
++@patch("app.core.auth.get_current_active_user")
++def test_superadmin_route_forbidden_for_contributor(mock_get_user, mock_users):
++    mock_get_user.return_value = mock_users["contributor"]
++    token = create_access_token(
++        subject=mock_users["contributor"].id,
++        email=mock_users["contributor"].email,
++        role="contributor",
++    )
++    response = client.get(
++        "/api/v1/admin/superadmin/overview",
++        headers={"Authorization": f"Bearer {token}"},
++    )
++    assert response.status_code == 403
++
++
++@patch("app.core.auth.get_current_active_user")
++def test_superadmin_route_allowed_for_superadmin(mock_get_user, mock_users):
++    mock_get_user.return_value = mock_users["superadmin"]
++    token = create_access_token(
++        subject=mock_users["superadmin"].id,
++        email=mock_users["superadmin"].email,
++        role="superadmin",
++    )
++    response = client.get(
++        "/api/v1/admin/superadmin/overview",
++        headers={"Authorization": f"Bearer {token}"},
++    )
++    assert response.status_code == 200
++    data = response.json()
++    assert data["status"] == "ok"
++
+diff --git a/backend/tests/test_health.py b/backend/tests/test_health.py
+new file mode 100644
+index 0000000..ecb0735
+--- /dev/null
++++ b/backend/tests/test_health.py
+@@ -0,0 +1,35 @@
++import pytest
++from unittest.mock import patch, AsyncMock
++from fastapi.testclient import TestClient
++from app.main import app
++
++client = TestClient(app)
++
++
++def test_root_endpoint():
++    response = client.get("/")
++    assert response.status_code == 200
++    data = response.json()
++    assert "HierIci" in data["message"]
++    assert data["health_check"] == "/api/health"
++
++
++@patch("app.main.check_db_connection", new_callable=AsyncMock)
++def test_health_check_connected(mock_check_db):
++    mock_check_db.return_value = True
++    response = client.get("/api/health")
++    assert response.status_code == 200
++    data = response.json()
++    assert data["status"] == "ok"
++    assert data["database"] == "connected"
++
++
++@patch("app.main.check_db_connection", new_callable=AsyncMock)
++def test_health_check_disconnected(mock_check_db):
++    mock_check_db.return_value = False
++    response = client.get("/api/health")
++    assert response.status_code == 503
++    data = response.json()
++    assert data["status"] == "error"
++    assert data["database"] == "disconnected"
++
+diff --git a/backend/tests/test_storage.py b/backend/tests/test_storage.py
+new file mode 100644
+index 0000000..0b1b2d0
+--- /dev/null
++++ b/backend/tests/test_storage.py
+@@ -0,0 +1,100 @@
++import pytest
++import shutil
++import tempfile
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++from app.services.storage.local import LocalStorageDriver
++from app.services.storage.s3 import S3StorageDriver
++from app.services.storage import get_storage_driver
++
++
++@pytest.fixture
++def temp_storage():
++    temp_dir = tempfile.mkdtemp()
++    driver = LocalStorageDriver(base_dir=temp_dir)
++    yield driver, temp_dir
++    shutil.rmtree(temp_dir, ignore_errors=True)
++
++
++@pytest.mark.asyncio
++async def test_local_storage_lifecycle(temp_storage):
++    driver, temp_dir = temp_storage
++    test_content = b"Contenu de test pour HierIci"
++    test_path = "photos/1912/test_image.webp"
++
++    # 1. Sauvegarde
++    url = await driver.save(test_content, test_path, content_type="image/webp")
++    assert url == "/uploads/photos/1912/test_image.webp"
++
++    # 2. Vérification existence
++    exists = await driver.exists(test_path)
++    assert exists is True
++
++    # 3. Lecture
++    content = await driver.read(test_path)
++    assert content == test_content
++
++    # 4. Suppression
++    deleted = await driver.delete(test_path)
++    assert deleted is True
++
++    # 5. Vérification post-suppression
++    exists_after = await driver.exists(test_path)
++    assert exists_after is False
++
++    with pytest.raises(FileNotFoundError):
++        await driver.read(test_path)
++
++
++@pytest.mark.asyncio
++async def test_local_storage_path_traversal_prevention(temp_storage):
++    driver, _ = temp_storage
++    with pytest.raises(ValueError):
++        await driver.save(b"bad", "../../etc/passwd")
++
++
++@pytest.mark.asyncio
++async def test_s3_storage_driver_mocked():
++    with patch("boto3.client") as mock_boto:
++        mock_s3 = MagicMock()
++        mock_boto.return_value = mock_s3
++
++        s3_driver = S3StorageDriver(
++            bucket_name="test-bucket",
++            endpoint_url="https://s3.fr-par.scw.cloud",
++            access_key_id="dummy_key",
++            secret_access_key="dummy_secret",
++            region="fr-par",
++        )
++
++        test_data = b"image_data_s3"
++        dest_path = "photos/2026/vue.webp"
++
++        # Test Save
++        url = await s3_driver.save(test_data, dest_path, "image/webp")
++        assert url == "https://s3.fr-par.scw.cloud/test-bucket/photos/2026/vue.webp"
++        mock_s3.put_object.assert_called_once_with(
++            Bucket="test-bucket",
++            Key="photos/2026/vue.webp",
++            Body=test_data,
++            ContentType="image/webp",
++        )
++
++        # Test Exists
++        mock_s3.head_object.return_value = {}
++        exists = await s3_driver.exists(dest_path)
++        assert exists is True
++
++        # Test Delete
++        deleted = await s3_driver.delete(dest_path)
++        assert deleted is True
++        mock_s3.delete_object.assert_called_once_with(
++            Bucket="test-bucket",
++            Key="photos/2026/vue.webp",
++        )
++
++
++def test_get_storage_driver_factory():
++    driver = get_storage_driver()
++    assert isinstance(driver, LocalStorageDriver)
++
+diff --git a/backend/tests/test_territory.py b/backend/tests/test_territory.py
+new file mode 100644
+index 0000000..eecc653
+--- /dev/null
++++ b/backend/tests/test_territory.py
+@@ -0,0 +1,54 @@
++import uuid
++from datetime import datetime, timezone
++import pytest
++from unittest.mock import patch, AsyncMock, MagicMock
++from fastapi.testclient import TestClient
++from app.main import app
++from app.models.territory import Territory
++from app.core.territory import extract_territory_slug_from_request
++
++client = TestClient(app)
++
++
++def test_extract_territory_slug_header():
++    mock_request = MagicMock()
++    mock_request.headers.get.side_effect = lambda key, default=None: "toulon" if key == "X-Territory-Slug" else ""
++    slug = extract_territory_slug_from_request(mock_request)
++    assert slug == "toulon"
++
++
++def test_extract_territory_slug_subdomain():
++    mock_request = MagicMock()
++    mock_request.headers.get.side_effect = lambda key, default=None: "marseille.hierici.fr:8000" if key == "host" else None
++    slug = extract_territory_slug_from_request(mock_request)
++    assert slug == "marseille"
++
++
++def test_extract_territory_slug_fallback():
++    mock_request = MagicMock()
++    mock_request.headers.get.return_value = None
++    slug = extract_territory_slug_from_request(mock_request)
++    assert slug == "territoire-pilote"
++
++
++@patch("app.core.territory.get_current_territory")
++def test_get_current_territory_endpoint(mock_get_territory):
++    dummy_territory = Territory(
++        id=uuid.uuid4(),
++        slug="territoire-pilote",
++        name="Territoire Pilote",
++        center_lat=43.1242,
++        center_lng=5.9280,
++        default_zoom=13,
++        created_at=datetime.now(timezone.utc),
++    )
++    mock_get_territory.return_value = dummy_territory
++
++    response = client.get("/api/v1/territory/current")
++    assert response.status_code == 200
++    data = response.json()
++    assert data["slug"] == "territoire-pilote"
++    assert data["name"] == "Territoire Pilote"
++    assert data["center_lat"] == 43.1242
++    assert data["center_lng"] == 5.9280
++
+diff --git a/docker-compose.yml b/docker-compose.yml
+new file mode 100644
+index 0000000..7c1b7a0
+--- /dev/null
++++ b/docker-compose.yml
+@@ -0,0 +1,72 @@
++services:
++  # Base de données spatiale PostgreSQL 16 + PostGIS 3.4
++  hierici-db:
++    image: postgis/postgis:16-3.4-alpine
++    container_name: hierici-db
++    restart: unless-stopped
++    environment:
++      POSTGRES_DB: ${POSTGRES_DB:-hierici}
++      POSTGRES_USER: ${POSTGRES_USER:-hierici}
++      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hierici_secret_password}
++    ports:
++      - "${POSTGRES_PORT:-5433}:5432"
++    volumes:
++      - pgdata:/var/lib/postgresql/data
++    healthcheck:
++      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hierici} -d ${POSTGRES_DB:-hierici}"]
++      interval: 5s
++      timeout: 5s
++      retries: 5
++    networks:
++      - hierici-network
++
++  # Backend API FastAPI (Python 3.12)
++  hierici-backend:
++    build:
++      context: .
++      dockerfile: Dockerfile.backend
++    container_name: hierici-backend
++    restart: unless-stopped
++    depends_on:
++      hierici-db:
++        condition: service_healthy
++    env_file:
++      - .env
++    environment:
++      DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-hierici}:${POSTGRES_PASSWORD:-hierici_secret_password}@hierici-db:5432/${POSTGRES_DB:-hierici}
++      STORAGE_DRIVER: ${STORAGE_DRIVER:-local}
++      LOCAL_STORAGE_PATH: ${LOCAL_STORAGE_PATH:-/app/uploads}
++      DEFAULT_TERRITORY_SLUG: ${DEFAULT_TERRITORY_SLUG:-territoire-pilote}
++    ports:
++      - "8000:8000"
++    volumes:
++      - ./backend:/app
++      - uploads_data:/app/uploads
++    networks:
++      - hierici-network
++
++  # Frontend Web Vue 3 / Vite
++  hierici-frontend:
++    build:
++      context: .
++      dockerfile: Dockerfile.frontend
++    container_name: hierici-frontend
++    restart: unless-stopped
++    depends_on:
++      - hierici-backend
++    ports:
++      - "5173:80"
++    networks:
++      - hierici-network
++
++volumes:
++  pgdata:
++    name: hierici_pgdata
++  uploads_data:
++    name: hierici_uploads_data
++
++networks:
++  hierici-network:
++    name: hierici-network
++    driver: bridge
++
+diff --git a/frontend/src/App.vue b/frontend/src/App.vue
+new file mode 100644
+index 0000000..3d2647a
+--- /dev/null
++++ b/frontend/src/App.vue
+@@ -0,0 +1,96 @@
++<script setup lang="ts">
++import { ref, onMounted } from 'vue'
++
++const apiHealth = ref<{ status: string; database: string } | null>(null)
++const territory = ref<{ slug: string; name: string; center_lat: number; center_lng: number; default_zoom: number } | null>(null)
++const loading = ref(true)
++const error = ref<string | null>(null)
++
++onMounted(async () => {
++  try {
++    const [healthRes, territoryRes] = await Promise.all([
++      fetch('/api/health'),
++      fetch('/api/v1/territory/current')
++    ])
++    if (healthRes.ok) {
++      apiHealth.value = await healthRes.json()
++    }
++    if (territoryRes.ok) {
++      territory.value = await territoryRes.json()
++    }
++  } catch (e: any) {
++    error.value = "Impossible de contacter l'API backend"
++  } finally {
++    loading.value = false
++  }
++})
++</script>
++
++<template>
++  <main class="min-h-screen bg-slate-900 text-slate-100 flex flex-col font-sans">
++    <!-- Header -->
++    <header class="border-b border-slate-800 bg-slate-950/80 backdrop-blur px-6 py-4 flex items-center justify-between">
++      <div class="flex items-center space-x-3">
++        <span class="text-2xl">🧭</span>
++        <div>
++          <h1 class="text-xl font-bold tracking-tight text-white">HierIci</h1>
++          <p class="text-xs text-slate-400">Plateforme géohistorique de photos anciennes & storymaps</p>
++        </div>
++      </div>
++      <div class="flex items-center space-x-2 text-xs">
++        <span v-if="territory" class="hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium bg-slate-800 text-slate-300 border border-slate-700">
++          📍 {{ territory.name }} ({{ territory.center_lat.toFixed(4) }}, {{ territory.center_lng.toFixed(4) }})
++        </span>
++        <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium"
++          :class="apiHealth?.database === 'connected' ? 'bg-emerald-950 text-emerald-400 border border-emerald-800' : 'bg-amber-950 text-amber-400 border border-amber-800'">
++          <span class="w-1.5 h-1.5 rounded-full" :class="apiHealth?.database === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
++          {{ apiHealth?.database === 'connected' ? 'Système Opérationnel' : 'Connexion API...' }}
++        </span>
++      </div>
++    </header>
++
++    <!-- Hero / Présentation -->
++    <div class="flex-1 max-w-5xl mx-auto px-6 py-12 flex flex-col justify-center">
++      <div class="text-center space-y-6">
++        <div class="inline-block px-3 py-1 rounded-full bg-indigo-950/60 border border-indigo-800 text-indigo-300 text-xs font-semibold uppercase tracking-wider">
++          Projet Open Source — Licence MIT
++        </div>
++        <h2 class="text-4xl sm:text-5xl font-extrabold text-white tracking-tight leading-tight">
++          Explorer le passé à travers les yeux des photographes d'hier
++        </h2>
++        <p class="text-lg text-slate-300 max-w-2xl mx-auto">
++          Géolocalisation précise avec angle de prise de vue (azimut) et parcours thématiques guidés en scrollytelling.
++        </p>
++
++        <!-- Statut des services -->
++        <div class="pt-8 grid grid-cols-1 sm:grid-cols-3 gap-4 max-w-2xl mx-auto text-left">
++          <div class="p-4 rounded-xl bg-slate-800/60 border border-slate-700/60">
++            <div class="text-xs text-slate-400">Base Spatiale</div>
++            <div class="text-sm font-semibold text-white mt-1">PostgreSQL 16 + PostGIS</div>
++            <div class="text-xs mt-2" :class="apiHealth?.database === 'connected' ? 'text-emerald-400' : 'text-amber-400'">
++              {{ apiHealth?.database === 'connected' ? '● Connectée' : '○ En attente' }}
++            </div>
++          </div>
++          <div class="p-4 rounded-xl bg-slate-800/60 border border-slate-700/60">
++            <div class="text-xs text-slate-400">Backend API</div>
++            <div class="text-sm font-semibold text-white mt-1">FastAPI Python 3.12</div>
++            <div class="text-xs mt-2" :class="apiHealth?.status === 'ok' ? 'text-emerald-400' : 'text-amber-400'">
++              {{ apiHealth?.status === 'ok' ? '● HTTP 200 OK' : '○ En attente' }}
++            </div>
++          </div>
++          <div class="p-4 rounded-xl bg-slate-800/60 border border-slate-700/60">
++            <div class="text-xs text-slate-400">Moteur Carto</div>
++            <div class="text-sm font-semibold text-white mt-1">MapLibre GL JS</div>
++            <div class="text-xs text-sky-400 mt-2">● Prêt pour Epic 3</div>
++          </div>
++        </div>
++      </div>
++    </div>
++
++    <!-- Footer -->
++    <footer class="border-t border-slate-800/80 px-6 py-4 text-center text-xs text-slate-500">
++      HierIci — Socle conteneurisé Docker Compose (Story 1.1)
++    </footer>
++  </main>
++</template>
++
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+new file mode 100644
+index 0000000..a96d01d
+--- /dev/null
++++ b/frontend/src/main.ts
+@@ -0,0 +1,9 @@
++import { createApp } from 'vue'
++import { createPinia } from 'pinia'
++import App from './App.vue'
++import './assets/style.css'
++
++const app = createApp(App)
++app.use(createPinia())
++app.mount('#app')
++
+diff --git a/frontend/tsconfig.json b/frontend/tsconfig.json
+new file mode 100644
+index 0000000..07b71e4
+--- /dev/null
++++ b/frontend/tsconfig.json
+@@ -0,0 +1,22 @@
++{
++  "compilerOptions": {
++    "target": "ESNext",
++    "useDefineForClassFields": true,
++    "module": "ESNext",
++    "moduleResolution": "bundler",
++    "strict": true,
++    "jsx": "preserve",
++    "resolveJsonModule": true,
++    "isolatedModules": true,
++    "esModuleInterop": true,
++    "lib": ["ESNext", "DOM"],
++    "skipLibCheck": true,
++    "noEmit": true,
++    "baseUrl": ".",
++    "paths": {
++      "@/*": ["src/*"]
++    }
++  },
++  "include": ["src/**/*.ts", "src/**/*.d.ts", "src/**/*.tsx", "src/**/*.vue"],
++  "references": [{ "path": "./tsconfig.node.json" }]
++}
+diff --git a/frontend/vite.config.ts b/frontend/vite.config.ts
+new file mode 100644
+index 0000000..e1cb459
+--- /dev/null
++++ b/frontend/vite.config.ts
+@@ -0,0 +1,23 @@
++import { fileURLToPath, URL } from 'node:url'
++import { defineConfig } from 'vite'
++import vue from '@vitejs/plugin-vue'
++
++// https://vitejs.dev/config/
++export default defineConfig({
++  plugins: [vue()],
++  resolve: {
++    alias: {
++      '@': fileURLToPath(new URL('./src', import.meta.url)),
++    },
++  },
++  server: {
++    host: '0.0.0.0',
++    port: 5173,
++    proxy: {
++      '/api': {
++        target: 'http://hierici-backend:8000',
++        changeOrigin: true,
++      },
++    },
++  },
++})

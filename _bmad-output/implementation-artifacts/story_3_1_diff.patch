@@ -1,0 +1,1042 @@
+diff --git a/backend/app/api/v1/public/photos.py b/backend/app/api/v1/public/photos.py
+new file mode 100644
+index 0000000..51f59c9
+--- /dev/null
++++ b/backend/app/api/v1/public/photos.py
+@@ -0,0 +1,169 @@
++import uuid
++from typing import Annotated
++from fastapi import APIRouter, Depends, Query, HTTPException, status
++from sqlalchemy import select, and_, or_
++from sqlalchemy.orm import noload
++from sqlalchemy.ext.asyncio import AsyncSession
++
++from app.core.database import get_db
++from app.core.territory import get_current_territory
++from app.models.territory import Territory
++from app.models.photo import Photo, PhotoStatus
++from app.schemas.photo import (
++    PhotoGeoJsonFeatureCollection,
++    PhotoGeoJsonFeature,
++    GeoJsonPointGeometry,
++    PhotoGeoJsonProperties,
++    PhotoPublicRead,
++)
++from app.services.storage import resolve_media_url
++
++router = APIRouter(prefix="/photos", tags=["Photos Publiques"])
++
++
++@router.get("", response_model=PhotoGeoJsonFeatureCollection)
++async def list_public_photos_geojson(
++    territory: Annotated[Territory, Depends(get_current_territory)],
++    db: Annotated[AsyncSession, Depends(get_db)],
++    year_min: int | None = Query(None, ge=1000, le=3000, description="Année minimale de prise de vue"),
++    year_max: int | None = Query(None, ge=1000, le=3000, description="Année maximale de prise de vue"),
++    search: str | None = Query(None, min_length=1, max_length=100, description="Recherche textuelle"),
++    limit: int = Query(5000, ge=1, le=10000, description="Plafond de sécurité pour le volume GeoJSON"),
++) -> PhotoGeoJsonFeatureCollection:
++    """
++    Retourne la collection GeoJSON (FeatureCollection) des photographies publiées
++    et géolocalisées pour le territoire actif, prête pour le clustering cartographique.
++    """
++    if year_min is not None and year_max is not None and year_min > year_max:
++        raise HTTPException(
++            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++            detail={
++                "error": {
++                    "code": "INVALID_DATE_RANGE",
++                    "message": f"L'année minimale ({year_min}) ne peut être supérieure à l'année maximale ({year_max}).",
++                }
++            },
++        )
++
++    conditions = [
++        Photo.territory_id == territory.id,
++        Photo.status == PhotoStatus.PUBLISHED,
++        Photo.latitude.is_not(None),
++        Photo.longitude.is_not(None),
++    ]
++
++    if year_min is not None:
++        conditions.append(Photo.year_taken >= year_min)
++    if year_max is not None:
++        conditions.append(Photo.year_taken <= year_max)
++
++    if search and search.strip():
++        # Échappement des métacaractères LIKE pour éviter les scans séquentiels non intentionnels
++        clean_search = (
++            search.strip()
++            .replace("\\", "\\\\")
++            .replace("%", "\\%")
++            .replace("_", "\\_")
++        )
++        search_filter = f"%{clean_search}%"
++        conditions.append(
++            or_(
++                Photo.title.ilike(search_filter),
++                Photo.description.ilike(search_filter),
++                Photo.photographer.ilike(search_filter),
++                Photo.archive_source.ilike(search_filter),
++                Photo.period_label.ilike(search_filter),
++                Photo.archive_ref.ilike(search_filter),
++            )
++        )
++
++    stmt = (
++        select(Photo)
++        .options(noload(Photo.author), noload(Photo.territory))
++        .where(and_(*conditions))
++        .order_by(Photo.year_taken.asc().nulls_last(), Photo.created_at.desc())
++        .limit(limit)
++    )
++
++    result = await db.execute(stmt)
++    photos = result.scalars().all()
++
++    features: list[PhotoGeoJsonFeature] = []
++    for p in photos:
++        # Longitude en premier, Latitude en second selon le standard GeoJSON RFC 7946
++        geometry = GeoJsonPointGeometry(
++            type="Point",
++            coordinates=(float(p.longitude), float(p.latitude)),
++        )
++
++        properties = PhotoGeoJsonProperties(
++            id=p.id,
++            title=p.title,
++            description=p.description,
++            photographer=p.photographer,
++            year_taken=p.year_taken,
++            date_exact=p.date_exact,
++            period_label=p.period_label,
++            archive_source=p.archive_source,
++            archive_ref=p.archive_ref,
++            original_source_url=p.original_source_url,
++            license=p.license,
++            bearing=p.bearing,
++            field_of_view=p.field_of_view,
++            image_thumb_url=resolve_media_url(p.file_thumb_path),
++            image_display_url=resolve_media_url(p.file_display_path),
++            image_original_url=resolve_media_url(p.file_original_path),
++            created_at=p.created_at,
++            updated_at=p.updated_at,
++        )
++
++        features.append(
++            PhotoGeoJsonFeature(
++                type="Feature",
++                id=str(p.id),
++                geometry=geometry,
++                properties=properties,
++            )
++        )
++
++    return PhotoGeoJsonFeatureCollection(
++        type="FeatureCollection",
++        features=features,
++    )
++
++
++@router.get("/{id}", response_model=PhotoPublicRead)
++async def get_public_photo_detail(
++    id: uuid.UUID,
++    territory: Annotated[Territory, Depends(get_current_territory)],
++    db: Annotated[AsyncSession, Depends(get_db)],
++) -> PhotoPublicRead:
++    """
++    Retourne la fiche publique d'une photographie publiée du territoire actif.
++    Ne divulgue aucun chemin de fichier interne ni identifiant utilisateur d'auteur.
++    Renvoie 404 si la photo n'existe pas, n'appartient pas au territoire ou est en brouillon.
++    """
++    stmt = (
++        select(Photo)
++        .options(noload(Photo.author), noload(Photo.territory))
++        .where(
++            Photo.id == id,
++            Photo.territory_id == territory.id,
++            Photo.status == PhotoStatus.PUBLISHED,
++        )
++    )
++    result = await db.execute(stmt)
++    photo = result.scalar_one_or_none()
++
++    if not photo:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "PHOTO_NOT_FOUND",
++                    "message": "Photographie introuvable ou non publiée dans ce territoire.",
++                }
++            },
++        )
++
++    return PhotoPublicRead.model_validate(photo)
+diff --git a/backend/tests/test_photos_public.py b/backend/tests/test_photos_public.py
+new file mode 100644
+index 0000000..2ad52b7
+--- /dev/null
++++ b/backend/tests/test_photos_public.py
+@@ -0,0 +1,268 @@
++import uuid
++import pytest
++from httpx import AsyncClient, ASGITransport
++from sqlalchemy import delete
++
++from app.main import app
++from app.core.database import AsyncSessionLocal
++from app.models.territory import Territory
++from app.models.photo import Photo, PhotoStatus
++
++
++@pytest.fixture
++async def setup_public_test_data():
++    """Prépare un territoire de test et un lot de photos (publiées et brouillons)."""
++    async with AsyncSessionLocal() as session:
++        t_a = Territory(
++            id=uuid.uuid4(),
++            slug=f"territoire-public-{uuid.uuid4().hex[:6]}",
++            name="Territoire Public Test",
++            center_lat=43.125,
++            center_lng=5.930,
++            default_zoom=14,
++        )
++        t_b = Territory(
++            id=uuid.uuid4(),
++            slug=f"autre-territoire-{uuid.uuid4().hex[:6]}",
++            name="Autre Territoire Test",
++            center_lat=48.856,
++            center_lng=2.352,
++            default_zoom=12,
++        )
++        session.add_all([t_a, t_b])
++        await session.commit()
++        await session.refresh(t_a)
++        await session.refresh(t_b)
++
++        # Photos sur Territoire A
++        p1 = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            title="Place de la Liberté 1910",
++            description="Vue d'ensemble animée",
++            photographer="Marius Bar",
++            year_taken=1910,
++            archive_source="Archives Municipales",
++            archive_ref="10Fi12",
++            file_original_path="private/storage/original_p1.jpg",
++            file_display_path="private/storage/display_p1.webp",
++            file_thumb_path="private/storage/thumb_p1.webp",
++            latitude=43.124500,
++            longitude=5.928500,
++            bearing=135,
++            field_of_view=60,
++            status=PhotoStatus.PUBLISHED,
++        )
++        p2 = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            title="Port de Commerce 1925",
++            description="Bateaux à vapeur à quai",
++            photographer="Inconnu",
++            year_taken=1925,
++            archive_source="Chambre de Commerce",
++            archive_ref="CC-88",
++            file_display_path="private/storage/display_p2.webp",
++            latitude=43.120100,
++            longitude=5.932000,
++            bearing=180,
++            field_of_view=75,
++            status=PhotoStatus.PUBLISHED,
++        )
++        p3_draft = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            title="Brouillon Secret Non Publié",
++            latitude=43.122000,
++            longitude=5.931000,
++            status=PhotoStatus.DRAFT,
++        )
++
++        # Photo sur Territoire B
++        p_b = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            title="Notre-Dame de Paris 1900",
++            latitude=48.853000,
++            longitude=2.349900,
++            status=PhotoStatus.PUBLISHED,
++        )
++
++        session.add_all([p1, p2, p3_draft, p_b])
++        await session.commit()
++        await session.refresh(p1)
++        await session.refresh(p2)
++        await session.refresh(p3_draft)
++        await session.refresh(p_b)
++
++        data = {
++            "t_a": t_a,
++            "t_b": t_b,
++            "p1": p1,
++            "p2": p2,
++            "p3_draft": p3_draft,
++            "p_b": p_b,
++        }
++
++    yield data
++
++    # Nettoyage
++    async with AsyncSessionLocal() as session:
++        await session.execute(delete(Photo).where(Photo.territory_id.in_([t_a.id, t_b.id])))
++        await session.execute(delete(Territory).where(Territory.id.in_([t_a.id, t_b.id])))
++        await session.commit()
++
++
++@pytest.mark.asyncio
++async def test_list_public_photos_geojson(setup_public_test_data):
++    """Vérifie que l'endpoint public retourne une FeatureCollection GeoJSON valide avec les seules photos publiées du territoire."""
++    data = setup_public_test_data
++    t_a = data["t_a"]
++
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        response = await client.get(
++            "/api/v1/photos",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++
++    assert response.status_code == 200
++    geojson = response.json()
++
++    assert geojson["type"] == "FeatureCollection"
++    assert "features" in geojson
++    assert len(geojson["features"]) == 2
++
++    feature_ids = [f["id"] for f in geojson["features"]]
++    assert str(data["p1"].id) in feature_ids
++    assert str(data["p2"].id) in feature_ids
++    # Le brouillon et la photo de l'autre territoire ne doivent jamais être présents
++    assert str(data["p3_draft"].id) not in feature_ids
++    assert str(data["p_b"].id) not in feature_ids
++
++    # Vérification de la géométrie Point GeoJSON (lon, lat)
++    f1 = next(f for f in geojson["features"] if f["id"] == str(data["p1"].id))
++    assert f1["geometry"]["type"] == "Point"
++    assert f1["geometry"]["coordinates"] == [5.928500, 43.124500]
++    assert f1["properties"]["title"] == "Place de la Liberté 1910"
++    assert f1["properties"]["bearing"] == 135
++    assert f1["properties"]["field_of_view"] == 60
++
++
++@pytest.mark.asyncio
++async def test_list_public_photos_filters(setup_public_test_data):
++    """Vérifie les filtres par année et par mot-clé de recherche."""
++    data = setup_public_test_data
++    t_a = data["t_a"]
++
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        # Filtre par année minimale
++        res_year = await client.get(
++            "/api/v1/photos?year_min=1920",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_year.status_code == 200
++        features = res_year.json()["features"]
++        assert len(features) == 1
++        assert features[0]["id"] == str(data["p2"].id)
++
++        # Filtre par recherche textuelle (titre)
++        res_search = await client.get(
++            "/api/v1/photos?search=Liberté",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_search.status_code == 200
++        search_features = res_search.json()["features"]
++        assert len(search_features) == 1
++        assert search_features[0]["id"] == str(data["p1"].id)
++
++        # Filtre par recherche textuelle (photographe)
++        res_photo = await client.get(
++            "/api/v1/photos?search=Marius",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_photo.status_code == 200
++        assert len(res_photo.json()["features"]) == 1
++
++
++@pytest.mark.asyncio
++async def test_list_public_photos_invalid_year_range(setup_public_test_data):
++    """Vérifie que l'inversion d'années ou des valeurs hors limites renvoient HTTP 422."""
++    data = setup_public_test_data
++    t_a = data["t_a"]
++
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        # year_min > year_max
++        res_inv = await client.get(
++            "/api/v1/photos?year_min=1950&year_max=1920",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_inv.status_code == 422
++
++        # Valeur hors borne (>3000)
++        res_overflow = await client.get(
++            "/api/v1/photos?year_min=999999",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_overflow.status_code == 422
++
++
++@pytest.mark.asyncio
++async def test_list_public_photos_empty_and_combined_filters(setup_public_test_data):
++    """Vérifie le retour d'une FeatureCollection vide conforme RFC 7946 lors d'un filtrage sans résultat."""
++    data = setup_public_test_data
++    t_a = data["t_a"]
++
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        res_empty = await client.get(
++            "/api/v1/photos?year_min=1900&year_max=1905",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_empty.status_code == 200
++        body = res_empty.json()
++        assert body["type"] == "FeatureCollection"
++        assert body["features"] == []
++
++
++@pytest.mark.asyncio
++async def test_get_public_photo_detail_and_privacy(setup_public_test_data):
++    """Vérifie l'accès public au détail d'une photo et l'absence stricte de fuite de données internes."""
++    data = setup_public_test_data
++    t_a = data["t_a"]
++
++    transport = ASGITransport(app=app)
++    async with AsyncClient(transport=transport, base_url="http://test") as client:
++        # Photo publiée existante
++        res_ok = await client.get(
++            f"/api/v1/photos/{data['p1'].id}",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_ok.status_code == 200
++        detail = res_ok.json()
++        assert detail["id"] == str(data["p1"].id)
++        assert detail["title"] == "Place de la Liberté 1910"
++
++        # Vérification stricte de confidentialité (P1-1) : aucun chemin physique interne ni id d'auteur
++        assert "author_user_id" not in detail
++        assert "created_by_id" not in detail
++        assert "file_original_path" not in detail
++        assert "file_display_path" not in detail
++        assert "file_thumb_path" not in detail
++        assert "status" not in detail
++
++        # Photo en brouillon -> 404
++        res_draft = await client.get(
++            f"/api/v1/photos/{data['p3_draft'].id}",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_draft.status_code == 404
++
++        # Photo d'un autre territoire -> 404
++        res_other = await client.get(
++            f"/api/v1/photos/{data['p_b'].id}",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_other.status_code == 404
+diff --git a/frontend/src/components/public/PublicMapViewer.vue b/frontend/src/components/public/PublicMapViewer.vue
+new file mode 100644
+index 0000000..fc951bc
+--- /dev/null
++++ b/frontend/src/components/public/PublicMapViewer.vue
+@@ -0,0 +1,587 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted, watch } from 'vue'
++import maplibregl from 'maplibre-gl'
++import 'maplibre-gl/dist/maplibre-gl.css'
++import { photoApi } from '@/services/api'
++import type { PhotoGeoJsonFeatureCollection, PhotoGeoJsonFeature } from '@/types/photo'
++
++const props = withDefaults(
++  defineProps<{
++    territoryCenter?: [number, number] // [lng, lat]
++    defaultZoom?: number
++    territoryName?: string
++  }>(),
++  {
++    territoryCenter: () => [5.93, 43.12],
++    defaultZoom: 13,
++    territoryName: 'Territoire',
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'select-photo', photoId: string, feature: PhotoGeoJsonFeature): void
++}>()
++
++const mapContainer = ref<HTMLDivElement | null>(null)
++let map: maplibregl.Map | null = null
++let resizeObserver: ResizeObserver | null = null
++let isMounted = false
++let currentAbortController: AbortController | null = null
++let activePopup: maplibregl.Popup | null = null
++
++const loading = ref(true)
++const error = ref<string | null>(null)
++const photosData = ref<PhotoGeoJsonFeatureCollection | null>(null)
++const totalPublishedCount = ref(0)
++
++// Filtres
++const searchQuery = ref('')
++const filterYearMin = ref<number | undefined>(undefined)
++const filterYearMax = ref<number | undefined>(undefined)
++
++// Style raster OSM libre et sans clé API
++const mapStyle: maplibregl.StyleSpecification = {
++  version: 8,
++  sources: {
++    'osm-tiles': {
++      type: 'raster',
++      tiles: [
++        'https://a.tile.openstreetmap.org/{z}/{x}/{y}.png',
++        'https://b.tile.openstreetmap.org/{z}/{x}/{y}.png',
++        'https://c.tile.openstreetmap.org/{z}/{x}/{y}.png',
++      ],
++      tileSize: 256,
++      attribution:
++        '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank">OpenStreetMap</a> contributeurs',
++      maxzoom: 19,
++    },
++  },
++  layers: [
++    {
++      id: 'osm-tiles-layer',
++      type: 'raster',
++      source: 'osm-tiles',
++      minzoom: 0,
++      maxzoom: 19,
++    },
++  ],
++}
++
++/**
++ * Charge les données GeoJSON depuis l'API publique avec annulation des requêtes précédentes
++ */
++async function loadGeoJsonData() {
++  if (currentAbortController) {
++    currentAbortController.abort()
++  }
++  currentAbortController = new AbortController()
++
++  loading.value = true
++  error.value = null
++
++  try {
++    const data = await photoApi.getPublicPhotos(
++      {
++        search: searchQuery.value.trim() || undefined,
++        year_min: filterYearMin.value,
++        year_max: filterYearMax.value,
++      },
++      currentAbortController.signal
++    )
++
++    if (!isMounted) return
++
++    photosData.value = data
++    totalPublishedCount.value = data.features.length
++
++    if (map && map.isStyleLoaded()) {
++      const source = map.getSource('photos') as maplibregl.GeoJSONSource | undefined
++      if (source) {
++        source.setData(data as any)
++      }
++    }
++  } catch (err: any) {
++    if (err.name === 'AbortError') {
++      // Annulation normale par frappe ultérieure
++      return
++    }
++    console.error('Erreur lors du chargement des données GeoJSON:', err)
++    error.value = err.message || 'Impossible de charger les données photographiques.'
++  } finally {
++    if (isMounted) {
++      loading.value = false
++    }
++  }
++}
++
++/**
++ * Affiche une popup descriptive sur un point individuel sélectionné
++ */
++function showPhotoPopup(feature: PhotoGeoJsonFeature, lngLat: [number, number]) {
++  if (!map) return
++
++  if (activePopup) {
++    activePopup.remove()
++  }
++
++  const p = feature.properties
++  const popupHtml = `
++    <div class="p-2 space-y-2 max-w-[240px] font-sans text-slate-100">
++      ${
++        p.image_thumb_url
++          ? `<img src="${p.image_thumb_url}" alt="${p.title}" class="w-full h-28 object-cover rounded-lg border border-slate-700 shadow-md" />`
++          : ''
++      }
++      <div>
++        <h4 class="font-bold text-xs text-white line-clamp-2 leading-tight">${p.title}</h4>
++        <div class="flex items-center gap-2 mt-1 text-[11px] text-slate-400">
++          ${p.year_taken ? `<span>📅 ${p.year_taken}</span>` : ''}
++          ${p.photographer ? `<span class="truncate">👤 ${p.photographer}</span>` : ''}
++        </div>
++      </div>
++      <button
++        id="hierici-popup-btn-${p.id}"
++        type="button"
++        class="w-full py-1 px-2 mt-1 bg-sky-600 hover:bg-sky-500 text-white text-[11px] font-semibold rounded transition-colors text-center"
++      >
++        Consulter la fiche
++      </button>
++    </div>
++  `
++
++  activePopup = new maplibregl.Popup({
++    closeButton: true,
++    closeOnClick: true,
++    offset: 12,
++    className: 'hierici-map-popup',
++  })
++    .setLngLat(lngLat)
++    .setHTML(popupHtml)
++    .addTo(map)
++
++  // Gestion du clic sur le bouton de consultation dans le DOM de la popup
++  setTimeout(() => {
++    const btn = document.getElementById(`hierici-popup-btn-${p.id}`)
++    if (btn) {
++      btn.onclick = () => {
++        emit('select-photo', p.id, feature)
++      }
++    }
++  }, 50)
++}
++
++/**
++ * Initialise l'instance MapLibre GL et les couches vectorielles de clustering
++ */
++function initMap() {
++  if (!mapContainer.value || !isMounted) return
++
++  map = new maplibregl.Map({
++    container: mapContainer.value,
++    style: mapStyle,
++    center: props.territoryCenter,
++    zoom: props.defaultZoom,
++    maxZoom: 18,
++    minZoom: 4,
++    attributionControl: false,
++  })
++
++  // Contrôles de navigation et attribution
++  map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right')
++  map.addControl(new maplibregl.AttributionControl({ compact: true }), 'bottom-right')
++
++  map.on('load', () => {
++    if (!map || !isMounted) return
++
++    // 1. Source GeoJSON avec clustering activé côté client
++    map.addSource('photos', {
++      type: 'geojson',
++      data: (photosData.value as any) || { type: 'FeatureCollection', features: [] },
++      cluster: true,
++      clusterMaxZoom: 14, // Au-delà du zoom 14, les points individuels sont toujours affichés
++      clusterRadius: 50,  // Rayon de regroupement en pixels
++    })
++
++    // 2. Couche des cercles de clusters (taille et palette selon densité)
++    map.addLayer({
++      id: 'clusters',
++      type: 'circle',
++      source: 'photos',
++      filter: ['has', 'point_count'],
++      paint: {
++        'circle-color': [
++          'step',
++          ['get', 'point_count'],
++          '#0284c7', // < 10 clichés : sky-600
++          10,
++          '#0d9488', // 10 - 24 : teal-600
++          25,
++          '#d97706', // 25 - 49 : amber-600
++          50,
++          '#e11d48', // >= 50 : rose-600
++        ],
++        'circle-radius': [
++          'step',
++          ['get', 'point_count'],
++          18,
++          10,
++          24,
++          25,
++          30,
++          50,
++          36,
++        ],
++        'circle-stroke-width': 3,
++        'circle-stroke-color': '#ffffff',
++        'circle-opacity': 0.92,
++      },
++    })
++
++    // 3. Couche du décompte textuel à l'intérieur du cercle cluster
++    map.addLayer({
++      id: 'cluster-count',
++      type: 'symbol',
++      source: 'photos',
++      filter: ['has', 'point_count'],
++      layout: {
++        'text-field': '{point_count_abbreviated}',
++        'text-size': 13,
++      },
++      paint: {
++        'text-color': '#ffffff',
++      },
++    })
++
++    // 4. Couche des clichés individuels (points dégroupés)
++    map.addLayer({
++      id: 'unclustered-point',
++      type: 'circle',
++      source: 'photos',
++      filter: ['!', ['has', 'point_count']],
++      paint: {
++        'circle-color': '#0ea5e9',
++        'circle-radius': 9,
++        'circle-stroke-width': 2.5,
++        'circle-stroke-color': '#ffffff',
++        'circle-opacity': 0.95,
++      },
++    })
++
++    // Clic sur un cluster : zoom automatique fluide pour éclater le groupe
++    map.on('click', 'clusters', async (e) => {
++      if (!map) return
++      const features = map.queryRenderedFeatures(e.point, { layers: ['clusters'] })
++      const clusterId = features[0]?.properties?.cluster_id
++      if (clusterId === undefined) return
++
++      const source = map.getSource('photos') as maplibregl.GeoJSONSource
++      try {
++        const expansionZoom = await source.getClusterExpansionZoom(clusterId)
++        const coords = (features[0].geometry as any).coordinates.slice()
++
++        // Gestion du cas où les clichés partagent exactement les mêmes coordonnées GPS
++        const currentZoom = map.getZoom()
++        if (expansionZoom <= currentZoom || currentZoom >= 17) {
++          map.easeTo({
++            center: coords,
++            zoom: Math.min(currentZoom + 1, 18),
++            duration: 400,
++          })
++        } else {
++          map.easeTo({
++            center: coords,
++            zoom: Math.min(expansionZoom, 17),
++            duration: 500,
++          })
++        }
++      } catch (err) {
++        console.warn('Impossible de calculer le zoom de cluster:', err)
++      }
++    })
++
++    // Clic sur un cliché individuel dégroupé
++    map.on('click', 'unclustered-point', (e) => {
++      if (!map) return
++      const features = map.queryRenderedFeatures(e.point, { layers: ['unclustered-point'] })
++      const feature = features[0]
++      const featureId = feature?.properties?.id
++      if (!featureId) return
++
++      // Résolution de l'entité complète depuis photosData pour garantir le typage
++      const fullFeature = photosData.value?.features.find((f) => f.properties.id === featureId)
++      if (fullFeature) {
++        const coords = fullFeature.geometry.coordinates
++        showPhotoPopup(fullFeature, coords)
++        emit('select-photo', featureId, fullFeature)
++      }
++    })
++
++    // Changement du curseur au survol
++    map.on('mouseenter', 'clusters', () => {
++      if (map) map.getCanvas().style.cursor = 'pointer'
++    })
++    map.on('mouseleave', 'clusters', () => {
++      if (map) map.getCanvas().style.cursor = ''
++    })
++    map.on('mouseenter', 'unclustered-point', () => {
++      if (map) map.getCanvas().style.cursor = 'pointer'
++    })
++    map.on('mouseleave', 'unclustered-point', () => {
++      if (map) map.getCanvas().style.cursor = ''
++    })
++  })
++
++  // Surveillance des redimensionnements de fenêtre et de conteneur
++  resizeObserver = new ResizeObserver(() => {
++    map?.resize()
++  })
++  resizeObserver.observe(mapContainer.value)
++}
++
++/**
++ * Recentre la vue sur l'emprise du territoire
++ */
++function resetTerritoryView() {
++  if (!map) return
++  map.flyTo({
++    center: props.territoryCenter,
++    zoom: props.defaultZoom,
++    essential: true,
++  })
++}
++
++// Surveillance des changements de filtres avec debounce
++let searchTimer: ReturnType<typeof setTimeout> | null = null
++watch([searchQuery, filterYearMin, filterYearMax], () => {
++  if (searchTimer) clearTimeout(searchTimer)
++  searchTimer = setTimeout(() => {
++    loadGeoJsonData()
++  }, 300)
++})
++
++// Surveillance du changement de territoire actif
++watch(
++  () => props.territoryCenter,
++  (newCenter) => {
++    if (map && newCenter) {
++      map.flyTo({
++        center: newCenter,
++        zoom: props.defaultZoom,
++      })
++      loadGeoJsonData()
++    }
++  }
++)
++
++onMounted(async () => {
++  isMounted = true
++  await loadGeoJsonData()
++  if (isMounted) {
++    initMap()
++  }
++})
++
++onUnmounted(() => {
++  isMounted = false
++
++  if (searchTimer) {
++    clearTimeout(searchTimer)
++    searchTimer = null
++  }
++  if (currentAbortController) {
++    currentAbortController.abort()
++    currentAbortController = null
++  }
++  if (activePopup) {
++    activePopup.remove()
++    activePopup = null
++  }
++  if (resizeObserver) {
++    resizeObserver.disconnect()
++    resizeObserver = null
++  }
++  if (map) {
++    map.remove()
++    map = null
++  }
++})
++
++defineExpose({
++  resize: () => map?.resize(),
++  resetView: resetTerritoryView,
++  refresh: loadGeoJsonData,
++})
++</script>
++
++<template>
++  <div class="relative w-full h-[calc(100vh-140px)] min-h-[500px] flex flex-col rounded-2xl overflow-hidden border border-slate-800 bg-slate-950 shadow-2xl">
++    <!-- Barre Supérieure d'Exploration & Filtres -->
++    <div class="absolute top-4 left-4 right-4 z-10 flex flex-wrap items-center justify-between gap-3 pointer-events-none">
++      <!-- Groupe Filtres & Recherche -->
++      <div class="flex flex-wrap items-center gap-2 pointer-events-auto bg-slate-900/90 backdrop-blur-md p-2 rounded-xl border border-slate-700/80 shadow-xl text-xs">
++        <!-- Recherche textuelle -->
++        <div class="relative flex items-center">
++          <span class="absolute left-2.5 text-slate-400">🔍</span>
++          <input
++            v-model="searchQuery"
++            type="text"
++            placeholder="Rechercher un monument, auteur..."
++            class="pl-8 pr-3 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-500 focus:outline-none focus:border-sky-500 w-52 sm:w-64 transition-colors"
++          />
++          <button
++            v-if="searchQuery"
++            type="button"
++            class="absolute right-2 text-slate-400 hover:text-white"
++            @click="searchQuery = ''"
++          >
++            ✕
++          </button>
++        </div>
++
++        <!-- Filtre Période / Année -->
++        <div class="hidden sm:flex items-center gap-1.5 pl-2 border-l border-slate-700/80 text-slate-300">
++          <span>Année :</span>
++          <input
++            v-model.number="filterYearMin"
++            type="number"
++            placeholder="Min"
++            class="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 text-center"
++          />
++          <span class="text-slate-500">-</span>
++          <input
++            v-model.number="filterYearMax"
++            type="number"
++            placeholder="Max"
++            class="w-16 px-2 py-1.5 bg-slate-950 border border-slate-700 rounded-lg text-white placeholder-slate-600 focus:outline-none focus:border-sky-500 text-center"
++          />
++        </div>
++
++        <!-- Bouton Reset Filtres si actifs -->
++        <button
++          v-if="searchQuery || filterYearMin !== undefined || filterYearMax !== undefined"
++          type="button"
++          class="px-2 py-1.5 text-sky-400 hover:text-sky-300 font-semibold"
++          @click="searchQuery = ''; filterYearMin = undefined; filterYearMax = undefined"
++        >
++          Effacer
++        </button>
++      </div>
++
++      <!-- Badge Décompte & Recentrage -->
++      <div class="flex items-center gap-2 pointer-events-auto bg-slate-900/90 backdrop-blur-md px-3 py-2 rounded-xl border border-slate-700/80 shadow-xl text-xs">
++        <span class="flex items-center gap-1.5 font-semibold text-slate-200">
++          <span
++            class="w-2 h-2 rounded-full"
++            :class="totalPublishedCount > 0 ? 'bg-emerald-400 animate-pulse' : 'bg-slate-500'"
++          ></span>
++          <span>{{ totalPublishedCount }} photo{{ totalPublishedCount > 1 ? 's' : '' }}</span>
++        </span>
++
++        <button
++          type="button"
++          class="ml-2 px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 hover:text-white rounded-lg border border-slate-600/80 transition-colors flex items-center gap-1"
++          title="Recentrer sur le territoire"
++          @click="resetTerritoryView"
++        >
++          <span>🎯</span>
++          <span class="hidden md:inline">{{ territoryName }}</span>
++        </button>
++      </div>
++    </div>
++
++    <!-- Conteneur Cartographique MapLibre GL -->
++    <div ref="mapContainer" class="flex-1 w-full h-full relative z-0"></div>
++
++    <!-- État Vide lorsque aucun résultat ne correspond aux filtres -->
++    <div
++      v-if="!loading && totalPublishedCount === 0"
++      class="absolute bottom-6 left-1/2 -translate-x-1/2 z-10 px-4 py-2.5 rounded-xl bg-slate-900/95 border border-slate-700/80 text-xs text-slate-300 shadow-xl flex items-center gap-3"
++    >
++      <span>🔎 Aucune photographie publiée ne correspond aux critères de recherche.</span>
++      <button
++        v-if="searchQuery || filterYearMin !== undefined || filterYearMax !== undefined"
++        type="button"
++        class="px-2 py-1 rounded bg-sky-600 hover:bg-sky-500 text-white font-medium text-[11px]"
++        @click="searchQuery = ''; filterYearMin = undefined; filterYearMax = undefined"
++      >
++        Réinitialiser les filtres
++      </button>
++    </div>
++
++    <!-- Indicateur de Chargement -->
++    <div
++      v-if="loading"
++      class="absolute bottom-6 left-6 z-20 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-slate-900/90 border border-slate-700 text-xs text-sky-400 shadow-lg"
++    >
++      <svg class="animate-spin w-4 h-4 text-sky-400" viewBox="0 0 24 24" fill="none">
++        <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
++        <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8H4z"></path>
++      </svg>
++      <span>Actualisation des photographies...</span>
++    </div>
++
++    <!-- Message d'Erreur -->
++    <div
++      v-if="error"
++      class="absolute bottom-6 left-6 right-6 z-20 p-3 rounded-xl bg-rose-950/90 border border-rose-800 text-xs text-rose-300 shadow-xl flex items-center justify-between"
++    >
++      <span>⚠️ {{ error }}</span>
++      <button
++        type="button"
++        class="px-2 py-1 bg-rose-800 hover:bg-rose-700 text-white rounded font-medium"
++        @click="loadGeoJsonData"
++      >
++        Réessayer
++      </button>
++    </div>
++  </div>
++</template>
++
++<style scoped>
++:deep(.maplibregl-ctrl-group) {
++  background-color: rgb(15 23 42 / 0.9) !important;
++  border: 1px solid rgb(51 65 85) !important;
++  border-radius: 0.75rem !important;
++  overflow: hidden;
++  box-shadow: 0 10px 15px -3px rgb(0 0 0 / 0.3) !important;
++}
++
++:deep(.maplibregl-ctrl-group button) {
++  border-bottom: 1px solid rgb(51 65 85) !important;
++}
++
++:deep(.maplibregl-ctrl-group button:last-child) {
++  border-bottom: none !important;
++}
++
++:deep(.maplibregl-ctrl-group button:hover) {
++  background-color: rgb(30 41 59) !important;
++}
++
++:deep(.maplibregl-ctrl-icon) {
++  filter: invert(1);
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-content) {
++  background-color: rgb(15 23 42 / 0.96) !important;
++  border: 1px solid rgb(51 65 85) !important;
++  border-radius: 1rem !important;
++  padding: 0.5rem !important;
++  box-shadow: 0 20px 25px -5px rgb(0 0 0 / 0.5) !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-tip) {
++  border-top-color: rgb(15 23 42 / 0.96) !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-close-button) {
++  color: rgb(148 163 184) !important;
++  padding: 4px 8px !important;
++  font-size: 16px !important;
++}
++
++:deep(.hierici-map-popup .maplibregl-popup-close-button:hover) {
++  color: white !important;
++  background: transparent !important;
++}
++</style>

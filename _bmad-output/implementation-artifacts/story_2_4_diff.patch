@@ -1,0 +1,1664 @@
+diff --git a/frontend/src/components/admin/PhotoFormModal.vue b/frontend/src/components/admin/PhotoFormModal.vue
+new file mode 100644
+index 0000000..3fbb7a9
+--- /dev/null
++++ b/frontend/src/components/admin/PhotoFormModal.vue
+@@ -0,0 +1,774 @@
++<script setup lang="ts">
++import { ref, computed, watch, nextTick } from 'vue'
++import type { Photo, PhotoCreatePayload, PhotoUpdatePayload, PhotoStatus, PhotoLicense } from '@/types/photo'
++import { PHOTO_LICENSES } from '@/types/photo'
++import { photoApi, ApiError } from '@/services/api'
++import PhotoLocationPicker from './PhotoLocationPicker.vue'
++
++const props = defineProps<{
++  isOpen: boolean
++  photoToEdit?: Photo | null
++}>()
++
++const emit = defineEmits<{
++  (e: 'close'): void
++  (e: 'saved', photo: Photo): void
++  (e: 'toast', message: string, type?: 'success' | 'error' | 'info'): void
++}>()
++
++// État du formulaire
++const form = ref<{
++  id?: string
++  title: string
++  description: string
++  photographer: string
++  year_taken: number | null
++  date_exact: string
++  period_label: string
++  archive_source: string
++  archive_ref: string
++  original_source_url: string
++  license: PhotoLicense | string
++  latitude: number | null
++  longitude: number | null
++  bearing: number | null
++  field_of_view: number
++  status: PhotoStatus
++  thumb_url?: string | null
++  display_url?: string | null
++  original_url?: string | null
++}>({
++  title: '',
++  description: '',
++  photographer: '',
++  year_taken: null,
++  date_exact: '',
++  period_label: '',
++  archive_source: '',
++  archive_ref: '',
++  original_source_url: '',
++  license: 'Domaine Public',
++  latitude: null,
++  longitude: null,
++  bearing: null,
++  field_of_view: 60,
++  status: 'draft',
++})
++
++const isSubmitting = ref(false)
++const isUploadingImage = ref(false)
++const uploadProgress = ref(false)
++const localImagePreview = ref<string | null>(null)
++const selectedImageFile = ref<File | null>(null)
++const errorMessage = ref<string | null>(null)
++const activeTab = ref<'document' | 'geo' | 'media'>('document')
++const fileInputRef = ref<HTMLInputElement | null>(null)
++const locationPickerRef = ref<InstanceType<typeof PhotoLocationPicker> | null>(null)
++
++// Initialisation du formulaire lors du changement de prop photoToEdit
++watch(
++  () => props.photoToEdit,
++  (newVal) => {
++    errorMessage.value = null
++    localImagePreview.value = null
++    selectedImageFile.value = null
++
++    if (newVal) {
++      form.value = {
++        id: newVal.id,
++        title: newVal.title || '',
++        description: newVal.description || '',
++        photographer: newVal.photographer || '',
++        year_taken: newVal.year_taken ?? newVal.year ?? null,
++        date_exact: newVal.date_exact || '',
++        period_label: newVal.period_label || '',
++        archive_source: newVal.archive_source || '',
++        archive_ref: newVal.archive_ref ?? newVal.archive_reference ?? '',
++        original_source_url: newVal.original_source_url ?? newVal.source_url ?? '',
++        license: newVal.license || 'Domaine Public',
++        latitude: newVal.latitude ?? null,
++        longitude: newVal.longitude ?? null,
++        bearing: newVal.bearing ?? null,
++        field_of_view: newVal.field_of_view ?? 60,
++        status: newVal.status || 'draft',
++        thumb_url: newVal.thumb_url ?? newVal.image_thumb_url ?? null,
++        display_url: newVal.display_url ?? newVal.image_display_url ?? null,
++        original_url: newVal.original_url ?? newVal.image_original_url ?? null,
++      }
++    } else {
++      // Réinitialisation pour création
++      form.value = {
++        title: '',
++        description: '',
++        photographer: '',
++        year_taken: null,
++        date_exact: '',
++        period_label: '',
++        archive_source: '',
++        archive_ref: '',
++        original_source_url: '',
++        license: 'Domaine Public',
++        latitude: null,
++        longitude: null,
++        bearing: null,
++        field_of_view: 60,
++        status: 'draft',
++        thumb_url: null,
++        display_url: null,
++        original_url: null,
++      }
++    }
++  },
++  { immediate: true }
++)
++
++watch(
++  () => props.isOpen,
++  (open) => {
++    if (open && !props.photoToEdit) {
++      form.value = {
++        title: '',
++        description: '',
++        photographer: '',
++        year_taken: null,
++        date_exact: '',
++        period_label: '',
++        archive_source: '',
++        archive_ref: '',
++        original_source_url: '',
++        license: 'Domaine Public',
++        latitude: null,
++        longitude: null,
++        bearing: null,
++        field_of_view: 60,
++        status: 'draft',
++        thumb_url: null,
++        display_url: null,
++        original_url: null,
++      }
++      localImagePreview.value = null
++      selectedImageFile.value = null
++      activeTab.value = 'document'
++    }
++  }
++)
++
++// Redimensionnement de la carte lors du basculement vers l'onglet Géoréférencement
++watch(activeTab, (newTab) => {
++  if (newTab === 'geo') {
++    nextTick(() => {
++      setTimeout(() => {
++        locationPickerRef.value?.resize()
++      }, 50)
++    })
++  }
++})
++
++const parseNullableNumber = (v: any): number | null => {
++  if (v === null || v === undefined || String(v).trim() === '') return null
++  const num = Number(v)
++  return isNaN(num) ? null : num
++}
++
++// Détection de présence de coordonnées géographiques complètes
++const hasCoordinates = computed(() => {
++  const lat = parseNullableNumber(form.value.latitude)
++  const lng = parseNullableNumber(form.value.longitude)
++  return lat !== null && lng !== null
++})
++
++// Détection du blocage de publication sans coordonnées
++const isPublishBlocked = computed(() => {
++  return form.value.status === 'published' && !hasCoordinates.value
++})
++
++const canSubmit = computed(() => {
++  return (
++    form.value.title.trim().length > 0 &&
++    !isPublishBlocked.value &&
++    !isSubmitting.value &&
++    !isUploadingImage.value
++  )
++})
++
++const currentPreviewUrl = computed(() => {
++  if (localImagePreview.value) {
++    return localImagePreview.value
++  }
++  return form.value.display_url || form.value.thumb_url || null
++})
++
++// Gestion du téléversement d'image
++async function handleFileSelect(event: Event) {
++  const target = event.target as HTMLInputElement
++  if (target.files && target.files.length > 0) {
++    await processFile(target.files[0])
++  }
++}
++
++async function handleDrop(event: DragEvent) {
++  event.preventDefault()
++  if (event.dataTransfer?.files && event.dataTransfer.files.length > 0) {
++    await processFile(event.dataTransfer.files[0])
++  }
++}
++
++async function processFile(file: File) {
++  if (!file.type.startsWith('image/')) {
++    errorMessage.value = 'Seuls les fichiers images (JPEG, PNG, TIFF, WebP) sont autorisés.'
++    return
++  }
++
++  // 25 Mo limite
++  if (file.size > 25 * 1024 * 1024) {
++    errorMessage.value = 'Le fichier dépasse la taille maximale de 25 Mo.'
++    return
++  }
++
++  errorMessage.value = null
++  selectedImageFile.value = file
++
++  // Aperçu local immédiat
++  const reader = new FileReader()
++  reader.onload = (e) => {
++    localImagePreview.value = e.target?.result as string
++  }
++  reader.readAsDataURL(file)
++
++  // Si la photo existe déjà en base, on déclenche directement l'upload API pour actualisation immédiate
++  if (form.value.id) {
++    try {
++      isUploadingImage.value = true
++      uploadProgress.value = true
++      const uploadRes = await photoApi.uploadPhotoImage(form.value.id, file)
++      form.value.thumb_url = uploadRes.thumb_url
++      form.value.display_url = uploadRes.display_url
++      form.value.original_url = uploadRes.original_url
++      localImagePreview.value = null
++      emit('toast', 'Image téléversée et déclinaisons WebP générées avec succès !', 'success')
++      if (uploadRes.photo) {
++        emit('saved', uploadRes.photo)
++      }
++    } catch (err: any) {
++      errorMessage.value = err.message || "Erreur lors de l'upload de l'image"
++      emit('toast', errorMessage.value || 'Erreur upload', 'error')
++    } finally {
++      isUploadingImage.value = false
++      uploadProgress.value = false
++    }
++  }
++}
++
++// Soumission du formulaire
++async function handleSubmit() {
++  errorMessage.value = null
++
++  if (!form.value.title.trim()) {
++    errorMessage.value = 'Le titre du cliché est obligatoire.'
++    return
++  }
++
++  // Règle d'or de la spec : Aucune publication sans coordonnées GPS
++  if (form.value.status === 'published' && !hasCoordinates.value) {
++    errorMessage.value = 'Coordonnées GPS obligatoires pour publier. Veuillez renseigner la latitude et la longitude ou conserver le statut brouillon.'
++    emit('toast', errorMessage.value, 'error')
++    activeTab.value = 'geo'
++    return
++  }
++
++  const lat = parseNullableNumber(form.value.latitude)
++  const lng = parseNullableNumber(form.value.longitude)
++  if ((lat === null) !== (lng === null)) {
++    errorMessage.value = 'La latitude et la longitude doivent être renseignées ensemble.'
++    emit('toast', errorMessage.value, 'error')
++    activeTab.value = 'geo'
++    return
++  }
++
++  try {
++    isSubmitting.value = true
++
++    let savedPhoto: Photo
++
++    if (form.value.id) {
++      // Mise à jour de la photo existante
++      const payload: PhotoUpdatePayload = {
++        title: form.value.title.trim(),
++        description: form.value.description.trim() || null,
++        photographer: form.value.photographer.trim() || null,
++        year_taken: form.value.year_taken ? Number(form.value.year_taken) : null,
++        date_exact: form.value.date_exact.trim() || null,
++        period_label: form.value.period_label.trim() || null,
++        archive_source: form.value.archive_source.trim() || null,
++        archive_ref: form.value.archive_ref.trim() || null,
++        original_source_url: form.value.original_source_url.trim() || null,
++        license: form.value.license,
++        latitude: lat,
++        longitude: lng,
++        bearing: parseNullableNumber(form.value.bearing),
++        field_of_view: Number(form.value.field_of_view || 60),
++        status: form.value.status,
++      }
++
++      savedPhoto = await photoApi.updatePhoto(form.value.id, payload)
++      emit('toast', `Fiche "${savedPhoto.title}" mise à jour avec succès.`, 'success')
++    } else {
++      // Création d'une nouvelle photo
++      const payload: PhotoCreatePayload = {
++        title: form.value.title.trim(),
++        description: form.value.description.trim() || null,
++        photographer: form.value.photographer.trim() || null,
++        year_taken: form.value.year_taken ? Number(form.value.year_taken) : null,
++        date_exact: form.value.date_exact.trim() || null,
++        period_label: form.value.period_label.trim() || null,
++        archive_source: form.value.archive_source.trim() || null,
++        archive_ref: form.value.archive_ref.trim() || null,
++        original_source_url: form.value.original_source_url.trim() || null,
++        license: form.value.license,
++        latitude: lat,
++        longitude: lng,
++        bearing: parseNullableNumber(form.value.bearing),
++        field_of_view: Number(form.value.field_of_view || 60),
++        status: form.value.status,
++      }
++
++      savedPhoto = await photoApi.createPhoto(payload)
++
++      // Si un fichier image a été sélectionné pour cette nouvelle photo, on le téléverse immédiatement
++      if (selectedImageFile.value) {
++        try {
++          isUploadingImage.value = true
++          const uploadRes = await photoApi.uploadPhotoImage(savedPhoto.id, selectedImageFile.value)
++          if (uploadRes.photo) {
++            savedPhoto = uploadRes.photo
++          }
++        } catch (uploadErr: any) {
++          emit(
++            'toast',
++            `Fiche créée mais échec du traitement de l'image : ${uploadErr.message}`,
++            'error'
++          )
++        }
++      }
++
++      emit('toast', `Nouveau cliché "${savedPhoto.title}" enregistré avec succès.`, 'success')
++    }
++
++    emit('saved', savedPhoto)
++    emit('close')
++  } catch (err: any) {
++    if (err instanceof ApiError) {
++      errorMessage.value = err.message
++    } else {
++      errorMessage.value = err.message || "Une erreur inattendue s'est produite lors de la sauvegarde."
++    }
++    emit('toast', errorMessage.value || 'Erreur', 'error')
++  } finally {
++    isSubmitting.value = false
++    isUploadingImage.value = false
++  }
++}
++</script>
++
++<template>
++  <div
++    v-if="isOpen"
++    class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm overflow-y-auto"
++    @click.self="emit('close')"
++  >
++    <div
++      class="bg-slate-900 border border-slate-700/80 rounded-2xl w-full max-w-4xl shadow-2xl flex flex-col max-h-[90vh] overflow-hidden animate-in fade-in zoom-in-95 duration-150"
++      role="dialog"
++      aria-modal="true"
++    >
++      <!-- En-tête de la modale -->
++      <div class="px-6 py-4 border-b border-slate-800 flex items-center justify-between bg-slate-950/50">
++        <div class="flex items-center space-x-3">
++          <div
++            class="w-10 h-10 rounded-xl flex items-center justify-center text-lg"
++            :class="form.id ? 'bg-indigo-950/80 text-indigo-400 border border-indigo-700' : 'bg-emerald-950/80 text-emerald-400 border border-emerald-700'"
++          >
++            {{ form.id ? '✏️' : '📸' }}
++          </div>
++          <div>
++            <h2 class="text-lg font-bold text-white tracking-tight">
++              {{ form.id ? 'Modifier le cliché d\'archive' : 'Nouveau cliché patrimonial' }}
++            </h2>
++            <p class="text-xs text-slate-400">
++              {{ form.id ? 'Mise à jour des métadonnées et du géoréférencement' : 'Saisie documentaire et rattachement au territoire actif' }}
++            </p>
++          </div>
++        </div>
++
++        <button
++          type="button"
++          class="p-2 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++          @click="emit('close')"
++          aria-label="Fermer la boîte de dialogue"
++        >
++          <svg class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
++            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
++          </svg>
++        </button>
++      </div>
++
++      <!-- Alerte de blocage publication sans GPS -->
++      <div
++        v-if="isPublishBlocked"
++        class="bg-amber-950/80 border-b border-amber-800/80 px-6 py-3 flex items-center gap-3 text-amber-200 text-sm"
++      >
++        <span class="text-xl">⚠️</span>
++        <div>
++          <strong class="font-semibold text-amber-300">Coordonnées GPS obligatoires pour publier</strong>
++          <p class="text-xs text-amber-200/90 mt-0.5">
++            Vous avez sélectionné le statut <em>Publié</em>, mais ce cliché ne dispose pas encore de latitude/longitude.
++            Renseignez ses coordonnées dans l'onglet <strong>Géolocalisation</strong> ou basculez le statut sur <strong>Brouillon (draft)</strong>.
++          </p>
++        </div>
++      </div>
++
++      <!-- Alerte d'erreur générique -->
++      <div
++        v-if="errorMessage && !isPublishBlocked"
++        class="bg-rose-950/80 border-b border-rose-800/80 px-6 py-3 flex items-center gap-3 text-rose-200 text-sm"
++      >
++        <span class="text-xl">❌</span>
++        <div class="flex-1 text-xs">
++          {{ errorMessage }}
++        </div>
++      </div>
++
++      <!-- Navigation par onglets -->
++      <div class="flex border-b border-slate-800 bg-slate-900/60 px-6 pt-2 gap-2 text-sm">
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'document' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'document'"
++        >
++          <span>📜</span>
++          <span>Notice & Métadonnées</span>
++        </button>
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'geo' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'geo'"
++        >
++          <span>📍</span>
++          <span>Géoréférencement</span>
++          <span
++            v-if="hasCoordinates"
++            class="w-2 h-2 rounded-full bg-emerald-400"
++            title="Coordonnées renseignées"
++          ></span>
++          <span
++            v-else
++            class="w-2 h-2 rounded-full bg-amber-500"
++            title="Non géolocalisé"
++          ></span>
++        </button>
++        <button
++          type="button"
++          class="px-4 py-2.5 font-medium border-b-2 transition-all flex items-center gap-2"
++          :class="activeTab === 'media' ? 'border-sky-500 text-sky-400 bg-slate-800/40' : 'border-transparent text-slate-400 hover:text-slate-200'"
++          @click="activeTab = 'media'"
++        >
++          <span>🖼️</span>
++          <span>Image & Numérisation</span>
++          <span
++            v-if="currentPreviewUrl"
++            class="w-2 h-2 rounded-full bg-emerald-400"
++            title="Image attachée"
++          ></span>
++        </button>
++      </div>
++
++      <!-- Corps du formulaire scrollable -->
++      <form class="flex-1 overflow-y-auto p-6 space-y-6" @submit.prevent="handleSubmit">
++        <!-- ONGLET 1 : Notice & Métadonnées documentaires -->
++        <div v-show="activeTab === 'document'" class="space-y-5">
++          <!-- Titre (obligatoire) -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              Titre du cliché <span class="text-rose-400">*</span>
++            </label>
++            <input
++              v-model="form.title"
++              type="text"
++              required
++              placeholder="Ex: Le Quai Cronstadt et les cuirassés en rade"
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++            />
++          </div>
++
++          <!-- Statut et Licence -->
++          <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Statut de publication <span class="text-rose-400">*</span>
++              </label>
++              <select
++                v-model="form.status"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++              >
++                <option value="draft">Brouillon (draft - masqué au public)</option>
++                <option value="published">Publié (published - visible sur la carte)</option>
++              </select>
++              <p class="text-[11px] text-slate-400 mt-1">
++                Le mode brouillon autorise l'enregistrement partiel sans coordonnées GPS.
++              </p>
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Licence de diffusion <span class="text-rose-400">*</span>
++              </label>
++              <select
++                v-model="form.license"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm"
++              >
++                <option
++                  v-for="lic in PHOTO_LICENSES"
++                  :key="lic.value"
++                  :value="lic.value"
++                >
++                  {{ lic.label }}
++                </option>
++              </select>
++              <p class="text-[11px] text-slate-400 mt-1">
++                {{ PHOTO_LICENSES.find(l => l.value === form.license)?.description }}
++              </p>
++            </div>
++          </div>
++
++          <!-- Description historique -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              Description & Contexte Historique
++            </label>
++            <textarea
++              v-model="form.description"
++              rows="3"
++              placeholder="Description documentaire de la vue, des monuments ou navires visibles, de l'événement immortalisé..."
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2.5 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all text-sm resize-y"
++            ></textarea>
++          </div>
++
++          <!-- Auteur et Datation -->
++          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Photographe / Auteur
++              </label>
++              <input
++                v-model="form.photographer"
++                type="text"
++                placeholder="Ex: Marius Bar, Félix Mesguich"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Année de prise de vue
++              </label>
++              <input
++                v-model.number="form.year_taken"
++                type="number"
++                min="1800"
++                max="2030"
++                placeholder="Ex: 1912"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Date précise (si connue)
++              </label>
++              <input
++                v-model="form.date_exact"
++                type="text"
++                placeholder="Ex: 1912-05-14"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++          </div>
++
++          <!-- Période et Fonds d'archives -->
++          <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Époque / Période
++              </label>
++              <input
++                v-model="form.period_label"
++                type="text"
++                placeholder="Ex: Belle Époque, Reconstruction"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Institution d'archive
++              </label>
++              <input
++                v-model="form.archive_source"
++                type="text"
++                placeholder="Ex: Arch. Municipales de Toulon"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++
++            <div>
++              <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++                Cote d'inventaire
++              </label>
++              <input
++                v-model="form.archive_ref"
++                type="text"
++                placeholder="Ex: 21Fi45, 4S128"
++                class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++              />
++            </div>
++          </div>
++
++          <!-- Lien source / notice -->
++          <div>
++            <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1.5">
++              URL de la notice d'origine
++            </label>
++            <input
++              v-model="form.original_source_url"
++              type="url"
++              placeholder="https://archives.toulon.fr/fonds/photos/21Fi45"
++              class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm"
++            />
++          </div>
++        </div>
++
++        <!-- ONGLET 2 : Géoréférencement & Azimut -->
++        <div v-show="activeTab === 'geo'" class="space-y-4">
++          <PhotoLocationPicker
++            ref="locationPickerRef"
++            :latitude="form.latitude"
++            :longitude="form.longitude"
++            :bearing="form.bearing"
++            :field-of-view="form.field_of_view"
++            @update:latitude="form.latitude = $event"
++            @update:longitude="form.longitude = $event"
++            @update:bearing="form.bearing = $event"
++            @update:field-of-view="form.field_of_view = $event"
++          />
++        </div>
++
++        <!-- ONGLET 3 : Image & Numérisation -->
++        <div v-show="activeTab === 'media'" class="space-y-5">
++          <!-- Zone Drag & Drop -->
++          <div
++            class="border-2 border-dashed rounded-2xl p-6 text-center transition-all cursor-pointer flex flex-col items-center justify-center relative overflow-hidden"
++            :class="isUploadingImage ? 'border-sky-500 bg-sky-950/20' : 'border-slate-700 hover:border-slate-500 bg-slate-900/40 hover:bg-slate-800/30'"
++            @dragover.prevent
++            @drop="handleDrop"
++            @click="fileInputRef?.click()"
++          >
++            <input
++              ref="fileInputRef"
++              type="file"
++              accept="image/jpeg,image/png,image/webp,image/tiff"
++              class="hidden"
++              @change="handleFileSelect"
++            />
++
++            <!-- Spinner pendant le téléversement -->
++            <div v-if="isUploadingImage" class="py-8 flex flex-col items-center gap-3">
++              <div class="w-10 h-10 border-4 border-sky-400 border-t-transparent rounded-full animate-spin"></div>
++              <p class="text-sm font-semibold text-sky-300">Traitement de l'image & conversion WebP...</p>
++              <p class="text-xs text-slate-400">Génération des déclinaisons (original, display 2048px, thumb 400px)</p>
++            </div>
++
++            <!-- Aperçu de l'image -->
++            <div v-else-if="currentPreviewUrl" class="space-y-4 w-full">
++              <div class="relative max-h-64 mx-auto rounded-lg overflow-hidden border border-slate-700 bg-black flex items-center justify-center">
++                <img
++                  :src="currentPreviewUrl"
++                  alt="Aperçu du cliché"
++                  class="max-h-64 object-contain"
++                />
++                <span class="absolute top-2 right-2 px-2 py-1 bg-slate-900/80 backdrop-blur rounded text-[11px] font-mono text-slate-300 border border-slate-700">
++                  WebP Optimisé
++                </span>
++              </div>
++
++              <div class="text-xs text-slate-400">
++                <span class="text-sky-400 font-medium hover:underline">Cliquer ou déposer</span> un nouveau fichier pour remplacer l'image existante (Max 25 Mo).
++              </div>
++            </div>
++
++            <!-- Placeholder sans image -->
++            <div v-else class="py-8 space-y-3">
++              <div class="w-12 h-12 mx-auto rounded-full bg-slate-800 flex items-center justify-center text-2xl text-slate-400">
++                📷
++              </div>
++              <div>
++                <p class="text-sm font-semibold text-white">
++                  Glissez-déposez le fichier numérisé ici, ou <span class="text-sky-400 underline">parcourez vos dossiers</span>
++                </p>
++                <p class="text-xs text-slate-400 mt-1">
++                  Formats acceptés : JPEG, PNG, TIFF, WebP (Jusqu'à 25 Mo).
++                </p>
++              </div>
++            </div>
++          </div>
++
++          <!-- Informations sur le pipeline d'ingestion -->
++          <div class="p-4 rounded-xl bg-slate-800/40 border border-slate-700/60 text-xs text-slate-400 space-y-1.5">
++            <div class="font-semibold text-slate-300">ℹ️ Pipeline automatique d'archivage (Pillow WebP) :</div>
++            <ul class="list-disc pl-4 space-y-1">
++              <li>Le fichier original haute définition est conservé intact pour la conservation patrimoniale.</li>
++              <li>Une version WebP affichage (display) max 2048px qualité 85 est générée pour les écrans et la carte.</li>
++              <li>Une vignette WebP (thumb) max 400px qualité 80 est générée pour les aperçus rapides.</li>
++              <li>Les métadonnées EXIF potentiellement vulnérables sont désinfectées automatiquement.</li>
++            </ul>
++          </div>
++        </div>
++      </form>
++
++      <!-- Pied de la modale avec actions -->
++      <div class="px-6 py-4 border-t border-slate-800 bg-slate-950/70 flex items-center justify-between">
++        <div class="text-xs text-slate-400">
++          <span v-if="form.status === 'published'" class="inline-flex items-center gap-1.5 text-emerald-400">
++            <span class="w-2 h-2 rounded-full bg-emerald-400"></span> Publication immédiate sur la carte
++          </span>
++          <span v-else class="inline-flex items-center gap-1.5 text-amber-400">
++            <span class="w-2 h-2 rounded-full bg-amber-400"></span> Sauvegarde en brouillon (mode draft)
++          </span>
++        </div>
++
++        <div class="flex items-center gap-3">
++          <button
++            type="button"
++            class="px-4 py-2 text-sm font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 rounded-lg transition-colors"
++            @click="emit('close')"
++          >
++            Annuler
++          </button>
++
++          <button
++            type="button"
++            class="px-5 py-2 text-sm font-medium text-white rounded-lg transition-all flex items-center gap-2 shadow-lg"
++            :class="canSubmit ? 'bg-sky-600 hover:bg-sky-500 shadow-sky-900/30' : 'bg-slate-800 text-slate-500 cursor-not-allowed border border-slate-700'"
++            :disabled="!canSubmit"
++            :title="isPublishBlocked ? 'Coordonnées GPS obligatoires pour publier' : ''"
++            @click="handleSubmit"
++          >
++            <span v-if="isSubmitting" class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++            <span>{{ isSubmitting ? 'Enregistrement...' : (form.status === 'published' ? 'Publier la fiche' : 'Enregistrer le brouillon') }}</span>
++          </button>
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
+diff --git a/frontend/src/components/admin/PhotoLocationPicker.vue b/frontend/src/components/admin/PhotoLocationPicker.vue
+new file mode 100644
+index 0000000..034a2a4
+--- /dev/null
++++ b/frontend/src/components/admin/PhotoLocationPicker.vue
+@@ -0,0 +1,716 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted, watch, nextTick, computed } from 'vue'
++import maplibregl from 'maplibre-gl'
++import {
++  createViewConePolygon,
++  createEmptyFeatureCollection,
++  roundCoordinate,
++  normalizeBearing,
++  clampFov,
++} from '@/utils/geo'
++import { photoApi } from '@/services/api'
++
++const props = withDefaults(
++  defineProps<{
++    latitude: number | null
++    longitude: number | null
++    bearing: number | null
++    fieldOfView?: number
++    defaultCenter?: { lat: number; lng: number; zoom?: number } | null
++  }>(),
++  {
++    fieldOfView: 60,
++    defaultCenter: () => ({ lat: 43.1242, lng: 5.9328, zoom: 14 }), // Défaut Toulon
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'update:latitude', val: number | null): void
++  (e: 'update:longitude', val: number | null): void
++  (e: 'update:bearing', val: number | null): void
++  (e: 'update:fieldOfView', val: number): void
++  (
++    e: 'change',
++    val: {
++      latitude: number | null
++      longitude: number | null
++      bearing: number | null
++      fieldOfView: number
++    }
++  ): void
++}>()
++
++const mapContainerRef = ref<HTMLDivElement | null>(null)
++let map: maplibregl.Map | null = null
++let marker: maplibregl.Marker | null = null
++let resizeObserver: ResizeObserver | null = null
++
++const isMapReady = ref(false)
++
++// Coordonnées locales pour réactivité instantanée
++const currentLat = computed(() => (props.latitude !== null && !isNaN(props.latitude) ? props.latitude : null))
++const currentLng = computed(() => (props.longitude !== null && !isNaN(props.longitude) ? props.longitude : null))
++const currentBearing = computed(() => normalizeBearing(props.bearing ?? 0))
++const currentFov = computed(() => clampFov(props.fieldOfView ?? 60))
++
++const hasCoordinates = computed(() => currentLat.value !== null && currentLng.value !== null)
++
++// Direction cardinale lisible
++const cardinalDirection = computed(() => {
++  const b = currentBearing.value
++  if (b >= 337.5 || b < 22.5) return 'Nord (N)'
++  if (b >= 22.5 && b < 67.5) return 'Nord-Est (NE)'
++  if (b >= 67.5 && b < 112.5) return 'Est (E)'
++  if (b >= 112.5 && b < 157.5) return 'Sud-Est (SE)'
++  if (b >= 157.5 && b < 202.5) return 'Sud (S)'
++  if (b >= 202.5 && b < 247.5) return 'Sud-Ouest (SO)'
++  if (b >= 247.5 && b < 292.5) return 'Ouest (O)'
++  return 'Nord-Ouest (NO)'
++})
++
++// Configuration du style OpenStreetMap libre
++const OSM_STYLE: maplibregl.StyleSpecification = {
++  version: 8,
++  sources: {
++    osm: {
++      type: 'raster',
++      tiles: ['https://tile.openstreetmap.org/{z}/{x}/{y}.png'],
++      tileSize: 256,
++      attribution:
++        '&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> contributeurs',
++      maxzoom: 19,
++    },
++  },
++  layers: [
++    {
++      id: 'osm-tiles',
++      type: 'raster',
++      source: 'osm',
++      minzoom: 0,
++      maxzoom: 19,
++    },
++  ],
++}
++
++/**
++ * Met à jour les couches vectorielles du cône de vue GeoJSON sur la carte
++ */
++function updateViewConeLayer() {
++  if (!map || !map.isStyleLoaded()) return
++
++  const source = map.getSource('view-cone-source') as maplibregl.GeoJSONSource | undefined
++  if (!source) return
++
++  if (currentLat.value !== null && currentLng.value !== null) {
++    const conePolygon = createViewConePolygon(
++      currentLng.value,
++      currentLat.value,
++      currentBearing.value,
++      currentFov.value,
++      220, // Distance en mètres sur la carte
++      2
++    )
++    source.setData(conePolygon)
++  } else {
++    source.setData(createEmptyFeatureCollection())
++  }
++}
++
++/**
++ * Initialise ou met à jour la position du marqueur sur la carte
++ */
++function updateMarkerPosition() {
++  if (!map) return
++
++  if (currentLat.value !== null && currentLng.value !== null) {
++    const lngLat: [number, number] = [currentLng.value, currentLat.value]
++
++    if (!marker) {
++      // Création d'un élément HTML personnalisé pour le marqueur avec indicateur de cap
++      const el = document.createElement('div')
++      el.className = 'hierici-camera-marker'
++      el.innerHTML = `
++        <div class="relative flex items-center justify-center w-8 h-8 rounded-full bg-sky-500 text-white shadow-xl border-2 border-white cursor-grab active:cursor-grabbing hover:scale-110 transition-transform">
++          <svg class="w-4 h-4 fill-current" viewBox="0 0 20 20">
++            <path d="M4 5a2 2 0 00-2 2v8a2 2 0 002 2h12a2 2 0 002-2V7a2 2 0 00-2-2h-1.586a1 1 0 01-.707-.293l-1.121-1.121A2 2 0 0011.172 3H8.828a2 2 0 00-1.414.586L6.293 4.707A1 1 0 015.586 5H4zm6 9a3 3 0 110-6 3 3 0 010 6z" />
++          </svg>
++        </div>
++      `
++
++      marker = new maplibregl.Marker({
++        element: el,
++        draggable: true,
++      })
++        .setLngLat(lngLat)
++        .addTo(map)
++
++      marker.on('drag', () => {
++        if (!marker) return
++        const pos = marker.getLngLat()
++        const lat = roundCoordinate(pos.lat, 6)
++        const lng = roundCoordinate(pos.lng, 6)
++        emit('update:latitude', lat)
++        emit('update:longitude', lng)
++        updateViewConeLayer()
++      })
++
++      marker.on('dragend', () => {
++        if (!marker) return
++        const pos = marker.getLngLat()
++        const lat = roundCoordinate(pos.lat, 6)
++        const lng = roundCoordinate(pos.lng, 6)
++        emitCoordinatesChange(lat, lng, currentBearing.value, currentFov.value)
++      })
++    } else {
++      marker.setLngLat(lngLat)
++    }
++  } else {
++    if (marker) {
++      marker.remove()
++      marker = null
++    }
++  }
++
++  updateViewConeLayer()
++}
++
++/**
++ * Notifie le parent des changements de coordonnées
++ */
++function emitCoordinatesChange(
++  lat: number | null,
++  lng: number | null,
++  bearing: number | null,
++  fov: number
++) {
++  emit('update:latitude', lat)
++  emit('update:longitude', lng)
++  emit('update:bearing', bearing)
++  emit('update:fieldOfView', fov)
++  emit('change', {
++    latitude: lat,
++    longitude: lng,
++    bearing,
++    fieldOfView: fov,
++  })
++}
++
++/**
++ * Gère le clic direct sur le canvas cartographique
++ */
++function handleMapClick(e: maplibregl.MapMouseEvent) {
++  const lat = roundCoordinate(e.lngLat.lat, 6)
++  const lng = roundCoordinate(e.lngLat.lng, 6)
++
++  // Si aucun bearing n'était encore défini, on initialise à 0° (Nord)
++  const bearingToUse = props.bearing ?? 0
++
++  emitCoordinatesChange(lat, lng, bearingToUse, currentFov.value)
++}
++
++/**
++ * Recentre la vue sur le marqueur ou le territoire actif
++ */
++function centerOnMarker() {
++  if (!map) return
++  if (currentLat.value !== null && currentLng.value !== null) {
++    map.flyTo({
++      center: [currentLng.value, currentLat.value],
++      zoom: 16,
++      duration: 800,
++    })
++  } else if (props.defaultCenter) {
++    map.flyTo({
++      center: [props.defaultCenter.lng, props.defaultCenter.lat],
++      zoom: props.defaultCenter.zoom || 14,
++      duration: 800,
++    })
++  }
++}
++
++/**
++ * Efface le pointement géographique du cliché
++ */
++function clearPosition() {
++  if (marker) {
++    marker.remove()
++    marker = null
++  }
++  emitCoordinatesChange(null, null, props.bearing, currentFov.value)
++}
++
++/**
++ * Met à jour l'azimut depuis les contrôles interactifs
++ */
++function setBearing(val: number) {
++  const norm = normalizeBearing(val)
++  emit('update:bearing', norm)
++  emit('change', {
++    latitude: currentLat.value,
++    longitude: currentLng.value,
++    bearing: norm,
++    fieldOfView: currentFov.value,
++  })
++  updateViewConeLayer()
++}
++
++/**
++ * Met à jour l'ouverture angulaire (FOV)
++ */
++function setFieldOfView(val: number) {
++  const clamped = clampFov(val)
++  emit('update:fieldOfView', clamped)
++  emit('change', {
++    latitude: currentLat.value,
++    longitude: currentLng.value,
++    bearing: currentBearing.value,
++    fieldOfView: clamped,
++  })
++  updateViewConeLayer()
++}
++
++/**
++ * Modification manuelle de la latitude
++ */
++function handleManualLatInput(e: Event) {
++  const target = e.target as HTMLInputElement
++  const raw = target.value.trim()
++  if (raw === '') {
++    emit('update:latitude', null)
++    return
++  }
++  const val = parseFloat(raw)
++  if (!isNaN(val) && val >= -90 && val <= 90) {
++    const lat = roundCoordinate(val, 6)
++    emit('update:latitude', lat)
++    emit('change', {
++      latitude: lat,
++      longitude: currentLng.value,
++      bearing: currentBearing.value,
++      fieldOfView: currentFov.value,
++    })
++  }
++}
++
++/**
++ * Modification manuelle de la longitude
++ */
++function handleManualLngInput(e: Event) {
++  const target = e.target as HTMLInputElement
++  const raw = target.value.trim()
++  if (raw === '') {
++    emit('update:longitude', null)
++    return
++  }
++  const val = parseFloat(raw)
++  if (!isNaN(val) && val >= -180 && val <= 180) {
++    const lng = roundCoordinate(val, 6)
++    emit('update:longitude', lng)
++    emit('change', {
++      latitude: currentLat.value,
++      longitude: lng,
++      bearing: currentBearing.value,
++      fieldOfView: currentFov.value,
++    })
++  }
++}
++
++onMounted(() => {
++  if (!mapContainerRef.value) return
++
++  // Calcul du centre initial
++  let initialCenter: [number, number] = [5.9328, 43.1242]
++  let initialZoom = 14
++
++  if (props.latitude !== null && props.longitude !== null) {
++    initialCenter = [props.longitude, props.latitude]
++    initialZoom = 16
++  } else if (props.defaultCenter) {
++    initialCenter = [props.defaultCenter.lng, props.defaultCenter.lat]
++    initialZoom = props.defaultCenter.zoom || 14
++  }
++
++  // Instanciation de MapLibre GL
++  map = new maplibregl.Map({
++    container: mapContainerRef.value,
++    style: OSM_STYLE,
++    center: initialCenter,
++    zoom: initialZoom,
++    pitch: 0,
++    bearing: 0,
++    attributionControl: false,
++  })
++
++  // Ajout des contrôles de zoom et boussole intégrés
++  map.addControl(new maplibregl.NavigationControl({ showCompass: true }), 'top-right')
++  map.addControl(
++    new maplibregl.AttributionControl({
++      compact: true,
++      customAttribution: 'Données cartographiques © OpenStreetMap',
++    }),
++    'bottom-right'
++  )
++
++  map.on('load', () => {
++    if (!map) return
++
++    // Ajout de la source GeoJSON pour le cône de vue
++    map.addSource('view-cone-source', {
++      type: 'geojson',
++      data: createEmptyFeatureCollection(),
++    })
++
++    // Remplissage semi-transparent du cône
++    map.addLayer({
++      id: 'view-cone-fill',
++      type: 'fill',
++      source: 'view-cone-source',
++      layout: {},
++      paint: {
++        'fill-color': '#0ea5e9',
++        'fill-opacity': 0.35,
++      },
++    })
++
++    // Bordure vectorielle du cône
++    map.addLayer({
++      id: 'view-cone-stroke',
++      type: 'line',
++      source: 'view-cone-source',
++      layout: {
++        'line-cap': 'round',
++        'line-join': 'round',
++      },
++      paint: {
++        'line-color': '#0284c7',
++        'line-width': 2,
++        'line-dasharray': [2, 2],
++      },
++    })
++
++    isMapReady.value = true
++
++    // Initialisation du marqueur et du cône si déjà géolocalisé
++    updateMarkerPosition()
++    updateViewConeLayer()
++
++    // Si la photo n'est pas encore géolocalisée, résolution du territoire actif pour recentrage
++    if (currentLat.value === null || currentLng.value === null) {
++      photoApi
++        .getCurrentTerritory()
++        .then((terr) => {
++          if (terr && map && (currentLat.value === null || currentLng.value === null)) {
++            map.flyTo({
++              center: [terr.center_lng, terr.center_lat],
++              zoom: terr.default_zoom || 14,
++              duration: 500,
++            })
++          }
++        })
++        .catch(() => {})
++    }
++  })
++
++  map.on('click', handleMapClick)
++
++  // Observation des redimensionnements pour synchroniser le canvas WebGL
++  resizeObserver = new ResizeObserver(() => {
++    map?.resize()
++  })
++  resizeObserver.observe(mapContainerRef.value)
++
++  // Force le resize après le rendu du modal
++  nextTick(() => {
++    setTimeout(() => {
++      map?.resize()
++    }, 150)
++  })
++})
++
++onUnmounted(() => {
++  if (resizeObserver) {
++    resizeObserver.disconnect()
++    resizeObserver = null
++  }
++  if (marker) {
++    marker.remove()
++    marker = null
++  }
++  if (map) {
++    map.remove()
++    map = null
++  }
++})
++
++// Réaction aux changements de coordonnées externes
++watch(
++  () => [props.latitude, props.longitude],
++  ([newLat, newLng], [oldLat, oldLng]) => {
++    if (isMapReady.value) {
++      updateMarkerPosition()
++      if (
++        newLat !== null &&
++        newLng !== null &&
++        (oldLat === null || oldLng === null || oldLat === undefined)
++      ) {
++        centerOnMarker()
++      }
++    }
++  }
++)
++
++// Réaction aux changements d'orientation ou d'ouverture angulaire
++watch(
++  () => [props.bearing, props.fieldOfView],
++  () => {
++    if (isMapReady.value) {
++      updateViewConeLayer()
++    }
++  }
++)
++
++// Méthode publique exposée pour redimensionner la carte lors du changement d'onglet
++defineExpose({
++  resize: () => {
++    map?.resize()
++  },
++  centerOnMarker,
++})
++</script>
++
++<template>
++  <div class="space-y-4">
++    <!-- Barre d'état du positionnement -->
++    <div class="flex flex-wrap items-center justify-between gap-3 p-3 rounded-xl bg-slate-900 border border-slate-800">
++      <div class="flex items-center gap-2.5">
++        <span
++          class="flex h-3 w-3 rounded-full"
++          :class="hasCoordinates ? 'bg-emerald-400 animate-pulse' : 'bg-amber-500'"
++        ></span>
++        <div>
++          <span class="text-xs font-semibold text-white">
++            {{ hasCoordinates ? 'Position définie' : 'Non géolocalisé' }}
++          </span>
++          <span v-if="hasCoordinates" class="text-xs font-mono text-sky-400 ml-2">
++            {{ currentLat?.toFixed(6) }}°, {{ currentLng?.toFixed(6) }}°
++          </span>
++          <p v-else class="text-[11px] text-slate-400">
++            Cliquez sur la carte ou glissez le marqueur pour placer la prise de vue.
++          </p>
++        </div>
++      </div>
++
++      <div class="flex items-center gap-2">
++        <button
++          v-if="hasCoordinates"
++          type="button"
++          class="px-2.5 py-1 text-xs font-medium text-slate-300 hover:text-white bg-slate-800 hover:bg-slate-700 border border-slate-700 rounded-lg transition-colors flex items-center gap-1.5"
++          @click="centerOnMarker"
++          title="Centrer la carte sur le marqueur"
++        >
++          <span>🎯</span>
++          <span>Centrer</span>
++        </button>
++
++        <button
++          v-if="hasCoordinates"
++          type="button"
++          class="px-2.5 py-1 text-xs font-medium text-rose-400 hover:text-rose-300 bg-rose-950/50 hover:bg-rose-900/60 border border-rose-800/80 rounded-lg transition-colors flex items-center gap-1.5"
++          @click="clearPosition"
++          title="Supprimer la géolocalisation pour ce cliché"
++        >
++          <span>✕</span>
++          <span>Effacer la position</span>
++        </button>
++      </div>
++    </div>
++
++    <!-- Conteneur de la Carte MapLibre GL -->
++    <div class="relative w-full h-80 sm:h-96 rounded-xl overflow-hidden border border-slate-700/80 shadow-inner bg-slate-950">
++      <div ref="mapContainerRef" class="w-full h-full"></div>
++
++      <!-- Indicateur d'aide flottant -->
++      <div
++        v-if="!hasCoordinates"
++        class="absolute top-3 left-3 z-10 bg-slate-900/90 backdrop-blur-md border border-slate-700/80 rounded-lg px-3 py-1.5 text-xs text-slate-200 shadow-md flex items-center gap-2 pointer-events-none"
++      >
++        <span class="text-sky-400 text-sm">📍</span>
++        <span>Cliquez sur la carte pour positionner le cliché</span>
++      </div>
++    </div>
++
++    <!-- Saisie numérique directe des coordonnées -->
++    <div class="grid grid-cols-1 sm:grid-cols-2 gap-4">
++      <div>
++        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1">
++          Latitude WGS84 (6 décimales)
++        </label>
++        <input
++          type="number"
++          step="0.000001"
++          min="-90"
++          max="90"
++          placeholder="Ex: 43.124500"
++          :value="currentLat ?? ''"
++          @input="handleManualLatInput"
++          class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-mono"
++        />
++      </div>
++
++      <div>
++        <label class="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-1">
++          Longitude WGS84 (6 décimales)
++        </label>
++        <input
++          type="number"
++          step="0.000001"
++          min="-180"
++          max="180"
++          placeholder="Ex: 5.928500"
++          :value="currentLng ?? ''"
++          @input="handleManualLngInput"
++          class="w-full bg-slate-800/90 border border-slate-700 rounded-lg px-3.5 py-2 text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 text-sm font-mono"
++        />
++      </div>
++    </div>
++
++    <!-- Contrôles interactifs de l'azimut et du cône de vue -->
++    <div class="p-4 rounded-xl bg-slate-900/80 border border-slate-800 space-y-4">
++      <div class="flex items-center justify-between">
++        <h4 class="text-xs font-bold text-white uppercase tracking-wider flex items-center gap-2">
++          <span>🧭</span>
++          <span>Orientation de prise de vue (Azimut & Cône)</span>
++        </h4>
++        <span class="text-xs font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
++          {{ currentBearing }}° — {{ cardinalDirection }}
++        </span>
++      </div>
++
++      <div class="grid grid-cols-1 md:grid-cols-12 gap-5 items-center">
++        <!-- Boussole rotative visuelle -->
++        <div class="md:col-span-3 flex flex-col items-center justify-center p-3 rounded-lg bg-slate-950/60 border border-slate-800/80">
++          <div
++            class="relative w-20 h-20 rounded-full border-2 border-slate-700 bg-slate-900 flex items-center justify-center shadow-md transition-transform duration-200"
++            :style="{ transform: `rotate(${currentBearing}deg)` }"
++          >
++            <!-- Aiguille de la boussole -->
++            <div class="absolute top-1.5 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-b-[24px] border-b-rose-500"></div>
++            <div class="absolute bottom-1.5 w-0 h-0 border-l-[6px] border-l-transparent border-r-[6px] border-r-transparent border-t-[24px] border-t-slate-500"></div>
++            <div class="w-2.5 h-2.5 rounded-full bg-white z-10 shadow"></div>
++          </div>
++          <span class="text-[10px] font-mono text-slate-400 mt-2">Cap : {{ currentBearing }}°</span>
++        </div>
++
++        <!-- Réglages Azimut (Curseur + Raccourcis cardinaux) -->
++        <div class="md:col-span-9 space-y-3">
++          <div class="space-y-1.5">
++            <div class="flex justify-between items-center text-xs">
++              <span class="text-slate-300 font-medium">Curseur d'azimut (0° à 359°)</span>
++              <div class="flex items-center gap-2">
++                <input
++                  type="number"
++                  min="0"
++                  max="359"
++                  :value="currentBearing"
++                  @input="setBearing(Number(($event.target as HTMLInputElement).value))"
++                  class="w-20 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-right text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-sky-500"
++                />
++                <span class="text-slate-400">degrés</span>
++              </div>
++            </div>
++
++            <input
++              type="range"
++              min="0"
++              max="359"
++              step="1"
++              :value="currentBearing"
++              @input="setBearing(Number(($event.target as HTMLInputElement).value))"
++              class="w-full accent-sky-500 cursor-pointer h-2 bg-slate-800 rounded-lg"
++            />
++          </div>
++
++          <!-- Raccourcis cardinaux rapides -->
++          <div class="flex items-center gap-2 pt-1">
++            <span class="text-[11px] text-slate-400 mr-1">Raccourcis :</span>
++            <button
++              type="button"
++              class="px-2.5 py-1 text-xs rounded border transition-colors font-medium"
++              :class="currentBearing === 0 ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'"
++              @click="setBearing(0)"
++            >
++              Nord (0°)
++            </button>
++            <button
++              type="button"
++              class="px-2.5 py-1 text-xs rounded border transition-colors font-medium"
++              :class="currentBearing === 90 ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'"
++              @click="setBearing(90)"
++            >
++              Est (90°)
++            </button>
++            <button
++              type="button"
++              class="px-2.5 py-1 text-xs rounded border transition-colors font-medium"
++              :class="currentBearing === 180 ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'"
++              @click="setBearing(180)"
++            >
++              Sud (180°)
++            </button>
++            <button
++              type="button"
++              class="px-2.5 py-1 text-xs rounded border transition-colors font-medium"
++              :class="currentBearing === 270 ? 'bg-sky-600 border-sky-500 text-white' : 'bg-slate-800 border-slate-700 text-slate-300 hover:bg-slate-700'"
++              @click="setBearing(270)"
++            >
++              Ouest (270°)
++            </button>
++          </div>
++        </div>
++      </div>
++
++      <!-- Ouverture angulaire (Champ de vision - FOV) -->
++      <div class="pt-3 border-t border-slate-800/80 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
++        <div class="space-y-0.5">
++          <label class="block text-xs font-medium text-slate-300">
++            Ouverture du champ de vision (FOV) : <strong class="text-sky-400 font-mono">{{ currentFov }}°</strong>
++          </label>
++          <p class="text-[11px] text-slate-500">
++            Standard: 60° (focale normale 50mm) • 90° (grand angle) • 35° (téléobjectif). Borné entre 10° et 120°.
++          </p>
++        </div>
++
++        <div class="flex items-center gap-3">
++          <input
++            type="range"
++            min="10"
++            max="120"
++            step="5"
++            :value="currentFov"
++            @input="setFieldOfView(Number(($event.target as HTMLInputElement).value))"
++            class="w-36 sm:w-44 accent-sky-500 cursor-pointer h-2 bg-slate-800 rounded-lg"
++          />
++          <input
++            type="number"
++            min="10"
++            max="120"
++            :value="currentFov"
++            @input="setFieldOfView(Number(($event.target as HTMLInputElement).value))"
++            class="w-16 bg-slate-800 border border-slate-700 rounded px-2 py-1 text-right text-xs font-mono text-white focus:outline-none focus:ring-1 focus:ring-sky-500"
++          />
++          <span class="text-xs text-slate-400">°</span>
++        </div>
++      </div>
++    </div>
++  </div>
++</template>
++
++<style>
++/* Style personnalisé pour le marqueur photo MapLibre */
++.hierici-camera-marker {
++  cursor: grab;
++}
++.hierici-camera-marker:active {
++  cursor: grabbing;
++}
++</style>
+diff --git a/frontend/src/main.ts b/frontend/src/main.ts
+new file mode 100644
+index 0000000..cae87d8
+--- /dev/null
++++ b/frontend/src/main.ts
+@@ -0,0 +1,11 @@
++import { createApp } from 'vue'
++import { createPinia } from 'pinia'
++import App from './App.vue'
++import './assets/style.css'
++import 'maplibre-gl/dist/maplibre-gl.css'
++
++const app = createApp(App)
++app.use(createPinia())
++app.mount('#app')
++
++
+diff --git a/frontend/src/utils/geo.ts b/frontend/src/utils/geo.ts
+new file mode 100644
+index 0000000..3b962ed
+--- /dev/null
++++ b/frontend/src/utils/geo.ts
+@@ -0,0 +1,139 @@
++/**
++/**
++ * Utilitaires géographiques et trigonométriques pour le calcul du cône de vue orienté
++ * dans le référentiel WGS84 (EPSG:4326).
++ */
++
++export interface ViewConeProperties {
++  bearing: number
++  field_of_view: number
++  distance: number
++  center_lat: number
++  center_lng: number
++}
++
++export type ViewConeFeature = GeoJSON.Feature<GeoJSON.Polygon, ViewConeProperties>
++
++/**
++ * Arrondit un nombre à un nombre donné de décimales (défaut : 6 décimales ~10 cm).
++ */
++export function roundCoordinate(val: number, decimals: number = 6): number {
++  const factor = Math.pow(10, decimals)
++  return Math.round(val * factor) / factor
++}
++
++/**
++ * Normalise un azimut pour garantir un entier strict entre 0 et 359 degrés.
++ * 0° = Nord, 90° = Est, 180° = Sud, 270° = Ouest.
++ */
++export function normalizeBearing(bearing: number): number {
++  if (isNaN(bearing)) return 0
++  const normalized = Math.round(((bearing % 360) + 360) % 360)
++  return normalized === 360 ? 0 : normalized
++}
++
++/**
++ * Borne l'ouverture angulaire (FOV) entre 10° et 120° (défaut : 60°).
++ */
++export function clampFov(fov: number): number {
++  if (isNaN(fov)) return 60
++  return Math.max(10, Math.min(120, Math.round(fov)))
++}
++
++/**
++ * Calcule le point de destination géographique [longitude, latitude] à partir
++ * d'un point d'origine, d'une distance en mètres et d'un cap en degrés.
++ * Formule directe d'orthodromie (Haversine direct problem) sur sphère terrestre (R = 6 371 000 m).
++ */
++export function destinationPoint(
++  lat: number,
++  lng: number,
++  distanceMeters: number,
++  bearingDegrees: number
++): [number, number] {
++  const R = 6371000 // Rayon moyen de la Terre en mètres
++  const dByR = distanceMeters / R
++  const latRad = (lat * Math.PI) / 180
++  const lngRad = (lng * Math.PI) / 180
++  const bearingRad = (bearingDegrees * Math.PI) / 180
++
++  const destLatRad = Math.asin(
++    Math.sin(latRad) * Math.cos(dByR) +
++      Math.cos(latRad) * Math.sin(dByR) * Math.cos(bearingRad)
++  )
++
++  const destLngRad =
++    lngRad +
++    Math.atan2(
++      Math.sin(bearingRad) * Math.sin(dByR) * Math.cos(latRad),
++      Math.cos(dByR) - Math.sin(latRad) * Math.sin(destLatRad)
++    )
++
++  const destLat = (destLatRad * 180) / Math.PI
++  const destLng = (((destLngRad * 180) / Math.PI + 540) % 360) - 180
++
++  return [roundCoordinate(destLng, 6), roundCoordinate(destLat, 6)]
++}
++
++/**
++ * Génère le polygone GeoJSON (Feature<Polygon>) représentant le cône de vue projeté.
++ * 
++ * Le polygone commence au point de prise de vue [originLng, originLat],
++ * trace un arc de cercle discrétisé entre (bearing - fov/2) et (bearing + fov/2)
++ * à une distance métrique donnée, puis se referme sur le point d'origine.
++ * 
++ * Les coordonnées retournées suivent strictement la convention GeoJSON [longitude, latitude].
++ */
++export function createViewConePolygon(
++  lng: number,
++  lat: number,
++  bearing: number = 0,
++  fov: number = 60,
++  distanceMeters: number = 200,
++  stepDegrees: number = 2
++): ViewConeFeature {
++  const normBearing = normalizeBearing(bearing)
++  const normFov = clampFov(fov)
++  const origin: [number, number] = [roundCoordinate(lng, 6), roundCoordinate(lat, 6)]
++
++  const halfFov = normFov / 2
++  const startAngle = normBearing - halfFov
++  const endAngle = normBearing + halfFov
++
++  const arcPoints: [number, number][] = []
++
++  // Échantillonnage régulier de l'arc
++  for (let angle = startAngle; angle < endAngle; angle += stepDegrees) {
++    arcPoints.push(destinationPoint(origin[1], origin[0], distanceMeters, angle))
++  }
++  // Point final précis de l'arc
++  arcPoints.push(destinationPoint(origin[1], origin[0], distanceMeters, endAngle))
++
++  // Construction de l'anneau linéaire fermé
++  const coordinates: [number, number][] = [origin, ...arcPoints, origin]
++
++  return {
++    type: 'Feature',
++    geometry: {
++      type: 'Polygon',
++      coordinates: [coordinates],
++    },
++    properties: {
++      bearing: normBearing,
++      field_of_view: normFov,
++      distance: distanceMeters,
++      center_lat: origin[1],
++      center_lng: origin[0],
++    },
++  }
++}
++
++/**
++ * Retourne une FeatureCollection GeoJSON vide.
++ */
++export function createEmptyFeatureCollection(): GeoJSON.FeatureCollection {
++  return {
++    type: 'FeatureCollection',
++    features: [],
++  }
++}

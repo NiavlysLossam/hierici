@@ -1,0 +1,2442 @@
+--- /dev/null
++++ b/backend/app/models/storymap.py
+@@ -0,0 +1,165 @@
++import uuid
++from datetime import datetime, timezone
++import enum
++from sqlalchemy import String, Text, Integer, Float, DateTime, Enum, ForeignKey, UniqueConstraint
++from sqlalchemy.dialects.postgresql import UUID
++from sqlalchemy.orm import Mapped, mapped_column, relationship
++from app.core.database import Base
++
++
++class StorymapStatus(str, enum.Enum):
++    DRAFT = "draft"
++    PUBLISHED = "published"
++
++
++class Storymap(Base):
++    __tablename__ = "storymaps"
++    __table_args__ = (
++        UniqueConstraint("territory_id", "slug", name="uq_storymaps_territory_slug"),
++    )
++
++    id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        primary_key=True,
++        default=uuid.uuid4,
++    )
++    territory_id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("territories.id", ondelete="CASCADE"),
++        nullable=False,
++        index=True,
++    )
++    author_user_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("users.id", ondelete="SET NULL"),
++        nullable=True,
++        index=True,
++    )
++
++    slug: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++        index=True,
++    )
++    title: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    summary: Mapped[str | None] = mapped_column(
++        Text,
++        nullable=True,
++    )
++    cover_image_path: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++    status: Mapped[StorymapStatus] = mapped_column(
++        Enum(StorymapStatus, name="storymap_status_enum"),
++        default=StorymapStatus.DRAFT,
++        nullable=False,
++    )
++
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        onupdate=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++
++    # Relations
++    territory = relationship("Territory", backref="storymaps", lazy="selectin")
++    author = relationship("User", backref="storymaps", lazy="selectin")
++    steps = relationship(
++        "StorymapStep",
++        back_populates="storymap",
++        cascade="all, delete-orphan",
++        order_by="StorymapStep.step_order",
++        lazy="selectin",
++    )
++
++
++class StorymapStep(Base):
++    __tablename__ = "storymap_steps"
++
++    id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        primary_key=True,
++        default=uuid.uuid4,
++    )
++    storymap_id: Mapped[uuid.UUID] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("storymaps.id", ondelete="CASCADE"),
++        nullable=False,
++        index=True,
++    )
++    photo_id: Mapped[uuid.UUID | None] = mapped_column(
++        UUID(as_uuid=True),
++        ForeignKey("photos.id", ondelete="SET NULL"),
++        nullable=True,
++        index=True,
++    )
++
++    step_order: Mapped[int] = mapped_column(
++        Integer,
++        nullable=False,
++        default=0,
++        index=True,
++    )
++    title: Mapped[str] = mapped_column(
++        String(255),
++        nullable=False,
++    )
++    content_markdown: Mapped[str | None] = mapped_column(
++        Text,
++        nullable=True,
++    )
++    audio_file_path: Mapped[str | None] = mapped_column(
++        String(1024),
++        nullable=True,
++    )
++
++    # Coordonnées cartographiques caméra MapLibre
++    camera_lat: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++    )
++    camera_lng: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++    )
++    camera_zoom: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++        default=12.0,
++    )
++    camera_bearing: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++        default=0.0,
++    )
++    camera_pitch: Mapped[float] = mapped_column(
++        Float,
++        nullable=False,
++        default=0.0,
++    )
++
++    created_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++    updated_at: Mapped[datetime] = mapped_column(
++        DateTime(timezone=True),
++        default=lambda: datetime.now(timezone.utc),
++        onupdate=lambda: datetime.now(timezone.utc),
++        nullable=False,
++    )
++
++    # Relations
++    storymap = relationship("Storymap", back_populates="steps")
++    photo = relationship("Photo", lazy="selectin")
+--- /dev/null
++++ b/backend/app/schemas/storymap.py
+@@ -0,0 +1,370 @@
++import uuid
++import re
++import unicodedata
++from datetime import datetime
++from typing import Any
++from pydantic import BaseModel, Field, ConfigDict, computed_field, model_validator, field_validator
++from app.models.storymap import StorymapStatus
++from app.schemas.photo import PhotoRead, PhotoPublicRead
++from app.services.storage import resolve_media_url
++
++
++def slugify(value: str) -> str:
++    """Normalise une chaîne pour créer un slug URL-friendly sans accents ni caractères spéciaux."""
++    if not value:
++        return ""
++    value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
++    value = re.sub(r"[^\w\s-]", "", value.lower())
++    return re.sub(r"[-\s]+", "-", value).strip("-_")
++
++
++# ============================================================================
++# Schemas des étapes de storymap (StorymapStep)
++# ============================================================================
++
++class StorymapStepBase(BaseModel):
++    photo_id: uuid.UUID | None = None
++    step_order: int = 0
++    title: str = Field(..., min_length=1, max_length=255, description="Titre du chapitre / étape")
++    content_markdown: str | None = Field(None, description="Texte narratif en Markdown")
++    audio_file_path: str | None = Field(None, description="Chemin du document sonore MP3")
++
++    # Coordonnées caméra MapLibre
++    camera_lat: float = Field(..., ge=-90.0, le=90.0, description="Latitude cible de la caméra")
++    camera_lng: float = Field(..., ge=-180.0, le=180.0, description="Longitude cible de la caméra")
++    camera_zoom: float = Field(default=12.0, ge=0.0, le=24.0, description="Niveau de zoom [0, 24]")
++    camera_bearing: float = Field(default=0.0, ge=0.0, le=360.0, description="Orientation angulaire [0, 360]")
++    camera_pitch: float = Field(default=0.0, ge=0.0, le=85.0, description="Inclinaison 3D [0, 85]")
++
++    @model_validator(mode="before")
++    @classmethod
++    def handle_step_aliases(cls, data: Any) -> Any:
++        if isinstance(data, dict):
++            # Aliases courts caméra
++            if "lat" in data and "camera_lat" not in data:
++                data["camera_lat"] = data["lat"]
++            if "lng" in data and "camera_lng" not in data:
++                data["camera_lng"] = data["lng"]
++            if "zoom" in data and "camera_zoom" not in data:
++                data["camera_zoom"] = data["zoom"]
++            if "bearing" in data and "camera_bearing" not in data:
++                data["camera_bearing"] = data["bearing"]
++            if "pitch" in data and "camera_pitch" not in data:
++                data["camera_pitch"] = data["pitch"]
++
++            # Aliases camelCase
++            if "cameraLat" in data and "camera_lat" not in data:
++                data["camera_lat"] = data["cameraLat"]
++            if "cameraLng" in data and "camera_lng" not in data:
++                data["camera_lng"] = data["cameraLng"]
++            if "cameraZoom" in data and "camera_zoom" not in data:
++                data["camera_zoom"] = data["cameraZoom"]
++            if "cameraBearing" in data and "camera_bearing" not in data:
++                data["camera_bearing"] = data["cameraBearing"]
++            if "cameraPitch" in data and "camera_pitch" not in data:
++                data["camera_pitch"] = data["cameraPitch"]
++            if "stepOrder" in data and "step_order" not in data:
++                data["step_order"] = data["stepOrder"]
++            if "photoId" in data and "photo_id" not in data:
++                data["photo_id"] = data["photoId"]
++            if "contentMarkdown" in data and "content_markdown" not in data:
++                data["content_markdown"] = data["contentMarkdown"]
++            if "audioFilePath" in data and "audio_file_path" not in data:
++                data["audio_file_path"] = data["audioFilePath"]
++        return data
++
++    @field_validator("camera_bearing")
++    @classmethod
++    def normalize_bearing(cls, v: float) -> float:
++        if v == 360.0:
++            return 0.0
++        return v
++
++
++class StorymapStepCreate(StorymapStepBase):
++    pass
++
++
++class StorymapStepUpdate(BaseModel):
++    photo_id: uuid.UUID | None = None
++    step_order: int | None = None
++    title: str | None = Field(None, min_length=1, max_length=255)
++    content_markdown: str | None = None
++    audio_file_path: str | None = None
++
++    camera_lat: float | None = Field(None, ge=-90.0, le=90.0)
++    camera_lng: float | None = Field(None, ge=-180.0, le=180.0)
++    camera_zoom: float | None = Field(None, ge=0.0, le=24.0)
++    camera_bearing: float | None = Field(None, ge=0.0, le=360.0)
++    camera_pitch: float | None = Field(None, ge=0.0, le=85.0)
++
++    @model_validator(mode="before")
++    @classmethod
++    def handle_step_update_aliases(cls, data: Any) -> Any:
++        if isinstance(data, dict):
++            if "lat" in data and "camera_lat" not in data:
++                data["camera_lat"] = data["lat"]
++            if "lng" in data and "camera_lng" not in data:
++                data["camera_lng"] = data["lng"]
++            if "zoom" in data and "camera_zoom" not in data:
++                data["camera_zoom"] = data["zoom"]
++            if "bearing" in data and "camera_bearing" not in data:
++                data["camera_bearing"] = data["bearing"]
++            if "pitch" in data and "camera_pitch" not in data:
++                data["camera_pitch"] = data["pitch"]
++            if "cameraLat" in data and "camera_lat" not in data:
++                data["camera_lat"] = data["cameraLat"]
++            if "cameraLng" in data and "camera_lng" not in data:
++                data["camera_lng"] = data["cameraLng"]
++            if "cameraZoom" in data and "camera_zoom" not in data:
++                data["camera_zoom"] = data["cameraZoom"]
++            if "cameraBearing" in data and "camera_bearing" not in data:
++                data["camera_bearing"] = data["cameraBearing"]
++            if "cameraPitch" in data and "camera_pitch" not in data:
++                data["camera_pitch"] = data["cameraPitch"]
++            if "stepOrder" in data and "step_order" not in data:
++                data["step_order"] = data["stepOrder"]
++            if "photoId" in data and "photo_id" not in data:
++                data["photo_id"] = data["photoId"]
++            if "contentMarkdown" in data and "content_markdown" not in data:
++                data["content_markdown"] = data["contentMarkdown"]
++            if "audioFilePath" in data and "audio_file_path" not in data:
++                data["audio_file_path"] = data["audioFilePath"]
++        return data
++
++    @field_validator("camera_bearing")
++    @classmethod
++    def normalize_bearing(cls, v: float | None) -> float | None:
++        if v == 360.0:
++            return 0.0
++        return v
++
++
++class StorymapStepRead(BaseModel):
++    id: uuid.UUID
++    storymap_id: uuid.UUID
++    photo_id: uuid.UUID | None = None
++    step_order: int
++    title: str
++    content_markdown: str | None = None
++    audio_file_path: str | None = None
++    camera_lat: float
++    camera_lng: float
++    camera_zoom: float
++    camera_bearing: float
++    camera_pitch: float
++    created_at: datetime
++    updated_at: datetime
++    photo: PhotoRead | None = None
++
++    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
++
++    @computed_field
++    @property
++    def audio_url(self) -> str | None:
++        return resolve_media_url(self.audio_file_path)
++
++    @computed_field
++    @property
++    def lat(self) -> float:
++        return self.camera_lat
++
++    @computed_field
++    @property
++    def lng(self) -> float:
++        return self.camera_lng
++
++    @computed_field
++    @property
++    def zoom(self) -> float:
++        return self.camera_zoom
++
++    @computed_field
++    @property
++    def bearing(self) -> float:
++        return self.camera_bearing
++
++    @computed_field
++    @property
++    def pitch(self) -> float:
++        return self.camera_pitch
++
++
++class StorymapStepPublicRead(BaseModel):
++    id: uuid.UUID
++    step_order: int
++    title: str
++    content_markdown: str | None = None
++    camera_lat: float
++    camera_lng: float
++    camera_zoom: float
++    camera_bearing: float
++    camera_pitch: float
++    photo_id: uuid.UUID | None = None
++    photo: PhotoPublicRead | None = None
++
++    # Exclu de la sérialisation publique pour éviter la fuite de chemin de stockage interne
++    audio_file_path: str | None = Field(None, exclude=True)
++
++    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
++
++    @computed_field
++    @property
++    def audio_url(self) -> str | None:
++        return resolve_media_url(self.audio_file_path)
++
++    @computed_field
++    @property
++    def lat(self) -> float:
++        return self.camera_lat
++
++    @computed_field
++    @property
++    def lng(self) -> float:
++        return self.camera_lng
++
++    @computed_field
++    @property
++    def zoom(self) -> float:
++        return self.camera_zoom
++
++    @computed_field
++    @property
++    def bearing(self) -> float:
++        return self.camera_bearing
++
++    @computed_field
++    @property
++    def pitch(self) -> float:
++        return self.camera_pitch
++
++
++# ============================================================================
++# Schemas des récits / storymaps
++# ============================================================================
++
++class StorymapBase(BaseModel):
++    title: str = Field(..., min_length=1, max_length=255, description="Titre de la storymap")
++    summary: str | None = Field(None, description="Résumé introductif")
++    slug: str | None = Field(None, max_length=255, description="Slug URL-friendly optionnel (déduit du titre si omis)")
++    cover_image_path: str | None = Field(None, description="Chemin de l'image de couverture")
++    status: StorymapStatus = Field(default=StorymapStatus.DRAFT, description="Statut de publication (draft / published)")
++
++    @model_validator(mode="before")
++    @classmethod
++    def handle_base_aliases(cls, data: Any) -> Any:
++        if isinstance(data, dict):
++            if "coverImagePath" in data and "cover_image_path" not in data:
++                data["cover_image_path"] = data["coverImagePath"]
++        return data
++
++
++class StorymapCreate(StorymapBase):
++    territory_id: uuid.UUID | None = None
++    steps: list[StorymapStepCreate] = Field(default_factory=list, description="Étapes initiales optionnelles")
++
++    @model_validator(mode="before")
++    @classmethod
++    def handle_create_aliases(cls, data: Any) -> Any:
++        if isinstance(data, dict):
++            if "territoryId" in data and "territory_id" not in data:
++                data["territory_id"] = data["territoryId"]
++            if "coverImagePath" in data and "cover_image_path" not in data:
++                data["cover_image_path"] = data["coverImagePath"]
++        return data
++
++
++class StorymapUpdate(BaseModel):
++    title: str | None = Field(None, min_length=1, max_length=255)
++    summary: str | None = None
++    slug: str | None = Field(None, max_length=255)
++    cover_image_path: str | None = None
++    status: StorymapStatus | None = None
++    territory_id: uuid.UUID | None = None
++
++    @model_validator(mode="before")
++    @classmethod
++    def handle_update_aliases(cls, data: Any) -> Any:
++        if isinstance(data, dict):
++            if "territoryId" in data and "territory_id" not in data:
++                data["territory_id"] = data["territoryId"]
++            if "coverImagePath" in data and "cover_image_path" not in data:
++                data["cover_image_path"] = data["coverImagePath"]
++        return data
++
++
++class StorymapRead(BaseModel):
++    id: uuid.UUID
++    territory_id: uuid.UUID
++    author_user_id: uuid.UUID | None = None
++    slug: str
++    title: str
++    summary: str | None = None
++    cover_image_path: str | None = None
++    status: StorymapStatus
++    created_at: datetime
++    updated_at: datetime
++    steps: list[StorymapStepRead] = Field(default_factory=list)
++
++    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
++
++    @computed_field
++    @property
++    def cover_image_url(self) -> str | None:
++        return resolve_media_url(self.cover_image_path)
++
++    @computed_field
++    @property
++    def steps_count(self) -> int:
++        return len(self.steps)
++
++
++class StorymapPublicRead(BaseModel):
++    id: uuid.UUID
++    territory_id: uuid.UUID
++    slug: str
++    title: str
++    summary: str | None = None
++    status: StorymapStatus
++    created_at: datetime
++    updated_at: datetime
++    steps: list[StorymapStepPublicRead] = Field(default_factory=list)
++
++    # Exclu de la sérialisation publique pour éviter la fuite de métadonnées sensibles internes
++    cover_image_path: str | None = Field(None, exclude=True)
++
++    model_config = ConfigDict(from_attributes=True, populate_by_name=True)
++
++    @computed_field
++    @property
++    def cover_image_url(self) -> str | None:
++        return resolve_media_url(self.cover_image_path)
++
++    @computed_field
++    @property
++    def steps_count(self) -> int:
++        return len(self.steps)
++
++
++class StorymapListResponse(BaseModel):
++    items: list[StorymapRead]
++    total: int
++    page: int
++    page_size: int
++    pages: int
++
++
++class StorymapPublicListResponse(BaseModel):
++    items: list[StorymapPublicRead]
++    total: int
++    page: int
++    page_size: int
++    pages: int
++
++
++class StorymapReorderPayload(BaseModel):
++    step_ids: list[uuid.UUID] = Field(
++        ...,
++        min_length=1,
++        description="Liste ordonnée exhaustive des identifiants d'étapes de la storymap",
++    )
+--- /dev/null
++++ b/backend/app/api/v1/admin/storymaps.py
+@@ -0,0 +1,667 @@
++import math
++import uuid
++import logging
++from datetime import datetime, timezone
++from typing import Annotated
++from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from sqlalchemy.orm import selectinload
++
++from app.core.database import get_db
++from app.core.auth import get_current_active_user
++from app.models.user import User, UserRole
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++from app.models.photo import Photo
++from app.schemas.storymap import (
++    slugify,
++    StorymapCreate,
++    StorymapUpdate,
++    StorymapRead,
++    StorymapListResponse,
++    StorymapStepCreate,
++    StorymapStepUpdate,
++    StorymapStepRead,
++    StorymapReorderPayload,
++)
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/admin/storymaps", tags=["Administration Storymaps"])
++
++
++async def _generate_unique_slug(db: AsyncSession, territory_id: uuid.UUID, base_text: str, current_id: uuid.UUID | None = None) -> str:
++    """Génère un slug normalisé unique pour un territoire donné."""
++    clean_slug = slugify(base_text)
++    if not clean_slug:
++        clean_slug = f"recit-{uuid.uuid4().hex[:6]}"
++
++    clean_slug = clean_slug[:240]
++
++    candidate = clean_slug
++    counter = 1
++    while True:
++        stmt = select(Storymap.id).where(
++            Storymap.territory_id == territory_id,
++            Storymap.slug == candidate,
++        )
++        if current_id:
++            stmt = stmt.where(Storymap.id != current_id)
++        result = await db.execute(stmt)
++        if result.scalar_one_or_none() is None:
++            return candidate
++        counter += 1
++        candidate = f"{clean_slug}-{counter}"
++
++
++async def _validate_photo_id(db: AsyncSession, territory_id: uuid.UUID, photo_id: uuid.UUID | None) -> None:
++    """Vérifie qu'une photo existe et appartient bien au même territoire (AD-2)."""
++    if photo_id is not None:
++        stmt = select(Photo.id).where(
++            Photo.id == photo_id,
++            Photo.territory_id == territory_id,
++        )
++        result = await db.execute(stmt)
++        if result.scalar_one_or_none() is None:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "INVALID_PHOTO",
++                        "message": "Photo introuvable ou non autorisée dans ce territoire.",
++                    }
++                },
++            )
++
++
++@router.post(
++    "",
++    response_model=StorymapRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Créer une nouvelle storymap",
++)
++async def create_storymap(
++    storymap_in: StorymapCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Crée une nouvelle storymap rattachée au territoire actif et à l'auteur connecté.
++    Permet l'ajout facultatif d'étapes initiales ordonnées.
++    """
++    # 1. Résolution stricte du territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        if not current_user.territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_403_FORBIDDEN,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_NOT_ASSIGNED",
++                        "message": "Le contributeur n'a aucun territoire assigné.",
++                    }
++                },
++            )
++        target_territory_id = current_user.territory_id
++    else:
++        target_territory_id = storymap_in.territory_id or current_user.territory_id
++        if not target_territory_id:
++            raise HTTPException(
++                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
++                detail={
++                    "error": {
++                        "code": "TERRITORY_REQUIRED",
++                        "message": "Un territoire_id est requis pour créer une storymap.",
++                    }
++                },
++            )
++
++    # 2. Slug automatique unique
++    slug_source = storymap_in.slug.strip() if storymap_in.slug else storymap_in.title
++    unique_slug = await _generate_unique_slug(db, target_territory_id, slug_source)
++
++    # 3. Création de l'entité Storymap
++    new_storymap = Storymap(
++        territory_id=target_territory_id,
++        author_user_id=current_user.id,
++        slug=unique_slug,
++        title=storymap_in.title,
++        summary=storymap_in.summary,
++        cover_image_path=storymap_in.cover_image_path,
++        status=storymap_in.status,
++    )
++
++    # 4. Étapes initiales optionnelles avec validation territoriale de photo_id
++    for idx, step_in in enumerate(storymap_in.steps):
++        await _validate_photo_id(db, target_territory_id, step_in.photo_id)
++        order = step_in.step_order if step_in.step_order > 0 else idx
++        step = StorymapStep(
++            storymap=new_storymap,
++            photo_id=step_in.photo_id,
++            step_order=order,
++            title=step_in.title,
++            content_markdown=step_in.content_markdown,
++            audio_file_path=step_in.audio_file_path,
++            camera_lat=step_in.camera_lat,
++            camera_lng=step_in.camera_lng,
++            camera_zoom=step_in.camera_zoom,
++            camera_bearing=step_in.camera_bearing,
++            camera_pitch=step_in.camera_pitch,
++        )
++        new_storymap.steps.append(step)
++
++    db.add(new_storymap)
++    await db.commit()
++    await db.refresh(new_storymap)
++
++    # Recharger avec les étapes et photos associées
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++            selectinload(Storymap.territory),
++        )
++        .where(Storymap.id == new_storymap.id)
++    )
++    res = await db.execute(stmt)
++    persisted = res.scalar_one()
++
++    return StorymapRead.model_validate(persisted)
++
++
++@router.get(
++    "",
++    response_model=StorymapListResponse,
++    summary="Lister les storymaps du territoire actif",
++)
++async def list_storymaps(
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    status_filter: StorymapStatus | None = Query(None, alias="status", description="Filtrer par statut"),
++    search: str | None = Query(None, description="Recherche textuelle sur le titre ou résumé"),
++    territory_id: uuid.UUID | None = Query(None, description="Filtre territoire réservé aux superadmins"),
++) -> StorymapListResponse:
++    """Retourne la liste paginée des storymaps du territoire du contributeur."""
++    base_query = select(Storymap).options(
++        selectinload(Storymap.steps),
++        selectinload(Storymap.author),
++    )
++
++    # Cloisonnement multi-territoire
++    if current_user.role != UserRole.SUPERADMIN:
++        base_query = base_query.where(Storymap.territory_id == current_user.territory_id)
++    else:
++        if territory_id:
++            base_query = base_query.where(Storymap.territory_id == territory_id)
++        elif current_user.territory_id:
++            base_query = base_query.where(Storymap.territory_id == current_user.territory_id)
++
++    if status_filter:
++        base_query = base_query.where(Storymap.status == status_filter)
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Storymap.title.ilike(term) | Storymap.summary.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri chronologique inversé
++    paginated_query = (
++        base_query.order_by(Storymap.created_at.desc(), Storymap.id.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return StorymapListResponse(
++        items=[StorymapRead.model_validate(item) for item in items],
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.get(
++    "/{id}",
++    response_model=StorymapRead,
++    summary="Consulter le détail administratif d'une storymap avec ses étapes",
++)
++async def get_storymap(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Retourne une storymap par identifiant unique."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.put(
++    "/{id}",
++    response_model=StorymapRead,
++    summary="Mettre à jour les métadonnées d'une storymap",
++)
++async def update_storymap(
++    id: uuid.UUID,
++    storymap_in: StorymapUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Met à jour le titre, le résumé, le slug ou le statut de publication d'une storymap."""
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == id)
++    )
++
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    update_data = storymap_in.model_dump(exclude_unset=True)
++
++    if "title" in update_data:
++        storymap.title = update_data["title"]
++    if "summary" in update_data:
++        storymap.summary = update_data["summary"]
++    if "cover_image_path" in update_data:
++        storymap.cover_image_path = update_data["cover_image_path"]
++    if "status" in update_data:
++        storymap.status = update_data["status"]
++
++    if "slug" in update_data and update_data["slug"] is not None and update_data["slug"].strip():
++        new_slug = await _generate_unique_slug(
++            db, storymap.territory_id, update_data["slug"], current_id=storymap.id
++        )
++        storymap.slug = new_slug
++
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(storymap)
++
++    return StorymapRead.model_validate(storymap)
++
++
++@router.delete(
++    "/{id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une storymap et toutes ses étapes (cascade)",
++)
++async def delete_storymap(
++    id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Supprime définitivement une storymap et propage la suppression en cascade à toutes ses étapes."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    await db.delete(storymap)
++    await db.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
++
++
++# ============================================================================
++# Gestion des étapes (StorymapStep)
++# ============================================================================
++
++@router.post(
++    "/{id}/steps",
++    response_model=StorymapStepRead,
++    status_code=status.HTTP_201_CREATED,
++    summary="Ajouter un chapitre / étape à une storymap",
++)
++async def add_storymap_step(
++    id: uuid.UUID,
++    step_in: StorymapStepCreate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapStepRead:
++    """Ajoute une nouvelle étape ordonnée avec cadrage cartographique à la storymap."""
++    stmt = (
++        select(Storymap)
++        .options(selectinload(Storymap.steps))
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    # Validation d'isolation territoriale de la photo liée
++    await _validate_photo_id(db, storymap.territory_id, step_in.photo_id)
++
++    # Calcul de l'ordre séquentiel si non fourni
++    if step_in.step_order <= 0 and storymap.steps:
++        next_order = max(s.step_order for s in storymap.steps) + 1
++    else:
++        next_order = step_in.step_order
++
++    new_step = StorymapStep(
++        storymap_id=storymap.id,
++        photo_id=step_in.photo_id,
++        step_order=next_order,
++        title=step_in.title,
++        content_markdown=step_in.content_markdown,
++        audio_file_path=step_in.audio_file_path,
++        camera_lat=step_in.camera_lat,
++        camera_lng=step_in.camera_lng,
++        camera_zoom=step_in.camera_zoom,
++        camera_bearing=step_in.camera_bearing,
++        camera_pitch=step_in.camera_pitch,
++    )
++
++    db.add(new_step)
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(new_step)
++
++    # Charger la photo liée si présente
++    if new_step.photo_id:
++        step_stmt = (
++            select(StorymapStep)
++            .options(selectinload(StorymapStep.photo))
++            .where(StorymapStep.id == new_step.id)
++        )
++        step_res = await db.execute(step_stmt)
++        new_step = step_res.scalar_one()
++
++    return StorymapStepRead.model_validate(new_step)
++
++
++@router.put(
++    "/{id}/steps/reorder",
++    response_model=StorymapRead,
++    summary="Réordonner atomiquement les étapes d'une storymap",
++)
++async def reorder_storymap_steps(
++    id: uuid.UUID,
++    payload: StorymapReorderPayload,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapRead:
++    """Met à jour atomiquement les champs `step_order` (0, 1, 2...) de l'ensemble des étapes d'une storymap."""
++    ordered_ids = payload.step_ids
++
++    stmt = (
++        select(Storymap)
++        .options(selectinload(Storymap.steps).selectinload(StorymapStep.photo))
++        .where(Storymap.id == id)
++    )
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_map = {step.id: step for step in storymap.steps}
++
++    # Vérifier que les IDs reçus correspondent exactement aux étapes existantes (ni doublons, ni manquants)
++    if len(ordered_ids) != len(step_map) or set(ordered_ids) != set(step_map.keys()):
++        raise HTTPException(
++            status_code=status.HTTP_400_BAD_REQUEST,
++            detail={
++                "error": {
++                    "code": "INVALID_STEP_IDS",
++                    "message": "La liste des identifiants d'étapes ne correspond pas exactement aux étapes de ce récit.",
++                }
++            },
++        )
++
++    # Réordonnancement atomique
++    for new_order, step_id in enumerate(ordered_ids):
++        step_map[step_id].step_order = new_order
++        step_map[step_id].updated_at = datetime.now(timezone.utc)
++
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    await db.refresh(storymap)
++
++    # Recharger les étapes triées
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++            selectinload(Storymap.author),
++        )
++        .where(Storymap.id == storymap.id)
++    )
++    reloaded = (await db.execute(stmt)).scalar_one()
++
++    return StorymapRead.model_validate(reloaded)
++
++
++@router.put(
++    "/{id}/steps/{step_id}",
++    response_model=StorymapStepRead,
++    summary="Mettre à jour un chapitre / étape",
++)
++async def update_storymap_step(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    step_in: StorymapStepUpdate,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++) -> StorymapStepRead:
++    """Met à jour le contenu, le cadrage cartographique ou la photo d'une étape."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = (
++        select(StorymapStep)
++        .options(selectinload(StorymapStep.photo))
++        .where(StorymapStep.id == step_id, StorymapStep.storymap_id == id)
++    )
++    step_result = await db.execute(step_stmt)
++    step = step_result.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    update_data = step_in.model_dump(exclude_unset=True)
++
++    if "photo_id" in update_data:
++        await _validate_photo_id(db, storymap.territory_id, update_data["photo_id"])
++        step.photo_id = update_data["photo_id"]
++    if "title" in update_data:
++        step.title = update_data["title"]
++    if "content_markdown" in update_data:
++        step.content_markdown = update_data["content_markdown"]
++    if "audio_file_path" in update_data:
++        step.audio_file_path = update_data["audio_file_path"]
++    if "step_order" in update_data and update_data["step_order"] is not None:
++        step.step_order = update_data["step_order"]
++
++    if "camera_lat" in update_data and update_data["camera_lat"] is not None:
++        step.camera_lat = update_data["camera_lat"]
++    if "camera_lng" in update_data and update_data["camera_lng"] is not None:
++        step.camera_lng = update_data["camera_lng"]
++    if "camera_zoom" in update_data and update_data["camera_zoom"] is not None:
++        step.camera_zoom = update_data["camera_zoom"]
++    if "camera_bearing" in update_data and update_data["camera_bearing"] is not None:
++        step.camera_bearing = update_data["camera_bearing"]
++    if "camera_pitch" in update_data and update_data["camera_pitch"] is not None:
++        step.camera_pitch = update_data["camera_pitch"]
++
++    step.updated_at = datetime.now(timezone.utc)
++    storymap.updated_at = datetime.now(timezone.utc)
++
++    await db.commit()
++    await db.refresh(step)
++
++    # Recharger avec photo si photo_id est défini
++    if step.photo_id:
++        step_stmt = (
++            select(StorymapStep)
++            .options(selectinload(StorymapStep.photo))
++            .where(StorymapStep.id == step.id)
++        )
++        step = (await db.execute(step_stmt)).scalar_one()
++
++    return StorymapStepRead.model_validate(step)
++
++
++@router.delete(
++    "/{id}/steps/{step_id}",
++    status_code=status.HTTP_204_NO_CONTENT,
++    summary="Supprimer une étape d'une storymap",
++)
++async def delete_storymap_step(
++    id: uuid.UUID,
++    step_id: uuid.UUID,
++    current_user: Annotated[User, Depends(get_current_active_user)],
++    db: AsyncSession = Depends(get_db),
++):
++    """Supprime une étape spécifique d'une storymap."""
++    stmt = select(Storymap).where(Storymap.id == id)
++    if current_user.role != UserRole.SUPERADMIN:
++        stmt = stmt.where(Storymap.territory_id == current_user.territory_id)
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non autorisée.",
++                }
++            },
++        )
++
++    step_stmt = select(StorymapStep).where(
++        StorymapStep.id == step_id,
++        StorymapStep.storymap_id == id,
++    )
++    step_res = await db.execute(step_stmt)
++    step = step_res.scalar_one_or_none()
++
++    if not step:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STEP_NOT_FOUND",
++                    "message": "Étape introuvable dans cette storymap.",
++                }
++            },
++        )
++
++    await db.delete(step)
++    storymap.updated_at = datetime.now(timezone.utc)
++    await db.commit()
++    return Response(status_code=status.HTTP_204_NO_CONTENT)
+--- /dev/null
++++ b/backend/app/api/v1/public/storymaps.py
+@@ -0,0 +1,165 @@
++import math
++import uuid
++import logging
++from typing import Annotated
++from fastapi import APIRouter, Depends, HTTPException, Query, status
++from sqlalchemy import select, func
++from sqlalchemy.ext.asyncio import AsyncSession
++from sqlalchemy.orm import selectinload
++
++from app.core.database import get_db
++from app.core.territory import get_current_territory
++from app.models.territory import Territory
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++from app.models.photo import Photo, PhotoStatus
++from app.schemas.storymap import (
++    StorymapPublicRead,
++    StorymapPublicListResponse,
++    StorymapStepPublicRead,
++)
++from app.schemas.photo import PhotoPublicRead
++
++logger = logging.getLogger(__name__)
++
++router = APIRouter(prefix="/storymaps", tags=["Storymaps Publiques"])
++
++
++def _format_public_storymap(storymap: Storymap) -> StorymapPublicRead:
++    """Formate une storymap pour l'exposition publique en masquant les photos non publiées
++    et en évitant toute fuite de métadonnées sensibles (chemins de fichiers internes, author_user_id).
++    """
++    public_steps: list[StorymapStepPublicRead] = []
++    for step in storymap.steps:
++        photo_public = None
++        if step.photo and step.photo.status == PhotoStatus.PUBLISHED:
++            photo_public = PhotoPublicRead.model_validate(step.photo)
++
++        public_step = StorymapStepPublicRead(
++            id=step.id,
++            step_order=step.step_order,
++            title=step.title,
++            content_markdown=step.content_markdown,
++            audio_file_path=step.audio_file_path,
++            camera_lat=step.camera_lat,
++            camera_lng=step.camera_lng,
++            camera_zoom=step.camera_zoom,
++            camera_bearing=step.camera_bearing,
++            camera_pitch=step.camera_pitch,
++            photo_id=step.photo_id if photo_public else None,
++            photo=photo_public,
++        )
++        public_steps.append(public_step)
++
++    return StorymapPublicRead(
++        id=storymap.id,
++        territory_id=storymap.territory_id,
++        slug=storymap.slug,
++        title=storymap.title,
++        summary=storymap.summary,
++        status=storymap.status,
++        created_at=storymap.created_at,
++        updated_at=storymap.updated_at,
++        cover_image_path=storymap.cover_image_path,
++        steps=public_steps,
++    )
++
++
++@router.get(
++    "",
++    response_model=StorymapPublicListResponse,
++    summary="Catalogue des récits publiés du territoire actif",
++)
++async def list_public_storymaps(
++    territory: Annotated[Territory, Depends(get_current_territory)],
++    db: Annotated[AsyncSession, Depends(get_db)],
++    page: int = Query(1, ge=1, description="Numéro de page"),
++    page_size: int = Query(20, ge=1, le=100, description="Taille de la page"),
++    search: str | None = Query(None, min_length=1, max_length=100, description="Recherche textuelle"),
++) -> StorymapPublicListResponse:
++    """Retourne la liste paginée des storymaps publiées du territoire actif.
++    Ne divulgue aucun brouillon ni chemin interne.
++    """
++    base_query = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++        )
++        .where(
++            Storymap.territory_id == territory.id,
++            Storymap.status == StorymapStatus.PUBLISHED,
++        )
++    )
++
++    if search and search.strip():
++        term = f"%{search.strip()}%"
++        base_query = base_query.where(
++            Storymap.title.ilike(term) | Storymap.summary.ilike(term)
++        )
++
++    # Comptage total
++    count_query = select(func.count()).select_from(base_query.subquery())
++    total_result = await db.execute(count_query)
++    total = total_result.scalar_one()
++
++    # Pagination & tri
++    paginated_query = (
++        base_query.order_by(Storymap.created_at.desc(), Storymap.id.desc())
++        .offset((page - 1) * page_size)
++        .limit(page_size)
++    )
++    items_result = await db.execute(paginated_query)
++    items = list(items_result.scalars().all())
++
++    pages = math.ceil(total / page_size) if total > 0 else 1
++
++    return StorymapPublicListResponse(
++        items=[_format_public_storymap(item) for item in items],
++        total=total,
++        page=page,
++        page_size=page_size,
++        pages=pages,
++    )
++
++
++@router.get(
++    "/{slug}",
++    response_model=StorymapPublicRead,
++    summary="Consulter un récit publié par son slug",
++)
++async def get_public_storymap_detail(
++    slug: str,
++    territory: Annotated[Territory, Depends(get_current_territory)],
++    db: Annotated[AsyncSession, Depends(get_db)],
++) -> StorymapPublicRead:
++    """Retourne les détails et l'ensemble des étapes ordonnées d'une storymap publiée.
++    Renvoie 404 (STORYMAP_NOT_FOUND) si le récit est introuvable, en statut draft ou rattaché à un autre territoire.
++    """
++    clean_slug = slug.strip().lower()
++
++    stmt = (
++        select(Storymap)
++        .options(
++            selectinload(Storymap.steps).selectinload(StorymapStep.photo),
++        )
++        .where(
++            Storymap.slug == clean_slug,
++            Storymap.territory_id == territory.id,
++            Storymap.status == StorymapStatus.PUBLISHED,
++        )
++    )
++
++    result = await db.execute(stmt)
++    storymap = result.scalar_one_or_none()
++
++    if not storymap:
++        raise HTTPException(
++            status_code=status.HTTP_404_NOT_FOUND,
++            detail={
++                "error": {
++                    "code": "STORYMAP_NOT_FOUND",
++                    "message": "Storymap introuvable ou non publiée dans ce territoire.",
++                }
++            },
++        )
++
++    return _format_public_storymap(storymap)
+--- /dev/null
++++ b/backend/app/api/v1/__init__.py
+@@ -0,0 +1,17 @@
++from fastapi import APIRouter
++from app.api.v1.public.territory import router as territory_router
++from app.api.v1.public.photos import router as photos_public_router
++from app.api.v1.public.storymaps import router as storymaps_public_router
++from app.api.v1.auth import router as auth_router
++from app.api.v1.admin.base import router as admin_router
++from app.api.v1.admin.photos import router as photos_admin_router
++from app.api.v1.admin.storymaps import router as storymaps_admin_router
++
++api_v1_router = APIRouter(prefix="/api/v1")
++api_v1_router.include_router(territory_router)
++api_v1_router.include_router(photos_public_router)
++api_v1_router.include_router(storymaps_public_router)
++api_v1_router.include_router(auth_router)
++api_v1_router.include_router(admin_router)
++api_v1_router.include_router(photos_admin_router)
++api_v1_router.include_router(storymaps_admin_router)
+--- /dev/null
++++ b/backend/app/core/init_db.py
+@@ -0,0 +1,71 @@
++import logging
++from sqlalchemy import text, select
++from app.core.database import engine, AsyncSessionLocal, Base
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++from app.core.security import hash_password
++from app.config import settings
++
++logger = logging.getLogger(__name__)
++
++
++async def init_db() -> None:
++    """Initialise l'extension PostGIS, crée les tables et le territoire initial + superadmin si besoin."""
++    async with engine.begin() as conn:
++        try:
++            # Active l'extension PostGIS
++            await conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
++            logger.info("Extension PostGIS vérifiée / activée avec succès.")
++        except Exception as e:
++            logger.warning(f"Note sur l'activation PostGIS: {e}")
++
++        # Crée toutes les tables déclarées (territories, users, etc.) si elles n'existent pas
++        await conn.run_sync(Base.metadata.create_all)
++        logger.info("Schéma des tables de la base de données synchronisé.")
++
++    # Vérification et initialisation des données de base
++    async with AsyncSessionLocal() as session:
++        # 1. Territoire pilote
++        result_territory = await session.execute(
++            select(Territory).where(Territory.slug == settings.DEFAULT_TERRITORY_SLUG)
++        )
++        existing_territory = result_territory.scalar_one_or_none()
++
++        if not existing_territory:
++            default_territory = Territory(
++                slug=settings.DEFAULT_TERRITORY_SLUG,
++                name="Territoire Pilote",
++                center_lat=43.1242,
++                center_lng=5.9280,
++                default_zoom=13,
++            )
++            session.add(default_territory)
++            await session.commit()
++            await session.refresh(default_territory)
++            existing_territory = default_territory
++            logger.info(f"Territoire par défaut créé: '{settings.DEFAULT_TERRITORY_SLUG}'.")
++        else:
++            logger.info(f"Territoire '{settings.DEFAULT_TERRITORY_SLUG}' déjà existant.")
++
++        # 2. Compte Superadmin initial
++        result_user = await session.execute(
++            select(User).where(User.email == settings.ADMIN_EMAIL)
++        )
++        existing_admin = result_user.scalar_one_or_none()
++
++        if not existing_admin:
++            admin_user = User(
++                email=settings.ADMIN_EMAIL,
++                password_hash=hash_password(settings.ADMIN_PASSWORD),
++                full_name=settings.ADMIN_FULL_NAME,
++                role=UserRole.SUPERADMIN,
++                territory_id=existing_territory.id,
++                is_active=True,
++            )
++            session.add(admin_user)
++            await session.commit()
++            logger.info(f"Compte Superadmin initial créé: '{settings.ADMIN_EMAIL}'.")
++        else:
++            logger.info(f"Compte Superadmin '{settings.ADMIN_EMAIL}' déjà existant.")
+--- /dev/null
++++ b/backend/tests/test_storymaps.py
+@@ -0,0 +1,893 @@
++import uuid
++import pytest
++from httpx import AsyncClient, ASGITransport
++from sqlalchemy import select, delete
++
++from app.main import app
++from app.core.database import AsyncSessionLocal
++from app.core.auth import get_current_active_user
++from app.models.territory import Territory
++from app.models.user import User, UserRole
++from app.models.photo import Photo, PhotoStatus
++from app.models.storymap import Storymap, StorymapStep, StorymapStatus
++
++
++@pytest.fixture
++async def setup_storymaps_test_data():
++    """Prépare deux territoires, deux contributeurs et deux photos (une publiée, une brouillon) pour les tests."""
++    async with AsyncSessionLocal() as session:
++        t_a = Territory(
++            id=uuid.uuid4(),
++            slug=f"toulon-{uuid.uuid4().hex[:6]}",
++            name="Toulon Test",
++            center_lat=43.12,
++            center_lng=5.93,
++            default_zoom=13,
++        )
++        t_b = Territory(
++            id=uuid.uuid4(),
++            slug=f"marseille-{uuid.uuid4().hex[:6]}",
++            name="Marseille Test",
++            center_lat=43.29,
++            center_lng=5.37,
++            default_zoom=13,
++        )
++        session.add_all([t_a, t_b])
++        await session.commit()
++        await session.refresh(t_a)
++        await session.refresh(t_b)
++
++        u_a = User(
++            id=uuid.uuid4(),
++            email=f"contrib_a_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Jean Toulon",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        u_b = User(
++            id=uuid.uuid4(),
++            email=f"contrib_b_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Claire Marseille",
++            role=UserRole.CONTRIBUTOR,
++            territory_id=t_b.id,
++            is_active=True,
++        )
++        super_admin = User(
++            id=uuid.uuid4(),
++            email=f"superadmin_{uuid.uuid4().hex[:6]}@example.com",
++            password_hash="fakehash",
++            full_name="Admin Principal",
++            role=UserRole.SUPERADMIN,
++            territory_id=t_a.id,
++            is_active=True,
++        )
++        session.add_all([u_a, u_b, super_admin])
++        await session.commit()
++        await session.refresh(u_a)
++        await session.refresh(u_b)
++        await session.refresh(super_admin)
++
++        photo_pub_a = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo d'archive port 1900",
++            latitude=43.12,
++            longitude=5.93,
++            bearing=90,
++            field_of_view=60,
++            file_original_path="private/storage/original_photo.jpg",
++            file_display_path="private/storage/display_photo.webp",
++            file_thumb_path="private/storage/thumb_photo.webp",
++            status=PhotoStatus.PUBLISHED,
++        )
++        photo_draft_a = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo d'archive confidentielle non publiée",
++            latitude=43.12,
++            longitude=5.93,
++            file_display_path="private/storage/draft.webp",
++            status=PhotoStatus.DRAFT,
++        )
++        photo_pub_b = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            title="Photo Marseille Vieux Port",
++            latitude=43.29,
++            longitude=5.37,
++            file_display_path="private/storage/marseille.webp",
++            status=PhotoStatus.PUBLISHED,
++        )
++        session.add_all([photo_pub_a, photo_draft_a, photo_pub_b])
++        await session.commit()
++        await session.refresh(photo_pub_a)
++        await session.refresh(photo_draft_a)
++        await session.refresh(photo_pub_b)
++
++    yield {
++        "t_a": t_a,
++        "t_b": t_b,
++        "u_a": u_a,
++        "u_b": u_b,
++        "super_admin": super_admin,
++        "photo": photo_pub_a,
++        "photo_draft": photo_draft_a,
++        "photo_b": photo_pub_b,
++    }
++
++    # Nettoyage en fin de test
++    async with AsyncSessionLocal() as session:
++        await session.execute(
++            delete(Storymap).where(Storymap.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(Photo).where(Photo.territory_id.in_([t_a.id, t_b.id]))
++        )
++        await session.execute(
++            delete(User).where(User.id.in_([u_a.id, u_b.id, super_admin.id]))
++        )
++        await session.execute(
++            delete(Territory).where(Territory.id.in_([t_a.id, t_b.id]))
++        )
++        await session.commit()
++
++
++@pytest.mark.asyncio
++async def test_admin_routes_require_authentication():
++    """Vérifie que les routes admin de storymaps rejettent les accès non authentifiés (401)."""
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        res = await client.get("/api/v1/admin/storymaps")
++        assert res.status_code == 401
++
++        res_post = await client.post("/api/v1/admin/storymaps", json={"title": "Test"})
++        assert res_post.status_code == 401
++
++
++@pytest.mark.asyncio
++async def test_create_storymap_draft_and_auto_slug(setup_storymaps_test_data):
++    """Vérifie la création d'une storymap en brouillon avec génération automatique de slug."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    t_a = data["t_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            payload = {
++                "title": "Histoire du Tramway Toulonnais (1886) !",
++                "summary": "Découvrez le développement des transports urbains au 19e siècle.",
++                "cover_image_path": "uploads/covers/tramway.webp",
++                "status": "draft",
++            }
++            res = await client.post("/api/v1/admin/storymaps", json=payload)
++            assert res.status_code == 201
++            body = res.json()
++
++            assert body["title"] == payload["title"]
++            assert body["summary"] == payload["summary"]
++            assert body["status"] == "draft"
++            assert body["slug"] == "histoire-du-tramway-toulonnais-1886"
++            assert body["territory_id"] == str(t_a.id)
++            assert body["author_user_id"] == str(u_a.id)
++            assert "cover_image_url" in body
++            assert body["steps"] == []
++            assert body["steps_count"] == 0
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_create_storymap_with_initial_steps_and_camera_validation(setup_storymaps_test_data):
++    """Vérifie la création avec étapes initiales et la validation stricte des coordonnées cartographiques."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    photo = data["photo"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Étape avec coordonnées caméra invalides (latitude hors borne > 90) -> 422
++            invalid_payload = {
++                "title": "Storymap Hors Bornes",
++                "steps": [
++                    {
++                        "title": "Étape Invalide",
++                        "camera_lat": 150.0,
++                        "camera_lng": 5.92,
++                    }
++                ],
++            }
++            res_invalid = await client.post("/api/v1/admin/storymaps", json=invalid_payload)
++            assert res_invalid.status_code == 422
++
++            # 2. Étape avec zoom hors borne (> 24) -> 422
++            invalid_zoom = {
++                "title": "Zoom Invalide",
++                "steps": [
++                    {
++                        "title": "Étape Invalide",
++                        "camera_lat": 43.12,
++                        "camera_lng": 5.92,
++                        "camera_zoom": 25.0,
++                    }
++                ],
++            }
++            res_zoom = await client.post("/api/v1/admin/storymaps", json=invalid_zoom)
++            assert res_zoom.status_code == 422
++
++            # 3. Payload valide avec 2 étapes ordonnées
++            valid_payload = {
++                "title": "Circuit Historique du Port",
++                "summary": "Parcours maritime",
++                "status": "published",
++                "steps": [
++                    {
++                        "title": "L'Arsenal",
++                        "content_markdown": "## Entrée monumentale\nConstruite en 1738.",
++                        "camera_lat": 43.1242,
++                        "camera_lng": 5.9280,
++                        "camera_zoom": 15.5,
++                        "camera_bearing": 120.0,
++                        "camera_pitch": 45.0,
++                        "audio_file_path": "audio/chapitre1.mp3",
++                        "photo_id": str(photo.id),
++                    },
++                    {
++                        "title": "Le Carré du Port",
++                        "content_markdown": "Vue panoramique des quais.",
++                        "camera_lat": 43.1210,
++                        "camera_lng": 5.9320,
++                        "camera_zoom": 16.0,
++                        "camera_bearing": 360.0,  # 360 doit être normalisé à 0
++                        "camera_pitch": 20.0,
++                    },
++                ],
++            }
++            res_valid = await client.post("/api/v1/admin/storymaps", json=valid_payload)
++            assert res_valid.status_code == 201
++            body = res_valid.json()
++
++            assert body["title"] == "Circuit Historique du Port"
++            assert body["steps_count"] == 2
++            assert len(body["steps"]) == 2
++
++            step1 = body["steps"][0]
++            assert step1["step_order"] == 0
++            assert step1["title"] == "L'Arsenal"
++            assert step1["camera_bearing"] == 120.0
++            assert step1["photo_id"] == str(photo.id)
++            assert "audio_url" in step1
++
++            step2 = body["steps"][1]
++            assert step2["step_order"] == 1
++            assert step2["title"] == "Le Carré du Port"
++            assert step2["camera_bearing"] == 0.0  # Normalisé
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_add_update_delete_steps(setup_storymaps_test_data):
++    """Vérifie l'ajout, la modification et la suppression unitaire d'étapes de storymap."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # Créer storymap sans étape
++            res_create = await client.post("/api/v1/admin/storymaps", json={"title": "Récit Étapes Test"})
++            assert res_create.status_code == 201
++            sm_id = res_create.json()["id"]
++
++            # 1. Ajouter une étape
++            res_step1 = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Première étape",
++                    "content_markdown": "Description introductive",
++                    "lat": 43.12,
++                    "lng": 5.92,
++                    "zoom": 14.0,
++                },
++            )
++            assert res_step1.status_code == 201
++            step1 = res_step1.json()
++            assert step1["title"] == "Première étape"
++            assert step1["step_order"] == 0
++            step1_id = step1["id"]
++
++            # 2. Ajouter une seconde étape (ordre séquentiel incrémenté)
++            res_step2 = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Deuxième étape",
++                    "lat": 43.13,
++                    "lng": 5.94,
++                },
++            )
++            assert res_step2.status_code == 201
++            step2 = res_step2.json()
++            assert step2["step_order"] == 1
++            step2_id = step2["id"]
++
++            # 3. Mettre à jour l'étape 1
++            res_up = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/{step1_id}",
++                json={
++                    "title": "Première étape renommée",
++                    "pitch": 60.0,
++                },
++            )
++            assert res_up.status_code == 200
++            assert res_up.json()["title"] == "Première étape renommée"
++            assert res_up.json()["camera_pitch"] == 60.0
++
++            # 4. Supprimer l'étape 2
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{sm_id}/steps/{step2_id}")
++            assert res_del.status_code == 204
++
++            # Vérifier la storymap
++            res_sm = await client.get(f"/api/v1/admin/storymaps/{sm_id}")
++            assert res_sm.status_code == 200
++            assert res_sm.json()["steps_count"] == 1
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_reorder_steps_atomically(setup_storymaps_test_data):
++    """Vérifie le réordonnancement atomique d'étapes via PUT /steps/reorder."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Réordonnancement",
++                    "steps": [
++                        {"title": "Étape Alpha", "lat": 43.1, "lng": 5.9},
++                        {"title": "Étape Bêta", "lat": 43.2, "lng": 5.8},
++                        {"title": "Étape Gamma", "lat": 43.3, "lng": 5.7},
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            sm = res_create.json()
++            sm_id = sm["id"]
++            id_alpha = sm["steps"][0]["id"]
++            id_beta = sm["steps"][1]["id"]
++            id_gamma = sm["steps"][2]["id"]
++
++            # Inverser l'ordre : Gamma (0), Alpha (1), Bêta (2)
++            res_reorder = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_alpha, id_beta]},
++            )
++            assert res_reorder.status_code == 200
++            updated_sm = res_reorder.json()
++
++            steps_res = updated_sm["steps"]
++            assert steps_res[0]["id"] == id_gamma
++            assert steps_res[0]["step_order"] == 0
++            assert steps_res[1]["id"] == id_alpha
++            assert steps_res[1]["step_order"] == 1
++            assert steps_res[2]["id"] == id_beta
++            assert steps_res[2]["step_order"] == 2
++
++            # Test d'erreur : liste incomplète -> 400
++            res_incomplete = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_alpha]},
++            )
++            assert res_incomplete.status_code == 400
++
++            # Test d'erreur : liste avec doublon -> 400
++            res_duplicate = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/reorder",
++                json={"step_ids": [id_gamma, id_gamma, id_beta]},
++            )
++            assert res_duplicate.status_code == 400
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_admin_list_storymaps_pagination_filters_and_isolation(setup_storymaps_test_data):
++    """Vérifie la route GET /api/v1/admin/storymaps :
++    - Pagination (page, page_size)
++    - Filtre par statut (draft, published)
++    - Filtre par recherche textuelle (titre/résumé)
++    - Isolation territoriale stricte entre contributeurs.
++    """
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    t_b = data["t_b"]
++    u_a = data["u_a"]
++    u_b = data["u_b"]
++
++    async with AsyncSessionLocal() as session:
++        sm1 = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="balade-rade-1",
++            title="Balade dans la Rade",
++            summary="Aperçu des forts militaires",
++            status=StorymapStatus.PUBLISHED,
++        )
++        sm2 = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="funiculaire-faron",
++            title="Le Funiculaire du Mont Faron",
++            summary="Histoire de la montée au sommet",
++            status=StorymapStatus.DRAFT,
++        )
++        sm_marseille = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            slug="notre-dame-garde",
++            title="Notre Dame de la Garde",
++            summary="Vue sur la cité phocéenne",
++            status=StorymapStatus.PUBLISHED,
++        )
++        session.add_all([sm1, sm2, sm_marseille])
++        await session.commit()
++
++    # Authentification sous Jean Toulon (u_a)
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Liste complète pour le territoire A (2 items attendus, pas celui de Marseille)
++            res = await client.get("/api/v1/admin/storymaps")
++            assert res.status_code == 200
++            data_res = res.json()
++            assert data_res["total"] == 2
++            slugs = [s["slug"] for s in data_res["items"]]
++            assert "balade-rade-1" in slugs
++            assert "funiculaire-faron" in slugs
++            assert "notre-dame-garde" not in slugs
++
++            # 2. Filtre par statut = published
++            res_pub = await client.get("/api/v1/admin/storymaps?status=published")
++            assert res_pub.status_code == 200
++            assert res_pub.json()["total"] == 1
++            assert res_pub.json()["items"][0]["slug"] == "balade-rade-1"
++
++            # 3. Filtre par recherche textuelle
++            res_search = await client.get("/api/v1/admin/storymaps?search=faron")
++            assert res_search.status_code == 200
++            assert res_search.json()["total"] == 1
++            assert res_search.json()["items"][0]["slug"] == "funiculaire-faron"
++
++            # 4. Pagination (page 1, limit 1)
++            res_page = await client.get("/api/v1/admin/storymaps?page=1&page_size=1")
++            assert res_page.status_code == 200
++            assert len(res_page.json()["items"]) == 1
++            assert res_page.json()["pages"] == 2
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_update_storymap_metadata_and_publishing(setup_storymaps_test_data):
++    """Vérifie la mise à jour des métadonnées, la réinitialisation de champs optionnels et la publication d'une storymap."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Créer une storymap initiale
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Histoire du Théâtre",
++                    "summary": "Résumé temporaire",
++                    "cover_image_path": "uploads/covers/theatre.webp",
++                    "status": "draft",
++                },
++            )
++            assert res_create.status_code == 201
++            sm_id = res_create.json()["id"]
++
++            # 2. Mettre à jour titre, publier, et effacer volontairement le résumé et la couverture (None)
++            res_update = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}",
++                json={
++                    "title": "L'Opéra de Toulon",
++                    "summary": None,
++                    "cover_image_path": None,
++                    "status": "published",
++                },
++            )
++            assert res_update.status_code == 200
++            body = res_update.json()
++            assert body["title"] == "L'Opéra de Toulon"
++            assert body["summary"] is None
++            assert body["cover_image_path"] is None
++            assert body["cover_image_url"] is None
++            assert body["status"] == "published"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_public_storymaps_access_isolation_and_privacy(setup_storymaps_test_data):
++    """Vérifie l'accès public aux storymaps :
++    - Récit publié accessible via son slug (200)
++    - Récit brouillon masqué (404)
++    - Récit d'un autre territoire masqué (404)
++    - Absence stricte de fuite de métadonnées sensibles (chemins internes, author_user_id)
++    """
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    t_b = data["t_b"]
++    u_a = data["u_a"]
++    u_b = data["u_b"]
++    photo = data["photo"]
++
++    # Créer 1 récit publié sur Territoire A
++    # Créer 1 récit brouillon sur Territoire A
++    # Créer 1 récit publié sur Territoire B
++    async with AsyncSessionLocal() as session:
++        sm_pub_a = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="decouverte-du-vieux-toulon",
++            title="Découverte du Vieux Toulon",
++            summary="Une balade à travers les ruelles médiévales.",
++            cover_image_path="internal/storage/covers/vieux_toulon.webp",
++            status=StorymapStatus.PUBLISHED,
++        )
++        step_pub = StorymapStep(
++            storymap=sm_pub_a,
++            photo_id=photo.id,
++            step_order=0,
++            title="Place Puget",
++            content_markdown="La fontaine des Trois Dauphins.",
++            audio_file_path="internal/storage/audio/puget.mp3",
++            camera_lat=43.125,
++            camera_lng=5.931,
++            camera_zoom=16.0,
++            camera_bearing=45.0,
++            camera_pitch=30.0,
++        )
++        sm_pub_a.steps.append(step_pub)
++
++        sm_draft_a = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="recit-en-preparation",
++            title="Récit en Préparation",
++            status=StorymapStatus.DRAFT,
++        )
++
++        sm_pub_b = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_b.id,
++            author_user_id=u_b.id,
++            slug="le-panier-marseillais",
++            title="Le Panier Marseillais",
++            status=StorymapStatus.PUBLISHED,
++        )
++
++        session.add_all([sm_pub_a, sm_draft_a, sm_pub_b])
++        await session.commit()
++
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        # 1. Consultation publique du récit publié sur Territoire A
++        res_pub = await client.get(
++            "/api/v1/storymaps/decouverte-du-vieux-toulon",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_pub.status_code == 200
++        item = res_pub.json()
++        assert item["slug"] == "decouverte-du-vieux-toulon"
++        assert item["title"] == "Découverte du Vieux Toulon"
++        assert item["status"] == "published"
++        assert "cover_image_url" in item
++        assert len(item["steps"]) == 1
++
++        # Vérification stricte de confidentialité (absence de chemins physiques et author_user_id)
++        assert "cover_image_path" not in item
++        assert "author_user_id" not in item
++        step_detail = item["steps"][0]
++        assert "audio_file_path" not in step_detail
++        assert "audio_url" in step_detail
++        assert step_detail["lat"] == 43.125
++        assert step_detail["lng"] == 5.931
++        assert step_detail["photo"] is not None
++        assert step_detail["photo"]["title"] == "Photo d'archive port 1900"
++        assert "file_original_path" not in step_detail["photo"]
++
++        # 2. Consultation d'une storymap en brouillon -> 404 (masque le brouillon)
++        res_draft = await client.get(
++            "/api/v1/storymaps/recit-en-preparation",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_draft.status_code == 404
++        assert res_draft.json()["error"]["code"] == "STORYMAP_NOT_FOUND"
++
++        # 3. Consultation d'un récit d'un autre territoire -> 404 (isolation multi-territoire)
++        res_other = await client.get(
++            "/api/v1/storymaps/le-panier-marseillais",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_other.status_code == 404
++
++        # 4. Catalogue public du territoire A : ne liste que le récit publié de Toulon
++        res_list = await client.get(
++            "/api/v1/storymaps",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_list.status_code == 200
++        catalogue = res_list.json()
++        assert catalogue["total"] == 1
++        assert catalogue["items"][0]["slug"] == "decouverte-du-vieux-toulon"
++
++
++@pytest.mark.asyncio
++async def test_public_storymaps_mask_draft_photos(setup_storymaps_test_data):
++    """Vérifie que les photos en statut draft liées à une étape sont totalement masquées dans les endpoints publics."""
++    data = setup_storymaps_test_data
++    t_a = data["t_a"]
++    u_a = data["u_a"]
++    photo_pub = data["photo"]
++    photo_draft = data["photo_draft"]
++
++    async with AsyncSessionLocal() as session:
++        sm = Storymap(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            slug="recit-photos-mixtes",
++            title="Récit avec photos mixtes",
++            status=StorymapStatus.PUBLISHED,
++        )
++        step1 = StorymapStep(
++            storymap=sm,
++            photo_id=photo_pub.id,
++            step_order=0,
++            title="Étape photo publiée",
++            camera_lat=43.12,
++            camera_lng=5.93,
++        )
++        step2 = StorymapStep(
++            storymap=sm,
++            photo_id=photo_draft.id,
++            step_order=1,
++            title="Étape photo brouillon",
++            camera_lat=43.13,
++            camera_lng=5.94,
++        )
++        sm.steps.extend([step1, step2])
++        session.add(sm)
++        await session.commit()
++
++    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++        # 1. Détail public
++        res = await client.get(
++            "/api/v1/storymaps/recit-photos-mixtes",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res.status_code == 200
++        body = res.json()
++        s1 = body["steps"][0]
++        s2 = body["steps"][1]
++
++        assert s1["photo"] is not None
++        assert s1["photo_id"] == str(photo_pub.id)
++        # La photo en statut draft ne doit pas être visible
++        assert s2["photo"] is None
++        assert s2["photo_id"] is None
++
++        # 2. Liste publique (catalogue)
++        res_list = await client.get(
++            "/api/v1/storymaps",
++            headers={"X-Territory-Slug": t_a.slug},
++        )
++        assert res_list.status_code == 200
++        matched = next(s for s in res_list.json()["items"] if s["slug"] == "recit-photos-mixtes")
++        assert matched["steps"][0]["photo"] is not None
++        assert matched["steps"][1]["photo"] is None
++        assert matched["steps"][1]["photo_id"] is None
++
++
++@pytest.mark.asyncio
++async def test_step_rejects_foreign_or_nonexistent_photo(setup_storymaps_test_data):
++    """Vérifie le rejet avec code 422 (INVALID_PHOTO) si une photo appartient à un autre territoire ou est introuvable."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    photo_b = data["photo_b"]
++    fake_photo_id = uuid.uuid4()
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            # 1. Création initiale d'une storymap avec photo d'un autre territoire -> 422
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Photo Marseille dans Toulon",
++                    "steps": [
++                        {
++                            "title": "Étape rejetée",
++                            "lat": 43.12,
++                            "lng": 5.93,
++                            "photo_id": str(photo_b.id),
++                        }
++                    ],
++                },
++            )
++            assert res_create.status_code == 422
++            assert res_create.json()["error"]["code"] == "INVALID_PHOTO"
++
++            # 2. Créer une storymap valide sans étape
++            res_ok = await client.post(
++                "/api/v1/admin/storymaps",
++                json={"title": "Storymap Toulon Test Photo"},
++            )
++            assert res_ok.status_code == 201
++            sm_id = res_ok.json()["id"]
++
++            # 3. Ajout d'une étape avec une photo inexistante -> 422
++            res_add_fake = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={
++                    "title": "Étape Photo Inexistante",
++                    "lat": 43.12,
++                    "lng": 5.93,
++                    "photo_id": str(fake_photo_id),
++                },
++            )
++            assert res_add_fake.status_code == 422
++            assert res_add_fake.json()["error"]["code"] == "INVALID_PHOTO"
++
++            # 4. Ajout d'une étape valide sans photo
++            res_step_ok = await client.post(
++                f"/api/v1/admin/storymaps/{sm_id}/steps",
++                json={"title": "Étape Initiale", "lat": 43.12, "lng": 5.93},
++            )
++            assert res_step_ok.status_code == 201
++            step_id = res_step_ok.json()["id"]
++
++            # 5. Modification de l'étape pour lui associer la photo de Marseille -> 422
++            res_up_foreign = await client.put(
++                f"/api/v1/admin/storymaps/{sm_id}/steps/{step_id}",
++                json={"photo_id": str(photo_b.id)},
++            )
++            assert res_up_foreign.status_code == 422
++            assert res_up_foreign.json()["error"]["code"] == "INVALID_PHOTO"
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_delete_storymap_cascades_to_steps(setup_storymaps_test_data):
++    """Vérifie que la suppression d'une storymap supprime en cascade toutes ses étapes."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap à Supprimer",
++                    "steps": [
++                        {"title": "Étape 1", "lat": 43.1, "lng": 5.9},
++                        {"title": "Étape 2", "lat": 43.2, "lng": 5.8},
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            sm_id = uuid.UUID(res_create.json()["id"])
++            step_ids = [uuid.UUID(s["id"]) for s in res_create.json()["steps"]]
++
++            # Vérifier que les étapes sont bien en base
++            async with AsyncSessionLocal() as session:
++                steps_db = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.storymap_id == sm_id)
++                    )
++                ).scalars().all()
++                assert len(steps_db) == 2
++
++            # Supprimer la storymap
++            res_del = await client.delete(f"/api/v1/admin/storymaps/{sm_id}")
++            assert res_del.status_code == 204
++
++            # Vérifier que la storymap ET toutes ses étapes ont disparu de la BDD
++            async with AsyncSessionLocal() as session:
++                sm_check = (
++                    await session.execute(
++                        select(Storymap).where(Storymap.id == sm_id)
++                    )
++                ).scalar_one_or_none()
++                assert sm_check is None
++
++                steps_check = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.id.in_(step_ids))
++                    )
++                ).scalars().all()
++                assert len(steps_check) == 0
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
++
++
++@pytest.mark.asyncio
++async def test_delete_photo_sets_null_on_step(setup_storymaps_test_data):
++    """Vérifie que la suppression d'une photo liée passe photo_id à NULL sans effacer l'étape (SET NULL)."""
++    data = setup_storymaps_test_data
++    u_a = data["u_a"]
++    t_a = data["t_a"]
++
++    # Créer une photo spécifique pour ce test
++    async with AsyncSessionLocal() as session:
++        tmp_photo = Photo(
++            id=uuid.uuid4(),
++            territory_id=t_a.id,
++            author_user_id=u_a.id,
++            title="Photo temporaire à supprimer",
++            latitude=43.12,
++            longitude=5.93,
++            status=PhotoStatus.PUBLISHED,
++        )
++        session.add(tmp_photo)
++        await session.commit()
++        await session.refresh(tmp_photo)
++        photo_id = tmp_photo.id
++
++    app.dependency_overrides[get_current_active_user] = lambda: u_a
++    try:
++        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
++            res_create = await client.post(
++                "/api/v1/admin/storymaps",
++                json={
++                    "title": "Storymap Test Set Null",
++                    "steps": [
++                        {
++                            "title": "Étape avec photo",
++                            "lat": 43.1,
++                            "lng": 5.9,
++                            "photo_id": str(photo_id),
++                        }
++                    ],
++                },
++            )
++            assert res_create.status_code == 201
++            step_id = uuid.UUID(res_create.json()["steps"][0]["id"])
++
++            # Supprimer la photo en BDD
++            async with AsyncSessionLocal() as session:
++                await session.execute(delete(Photo).where(Photo.id == photo_id))
++                await session.commit()
++
++            # Vérifier l'étape : elle doit toujours exister et son photo_id est devenu NULL
++            async with AsyncSessionLocal() as session:
++                step_db = (
++                    await session.execute(
++                        select(StorymapStep).where(StorymapStep.id == step_id)
++                    )
++                ).scalar_one_or_none()
++                assert step_db is not None
++                assert step_db.photo_id is None
++    finally:
++        app.dependency_overrides.pop(get_current_active_user, None)
+--- /dev/null
++++ b/backend/tests/test_storymaps_logic.py
+@@ -0,0 +1,70 @@
++import unittest
++import unicodedata
++import re
++
++
++def slugify(value: str) -> str:
++    """Normalise une chaîne pour créer un slug URL-friendly sans accents ni caractères spéciaux."""
++    if not value:
++        return ""
++    value = unicodedata.normalize("NFKD", str(value)).encode("ascii", "ignore").decode("ascii")
++    value = re.sub(r"[^\w\s-]", "", value.lower())
++    return re.sub(r"[-\s]+", "-", value).strip("-_")
++
++
++def validate_camera_bounds(lat: float, lng: float, zoom: float, bearing: float, pitch: float) -> tuple[bool, str | None]:
++    if not (-90.0 <= lat <= 90.0):
++        return False, "Latitude hors bornes [-90, 90]"
++    if not (-180.0 <= lng <= 180.0):
++        return False, "Longitude hors bornes [-180, 180]"
++    if not (0.0 <= zoom <= 24.0):
++        return False, "Zoom hors bornes [0, 24]"
++    if not (0.0 <= bearing <= 360.0):
++        return False, "Bearing hors bornes [0, 360]"
++    if not (0.0 <= pitch <= 85.0):
++        return False, "Pitch hors bornes [0, 85]"
++    return True, None
++
++
++def normalize_bearing(bearing: float) -> float:
++    if bearing == 360.0:
++        return 0.0
++    return bearing % 360.0
++
++
++class TestStorymapsLogic(unittest.TestCase):
++    def test_slugify(self):
++        self.assertEqual(slugify("Histoire du Tramway 1886 !"), "histoire-du-tramway-1886")
++        self.assertEqual(slugify("Épopée navale à Toulon"), "epopee-navale-a-toulon")
++        self.assertEqual(slugify("   Espaces   Multiples---et-tirets   "), "espaces-multiples-et-tirets")
++        self.assertEqual(slugify(""), "")
++
++    def test_camera_bounds(self):
++        valid, _ = validate_camera_bounds(43.12, 5.93, 14.0, 90.0, 45.0)
++        self.assertTrue(valid)
++
++        invalid_lat, err = validate_camera_bounds(95.0, 5.93, 14.0, 90.0, 45.0)
++        self.assertFalse(invalid_lat)
++        self.assertIn("Latitude", err)
++
++        invalid_lng, err = validate_camera_bounds(43.12, 190.0, 14.0, 90.0, 45.0)
++        self.assertFalse(invalid_lng)
++        self.assertIn("Longitude", err)
++
++        invalid_zoom, err = validate_camera_bounds(43.12, 5.93, -1.0, 90.0, 45.0)
++        self.assertFalse(invalid_zoom)
++        self.assertIn("Zoom", err)
++
++        invalid_pitch, err = validate_camera_bounds(43.12, 5.93, 14.0, 90.0, 90.0)
++        self.assertFalse(invalid_pitch)
++        self.assertIn("Pitch", err)
++
++    def test_normalize_bearing(self):
++        self.assertEqual(normalize_bearing(360.0), 0.0)
++        self.assertEqual(normalize_bearing(0.0), 0.0)
++        self.assertEqual(normalize_bearing(180.0), 180.0)
++
++
++if __name__ == "__main__":
++    unittest.main()
++

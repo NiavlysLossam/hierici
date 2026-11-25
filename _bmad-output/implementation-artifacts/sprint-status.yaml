@@ -1,0 +1,78 @@
+# Sprint Status Tracking - HierIci
+# Generated: 10-31-2026 09:56
+# Project: hierici
+# Tracking System: file-system
+# Story Location: _bmad-output/implementation-artifacts
+
+generated: 10-31-2026 09:56
+last_updated: 10-31-2026 22:05
+project: hierici
+project_key: HIER
+tracking_system: file-system
+story_location: "_bmad-output/implementation-artifacts"
+
+development_status:
+  # Epic 1: Socle Territorial, Authentification et Stockage Média
+  epic-1: done
+  1-1-initialisation-de-lenvironnement-conteneurise-docker-compose: done
+  1-2-modele-territoire-et-middleware-disolation-multi-territoire: done
+  1-3-authentification-jwt-et-controle-dacces-rbac: done
+  1-4-adaptateur-de-stockage-media-abstrait-local-s3: done
+  epic-1-retrospective: optional
+
+  # Epic 2: Ingestion & Géoréférencement Directionnel des Photos
+  epic-2: done
+  2-1-modele-de-donnees-photo-et-api-de-gestion: done
+  2-2-televersement-et-pipeline-de-compression-dimages-webp: done
+  2-3-interface-dadministration-de-saisie-des-metadonnees-darchives: done
+  2-4-selecteur-cartographique-interactif-pour-le-point-gps-et-lazimut: done
+  epic-2-retrospective: optional
+
+  # Epic 3: Exploration Cartographique Interactive & Visualisation Patrimoniale
+  epic-3: done
+  3-1-visualiseur-cartographique-public-et-clustering-vectoriel: done
+  3-2-rendu-des-marqueurs-orientes-et-projection-des-cones-de-vue-webgl: done
+  3-3-fiche-detaillee-du-cliche-et-visionneuse-plein-ecran: done
+  epic-3-retrospective: optional
+
+  # Epic 4: Création & Découverte de Storymaps Narratives (Scrollytelling & Audio)
+  epic-4: done
+  4-1-modele-de-donnees-et-api-des-storymaps-et-chapitres: done
+  4-2-studio-dedition-et-dordonnancement-des-storymaps: done
+  4-3-lecteur-public-de-storymap-en-scrollytelling-avec-camera-synchronisee-et-audio: 
+    done
+  4-4-catalogue-public-des-recits-et-navigation-territoriale: done
+  epic-4-retrospective: done
+
+  # Epic 5: Personnalisation Cartographique, Administration Générale & Vitrine Patrimoniale
+  epic-5: done
+  5-1-revision-du-modele-de-metadonnees-photo-et-cone-de-vision-metrique: done
+  5-2-optimisation-de-lexploration-cartographique-marqueurs-et-fiche-laterale: done
+  5-3-console-dadministration-generale-territoire-contributeurs-fonds-de-carte: done
+  5-4-page-de-presentation-vitrine-patrimoniale-landing-page: done
+  epic-5-retrospective: done
+
+action_items:
+  - id: "epic-4-retro-item-1-écrire-une-suite-de-tests-end-to-end-pla"
+    epic: 4
+    action: "Écrire une suite de tests end-to-end Playwright validant l expérience
+      scrollytelling et le basculement audio dans un vrai navigateur WebGL."
+    owner: "QA / Frontend"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-4-retro-10-31-2026.md"
+  - id: "epic-4-retro-item-2-optimiser-le-préchargement-audio-preload"
+    epic: 4
+    action: "Optimiser le préchargement audio (preload metadata) pour éviter tout
+      délai de latence lors du déclenchement du premier son."
+    owner: "Frontend"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-4-retro-10-31-2026.md"
+  - id: "epic-4-retro-item-3-extraire-les-chaînes-de-caractères-stati"
+    epic: 4
+    action: "Extraire les chaînes de caractères statiques (badges de durée, libellés
+      de boutons) dans un module de constantes/dictionnaire i18n pour faciliter une
+      future localisation."
+    owner: "Architecture / Frontend"
+    status: open
+    ref: "_bmad-output/implementation-artifacts/epic-4-retro-10-31-2026.md"
+

@@ -1,0 +1,1431 @@
+--- /dev/null	2026-10-31 21:29:50.115546528 +0100
++++ frontend/src/services/api.ts	2026-10-31 21:52:46.199163566 +0100
+@@ -0,0 +1,446 @@
++import type {
++  Photo,
++  PhotoCreatePayload,
++  PhotoUpdatePayload,
++  PhotoListResponse,
++  PhotoUploadResponse,
++  PhotoStatus,
++  PhotoGeoJsonFeatureCollection,
++} from '@/types/photo'
++import type {
++  Storymap,
++  StorymapStep,
++  StorymapStatus,
++  StorymapCreatePayload,
++  StorymapUpdatePayload,
++  StorymapStepCreatePayload,
++  StorymapStepUpdatePayload,
++  StorymapListResponse,
++} from '@/types/storymap'
++
++const TOKEN_STORAGE_KEY = 'hierici_access_token'
++
++export class ApiError extends Error {
++  code: string
++  status: number
++  details?: any
++
++  constructor(message: string, code = 'API_ERROR', status = 500, details?: any) {
++    super(message)
++    this.name = 'ApiError'
++    this.code = code
++    this.status = status
++    this.details = details
++  }
++}
++
++export function getAuthToken(): string | null {
++  return localStorage.getItem(TOKEN_STORAGE_KEY)
++}
++
++export function setAuthToken(token: string | null): void {
++  if (token) {
++    localStorage.setItem(TOKEN_STORAGE_KEY, token)
++  } else {
++    localStorage.removeItem(TOKEN_STORAGE_KEY)
++  }
++}
++
++export function hasAuthToken(): boolean {
++  return !!getAuthToken()
++}
++
++async function request<T>(
++  endpoint: string,
++  options: RequestInit = {}
++): Promise<T> {
++  const headers: Record<string, string> = {
++    ...(options.headers as Record<string, string> || {}),
++  }
++
++  const token = getAuthToken()
++  if (token && !headers['Authorization']) {
++    headers['Authorization'] = `Bearer ${token}`
++  }
++
++  // Si le body n'est pas un FormData, on ajoute Content-Type: application/json si non défini
++  if (options.body && !(options.body instanceof FormData) && !headers['Content-Type']) {
++    headers['Content-Type'] = 'application/json'
++  }
++
++  const response = await fetch(endpoint, {
++    ...options,
++    headers,
++  })
++
++  if (response.status === 204) {
++    return {} as T
++  }
++
++  let data: any = null
++  const contentType = response.headers.get('content-type')
++  if (contentType && contentType.includes('application/json')) {
++    try {
++      data = await response.json()
++    } catch {
++      data = null
++    }
++  }
++
++  if (!response.ok) {
++    let message = `Erreur HTTP ${response.status}`
++    let code = 'HTTP_ERROR'
++    let details = undefined
++
++    if (data?.error) {
++      code = data.error.code || code
++      message = data.error.message || message
++      details = data.error.details
++    } else if (data?.detail) {
++      if (typeof data.detail === 'string') {
++        message = data.detail
++      } else if (data.detail?.error) {
++        code = data.detail.error.code || code
++        message = data.detail.error.message || message
++        details = data.detail.error.details
++      } else if (Array.isArray(data.detail)) {
++        // FastAPI validation errors
++        message = data.detail.map((err: any) => `${err.loc?.join('.') || 'champ'}: ${err.msg}`).join(', ')
++      }
++    }
++
++    throw new ApiError(message, code, response.status, details)
++  }
++
++  return data as T
++}
++
++export const photoApi = {
++  /**
++   * Connexion avec email et mot de passe
++   */
++  async login(email: string, password: string): Promise<{ access_token: string; user: any }> {
++    const res = await request<{ access_token: string; token_type: string; user: any }>(
++      '/api/v1/auth/login',
++      {
++        method: 'POST',
++        body: JSON.stringify({ email, password }),
++      }
++    )
++    setAuthToken(res.access_token)
++    return res
++  },
++
++  /**
++   * Récupère le profil de l'utilisateur connecté
++   */
++  async getMe(): Promise<any> {
++    return request<any>('/api/v1/auth/me')
++  },
++
++  /**
++   * Liste paginée des photographies
++   */
++  async listPhotos(params?: {
++    page?: number
++    page_size?: number
++    status?: PhotoStatus
++    search?: string
++    territory_id?: string
++  }): Promise<PhotoListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.status) query.set('status', params.status)
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.territory_id) query.set('territory_id', params.territory_id)
++
++    const qs = query.toString()
++    return request<PhotoListResponse>(`/api/v1/admin/photos${qs ? `?${qs}` : ''}`)
++  },
++
++  /**
++   * Consultation du détail d'une photographie
++   */
++  async getPhoto(id: string): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`)
++  },
++
++  /**
++   * Création d'une nouvelle fiche photo
++   */
++  async createPhoto(payload: PhotoCreatePayload): Promise<Photo> {
++    return request<Photo>('/api/v1/admin/photos', {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour d'une fiche photo existante
++   */
++  async updatePhoto(id: string, payload: PhotoUpdatePayload): Promise<Photo> {
++    return request<Photo>(`/api/v1/admin/photos/${id}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression d'une fiche photo et de ses médias
++   */
++  async deletePhoto(id: string): Promise<void> {
++    await request<void>(`/api/v1/admin/photos/${id}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Téléversement d'image pour une photo existante
++   */
++  async uploadPhotoImage(photoId: string, file: File): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++
++    return request<PhotoUploadResponse>(`/api/v1/admin/photos/${photoId}/upload`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Téléversement direct créant une nouvelle photo avec image
++   */
++  async uploadPhotoDirect(file: File, title?: string): Promise<PhotoUploadResponse> {
++    const formData = new FormData()
++    formData.append('file', file)
++    if (title && title.trim()) {
++      formData.append('title', title.trim())
++    }
++
++    return request<PhotoUploadResponse>('/api/v1/admin/photos/upload', {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Récupération du territoire actif
++   */
++  async getCurrentTerritory(): Promise<{
++    id: string
++    slug: string
++    name: string
++    center_lat: number
++    center_lng: number
++    default_zoom: number
++  }> {
++    return request('/api/v1/territory/current')
++  },
++
++  /**
++   * Health check de l'API
++   */
++  async getHealth(): Promise<{ status: string; database: string }> {
++    return request('/api/health')
++  },
++
++  /**
++   * Récupère la collection GeoJSON des photos publiées du territoire actif
++   */
++  async getPublicPhotos(
++    params?: {
++      search?: string
++      year_min?: number
++      year_max?: number
++    },
++    signal?: AbortSignal
++  ): Promise<PhotoGeoJsonFeatureCollection> {
++    const query = new URLSearchParams()
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.year_min !== undefined && params.year_min !== null) {
++      query.set('year_min', params.year_min.toString())
++    }
++    if (params?.year_max !== undefined && params.year_max !== null) {
++      query.set('year_max', params.year_max.toString())
++    }
++
++    const qs = query.toString()
++    return request<PhotoGeoJsonFeatureCollection>(`/api/v1/photos${qs ? `?${qs}` : ''}`, { signal })
++  },
++
++  /**
++   * Récupère la fiche détaillée d'une photo publique
++   */
++  async getPublicPhoto(id: string): Promise<Photo> {
++    return request<Photo>(`/api/v1/photos/${id}`)
++  },
++}
++
++export const storymapApi = {
++  /**
++   * Liste paginée des storymaps du territoire
++   */
++  async listStorymaps(params?: {
++    page?: number
++    page_size?: number
++    status?: StorymapStatus
++    search?: string
++    territory_id?: string
++  }): Promise<StorymapListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.status) query.set('status', params.status)
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++    if (params?.territory_id) query.set('territory_id', params.territory_id)
++
++    const qs = query.toString()
++    return request<StorymapListResponse>(`/api/v1/admin/storymaps${qs ? `?${qs}` : ''}`)
++  },
++
++  /**
++   * Consultation du détail d'une storymap avec ses étapes ordonnées
++   */
++  async getStorymap(id: string): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}`)
++  },
++
++  /**
++   * Création d'une nouvelle storymap
++   */
++  async createStorymap(payload: StorymapCreatePayload): Promise<Storymap> {
++    return request<Storymap>('/api/v1/admin/storymaps', {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour des métadonnées d'une storymap
++   */
++  async updateStorymap(id: string, payload: StorymapUpdatePayload): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression définitive d'une storymap et cascade sur ses étapes
++   */
++  async deleteStorymap(id: string): Promise<void> {
++    await request<void>(`/api/v1/admin/storymaps/${id}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Téléversement et association d'une image de couverture
++   */
++  async uploadCover(id: string, file: File): Promise<Storymap> {
++    const formData = new FormData()
++    formData.append('file', file)
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/cover`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Suppression de l'image de couverture
++   */
++  async deleteCover(id: string): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/cover`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Ajout d'une étape / chapitre à une storymap
++   */
++  async addStep(id: string, payload: StorymapStepCreatePayload): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps`, {
++      method: 'POST',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Mise à jour d'un chapitre / étape
++   */
++  async updateStep(id: string, stepId: string, payload: StorymapStepUpdatePayload): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}`, {
++      method: 'PUT',
++      body: JSON.stringify(payload),
++    })
++  },
++
++  /**
++   * Suppression d'une étape d'une storymap
++   */
++  async deleteStep(id: string, stepId: string): Promise<void> {
++    await request<void>(`/api/v1/admin/storymaps/${id}/steps/${stepId}`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Réordonnancement atomique de l'ensemble des étapes
++   */
++  async reorderSteps(id: string, stepIds: string[]): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/admin/storymaps/${id}/steps/reorder`, {
++      method: 'PUT',
++      body: JSON.stringify({ step_ids: stepIds }),
++    })
++  },
++
++  /**
++   * Téléversement d'un document sonore (MP3, etc.) pour une étape
++   */
++  async uploadStepAudio(id: string, stepId: string, file: File): Promise<StorymapStep> {
++    const formData = new FormData()
++    formData.append('file', file)
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}/audio`, {
++      method: 'POST',
++      body: formData,
++    })
++  },
++
++  /**
++   * Suppression du fichier audio d'une étape
++   */
++  async deleteStepAudio(id: string, stepId: string): Promise<StorymapStep> {
++    return request<StorymapStep>(`/api/v1/admin/storymaps/${id}/steps/${stepId}/audio`, {
++      method: 'DELETE',
++    })
++  },
++
++  /**
++   * Consultation publique du catalogue des récits publiés du territoire actif
++   */
++  async listPublicStorymaps(
++    params?: {
++      page?: number
++      page_size?: number
++      search?: string
++    },
++    signal?: AbortSignal
++  ): Promise<StorymapListResponse> {
++    const query = new URLSearchParams()
++    if (params?.page) query.set('page', params.page.toString())
++    if (params?.page_size) query.set('page_size', params.page_size.toString())
++    if (params?.search && params.search.trim()) query.set('search', params.search.trim())
++
++    const qs = query.toString()
++    return request<StorymapListResponse>(`/api/v1/storymaps${qs ? `?${qs}` : ''}`, { signal })
++  },
++
++  /**
++   * Consultation publique d'un récit publié par son slug
++   */
++  async getPublicStorymap(slug: string, signal?: AbortSignal): Promise<Storymap> {
++    return request<Storymap>(`/api/v1/storymaps/${encodeURIComponent(slug.trim())}`, { signal })
++  },
++}
++
+--- /dev/null	2026-10-31 21:29:50.115546528 +0100
++++ frontend/src/utils/storymapCatalog.ts	2026-10-31 21:52:56.922036426 +0100
+@@ -0,0 +1,88 @@
++/**
++ * Utilitaires purs pour le Catalogue Public des Récits et la Navigation Territoriale (Story 4.4)
++ */
++
++import type { Storymap } from '../types/storymap'
++
++export type StorymapSortOption = 'recent' | 'steps' | 'title'
++
++export interface StorymapFilterOptions {
++  search?: string
++  hasAudioOnly?: boolean
++  sortBy?: StorymapSortOption
++}
++
++/**
++ * Estime le temps de lecture / visite d'une storymap selon son nombre d'étapes
++ * (environ 2.5 minutes par étape : lecture, observation des clichés et transition de carte)
++ */
++export function estimateReadingTime(stepsCount: number, minutesPerStep = 2.5): number {
++  if (isNaN(stepsCount) || stepsCount <= 0) return 2
++  const estimated = Math.ceil(stepsCount * minutesPerStep)
++  return Math.max(2, estimated)
++}
++
++/**
++ * Formate le temps de visite estimé en libellé convivial
++ */
++export function formatReadingDuration(minutes: number): string {
++  if (isNaN(minutes) || minutes <= 0) return '~2 min de visite'
++  return `~${minutes} min de visite`
++}
++
++/**
++ * Détermine si une storymap contient au moins une capsule sonore
++ */
++export function hasAudioContent(storymap: Storymap | null | undefined): boolean {
++  if (!storymap || !storymap.steps || !Array.isArray(storymap.steps)) return false
++  return storymap.steps.some((step) => Boolean(step.audio_url || step.audio_file_path))
++}
++
++/**
++ * Filtre et ordonne la liste des storymaps côté client
++ */
++export function filterAndSortStorymaps(
++  items: Storymap[],
++  options: StorymapFilterOptions = {}
++): Storymap[] {
++  if (!Array.isArray(items)) return []
++
++  let filtered = [...items]
++
++  // 1. Filtrage par recherche textuelle (titre ou résumé)
++  if (options.search && options.search.trim()) {
++    const term = options.search.trim().toLowerCase()
++    filtered = filtered.filter((story) => {
++      const matchTitle = story.title ? story.title.toLowerCase().includes(term) : false
++      const matchSummary = story.summary ? story.summary.toLowerCase().includes(term) : false
++      return matchTitle || matchSummary
++    })
++  }
++
++  // 2. Filtrage par présence audio
++  if (options.hasAudioOnly) {
++    filtered = filtered.filter(hasAudioContent)
++  }
++
++  // 3. Tri
++  const sortBy = options.sortBy || 'recent'
++  filtered.sort((a, b) => {
++    if (sortBy === 'steps') {
++      const countA = a.steps_count ?? a.steps?.length ?? 0
++      const countB = b.steps_count ?? b.steps?.length ?? 0
++      if (countB !== countA) return countB - countA
++      return a.title.localeCompare(b.title, 'fr')
++    }
++
++    if (sortBy === 'title') {
++      return a.title.localeCompare(b.title, 'fr')
++    }
++
++    // Défaut : recent (plus récents en premier)
++    const timeA = a.created_at ? new Date(a.created_at).getTime() : 0
++    const timeB = b.created_at ? new Date(b.created_at).getTime() : 0
++    return timeB - timeA
++  })
++
++  return filtered
++}
+--- /dev/null	2026-10-31 21:29:50.115546528 +0100
++++ frontend/src/components/public/StorymapPublicCatalog.vue	2026-10-31 21:53:50.387936102 +0100
+@@ -0,0 +1,335 @@
++<script setup lang="ts">
++import { ref, computed, onMounted, watch } from 'vue'
++import type { Storymap } from '@/types/storymap'
++import { storymapApi } from '@/services/api'
++import {
++  estimateReadingTime,
++  formatReadingDuration,
++  hasAudioContent,
++  filterAndSortStorymaps,
++  type StorymapSortOption,
++} from '@/utils/storymapCatalog'
++
++const props = withDefaults(
++  defineProps<{
++    territoryName?: string
++    territorySlug?: string
++  }>(),
++  {
++    territoryName: 'Territoire',
++    territorySlug: '',
++  }
++)
++
++const emit = defineEmits<{
++  (e: 'select-storymap', slug: string): void
++  (e: 'explore-map'): void
++}>()
++
++// État des données
++const storymaps = ref<Storymap[]>([])
++const isLoading = ref(true)
++const errorMessage = ref<string | null>(null)
++
++// Filtres et tri
++const searchQuery = ref('')
++const filterAudioOnly = ref(false)
++const sortBy = ref<StorymapSortOption>('recent')
++
++/**
++ * Charge la liste publique des récits publiés
++ */
++async function loadPublicCatalog() {
++  isLoading.value = true
++  errorMessage.value = null
++
++  try {
++    const res = await storymapApi.listPublicStorymaps({ page: 1, page_size: 100 })
++    storymaps.value = res.items || []
++  } catch (err: any) {
++    console.error('Erreur chargement catalogue storymaps:', err)
++    errorMessage.value = 'Impossible de charger les parcours historiques du territoire.'
++  } finally {
++    isLoading.value = false
++  }
++}
++
++// Récits filtrés et triés
++const displayedStorymaps = computed(() => {
++  return filterAndSortStorymaps(storymaps.value, {
++    search: searchQuery.value,
++    hasAudioOnly: filterAudioOnly.value,
++    sortBy: sortBy.value,
++  })
++})
++
++function resetFilters() {
++  searchQuery.value = ''
++  filterAudioOnly.value = false
++  sortBy.value = 'recent'
++}
++
++function selectStory(slug: string) {
++  emit('select-storymap', slug)
++}
++
++function formatDate(isoDate?: string | null): string {
++  if (!isoDate) return ''
++  try {
++    return new Date(isoDate).toLocaleDateString('fr-FR', {
++      year: 'numeric',
++      month: 'short',
++    })
++  } catch {
++    return ''
++  }
++}
++
++onMounted(() => {
++  loadPublicCatalog()
++})
++</script>
++
++<template>
++  <div class="w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8 font-sans">
++    <!-- En-tête de Présentation Territoriale -->
++    <header class="relative rounded-3xl bg-gradient-to-br from-slate-900 via-slate-900 to-sky-950/60 border border-slate-800 p-8 sm:p-10 shadow-2xl overflow-hidden">
++      <!-- Ornement géohistorique en fond -->
++      <div class="absolute -right-10 -bottom-10 opacity-10 text-[180px] pointer-events-none select-none font-serif">
++        🧭
++      </div>
++
++      <div class="relative z-10 max-w-3xl space-y-4">
++        <div class="inline-flex items-center gap-2 px-3.5 py-1 rounded-full bg-sky-950/80 border border-sky-800 text-sky-400 text-xs font-semibold">
++          <span>🏛️</span>
++          <span>Patrimoine & Archives — {{ territoryName }}</span>
++        </div>
++
++        <h1 class="text-3xl sm:text-4xl lg:text-5xl font-black text-white tracking-tight leading-tight">
++          Récits & Parcours Géohistoriques
++        </h1>
++
++        <p class="text-sm sm:text-base text-slate-300 leading-relaxed font-normal">
++          Explorez l'évolution urbaine, maritime et humaine de votre territoire à travers des visites immersives en scrollytelling synchronisant photographies d'archives, cadrages cartographiques 3D et documents sonores.
++        </p>
++
++        <div class="pt-2 flex flex-wrap items-center gap-4 text-xs font-medium text-slate-400">
++          <span class="flex items-center gap-1.5">
++            <span class="w-2 h-2 rounded-full bg-emerald-400"></span>
++            {{ storymaps.length }} parcours disponible{{ storymaps.length > 1 ? 's' : '' }}
++          </span>
++          <span class="text-slate-600">•</span>
++          <button
++            type="button"
++            class="text-sky-400 hover:text-sky-300 underline underline-offset-4 flex items-center gap-1 transition-colors"
++            @click="emit('explore-map')"
++          >
++            <span>🗺️ Basculer sur la carte interactive générale</span>
++          </button>
++        </div>
++      </div>
++    </header>
++
++    <!-- Barre de Recherche, Filtres et Tri -->
++    <div class="bg-slate-900/80 backdrop-blur-md rounded-2xl border border-slate-800 p-4 sm:p-5 flex flex-col md:flex-row items-stretch md:items-center justify-between gap-4 shadow-lg">
++      <!-- Champ de recherche textuelle -->
++      <div class="relative flex-1">
++        <span class="absolute inset-y-0 left-3.5 flex items-center text-slate-400 text-sm">
++          🔍
++        </span>
++        <input
++          v-model="searchQuery"
++          type="text"
++          placeholder="Rechercher un itinéraire, un lieu, une époque..."
++          class="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl pl-10 pr-4 py-2.5 text-xs text-white placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-sky-500 focus:border-transparent transition-all"
++        />
++        <button
++          v-if="searchQuery"
++          type="button"
++          class="absolute inset-y-0 right-3 flex items-center text-slate-400 hover:text-white text-xs"
++          @click="searchQuery = ''"
++        >
++          ✕
++        </button>
++      </div>
++
++      <!-- Filtres et Options de Tri -->
++      <div class="flex flex-wrap items-center gap-3">
++        <!-- Filtre Audio -->
++        <button
++          type="button"
++          class="px-3.5 py-2 rounded-xl text-xs font-semibold border transition-all flex items-center gap-2"
++          :class="filterAudioOnly ? 'bg-sky-600 text-white border-sky-500 shadow-md shadow-sky-950' : 'bg-slate-950 text-slate-300 border-slate-800 hover:border-slate-700'"
++          @click="filterAudioOnly = !filterAudioOnly"
++        >
++          <span>🎧</span>
++          <span>Avec document sonore</span>
++        </button>
++
++        <!-- Sélecteur de tri -->
++        <div class="flex items-center gap-2 bg-slate-950 border border-slate-800 rounded-xl px-3 py-1.5 text-xs">
++          <span class="text-slate-500 text-[11px]">Trier :</span>
++          <select
++            v-model="sortBy"
++            class="bg-transparent text-slate-200 focus:outline-none cursor-pointer text-xs"
++          >
++            <option value="recent" class="bg-slate-900 text-white">Plus récents</option>
++            <option value="steps" class="bg-slate-900 text-white">Nombre d'étapes</option>
++            <option value="title" class="bg-slate-900 text-white">Titre (A-Z)</option>
++          </select>
++        </div>
++      </div>
++    </div>
++
++    <!-- État de Chargement -->
++    <div
++      v-if="isLoading"
++      class="py-24 flex flex-col items-center justify-center space-y-4 text-center"
++    >
++      <div class="w-10 h-10 border-4 border-sky-500 border-t-transparent rounded-full animate-spin"></div>
++      <p class="text-sm font-medium text-slate-400">Chargement des parcours géohistoriques...</p>
++    </div>
++
++    <!-- État d'Erreur -->
++    <div
++      v-else-if="errorMessage"
++      class="py-16 text-center space-y-4 bg-slate-900/60 rounded-2xl border border-rose-900/50 p-8"
++    >
++      <div class="text-3xl text-rose-400">⚠️</div>
++      <p class="text-sm text-slate-300">{{ errorMessage }}</p>
++      <button
++        type="button"
++        class="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-semibold transition-colors"
++        @click="loadPublicCatalog"
++      >
++        Réessayer
++      </button>
++    </div>
++
++    <!-- Grille des Storymaps Publiées -->
++    <div
++      v-else-if="displayedStorymaps.length > 0"
++      class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-6 sm:gap-8"
++    >
++      <article
++        v-for="story in displayedStorymaps"
++        :key="story.id"
++        class="group bg-slate-900/90 rounded-2xl border border-slate-800/80 hover:border-sky-500/50 shadow-xl hover:shadow-2xl hover:shadow-sky-950/40 transition-all duration-300 flex flex-col overflow-hidden cursor-pointer"
++        @click="selectStory(story.slug)"
++      >
++        <!-- Vignette de couverture 16:9 -->
++        <div class="relative aspect-video bg-slate-950 overflow-hidden">
++          <img
++            v-if="story.cover_image_url"
++            :src="story.cover_image_url"
++            :alt="story.title"
++            loading="lazy"
++            class="w-full h-full object-cover transition-transform duration-700 group-hover:scale-105"
++          />
++          <div
++            v-else
++            class="w-full h-full flex items-center justify-center text-4xl text-slate-700 bg-gradient-to-br from-slate-900 to-slate-950 group-hover:scale-105 transition-transform duration-700"
++          >
++            🧭
++          </div>
++
++          <div class="absolute inset-0 bg-gradient-to-t from-slate-950/90 via-slate-950/20 to-transparent"></div>
++
++          <!-- Badges sur la vignette -->
++          <div class="absolute top-3 left-3 flex flex-wrap items-center gap-1.5">
++            <span class="px-2.5 py-1 rounded-full text-[10px] font-bold bg-slate-950/80 backdrop-blur-md text-sky-400 border border-slate-800 flex items-center gap-1 shadow-sm">
++              <span>⏱️</span>
++              <span>{{ formatReadingDuration(estimateReadingTime(story.steps_count ?? story.steps?.length ?? 0)) }}</span>
++            </span>
++          </div>
++
++          <div class="absolute top-3 right-3 flex items-center gap-1.5">
++            <span
++              v-if="hasAudioContent(story)"
++              class="px-2 py-1 rounded-full text-[10px] font-semibold bg-emerald-950/80 backdrop-blur-md text-emerald-300 border border-emerald-800 shadow-sm"
++              title="Ce récit comporte des capsules sonores"
++            >
++              🎧 Audio
++            </span>
++          </div>
++
++          <div class="absolute bottom-3 left-3 right-3 flex items-center justify-between text-[11px] text-slate-300">
++            <span class="font-semibold text-slate-200 flex items-center gap-1.5">
++              <span>📑</span>
++              <span>{{ story.steps_count ?? story.steps?.length ?? 0 }} chapitre{{ (story.steps_count ?? story.steps?.length ?? 0) > 1 ? 's' : '' }}</span>
++            </span>
++            <span v-if="story.created_at" class="text-slate-400 text-[10px]">
++              {{ formatDate(story.created_at) }}
++            </span>
++          </div>
++        </div>
++
++        <!-- Contenu descriptif du récit -->
++        <div class="p-5 flex-1 flex flex-col justify-between space-y-4">
++          <div class="space-y-2">
++            <h2 class="text-base sm:text-lg font-bold text-white group-hover:text-sky-400 transition-colors line-clamp-2 leading-snug">
++              {{ story.title }}
++            </h2>
++            <p class="text-xs text-slate-400 line-clamp-3 leading-relaxed">
++              {{ story.summary || 'Parcourez ce récit géohistorique à travers les archives visuelles et cartographiques du territoire.' }}
++            </p>
++          </div>
++
++          <!-- Bouton d'action "Commencer la visite" -->
++          <div class="pt-3 border-t border-slate-800/80 flex items-center justify-between text-xs">
++            <span class="text-sky-400 font-semibold group-hover:underline flex items-center gap-1">
++              <span>Commencer la visite</span>
++              <span class="transition-transform group-hover:translate-x-1">→</span>
++            </span>
++            <span class="text-[10px] text-slate-500 font-mono">
++              /{{ story.slug }}
++            </span>
++          </div>
++        </div>
++      </article>
++    </div>
++
++    <!-- État Aucun Résultat (Filtres sans match) -->
++    <div
++      v-else-if="storymaps.length > 0"
++      class="py-20 text-center space-y-4 bg-slate-900/40 rounded-3xl border border-slate-800 p-8"
++    >
++      <div class="text-4xl text-slate-600">🔍</div>
++      <div class="space-y-1">
++        <h3 class="text-base font-bold text-white">Aucun itinéraire ne correspond à votre recherche</h3>
++        <p class="text-xs text-slate-400 max-w-md mx-auto">
++          Essayez d'autres mots-clés ou désactivez le filtre audio pour élargir les résultats.
++        </p>
++      </div>
++      <button
++        type="button"
++        class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-md transition-colors"
++        @click="resetFilters"
++      >
++        Réinitialiser les filtres
++      </button>
++    </div>
++
++    <!-- État Vide Global (Territoire sans storymaps publiées) -->
++    <div
++      v-else
++      class="py-24 text-center space-y-5 bg-slate-900/40 rounded-3xl border border-slate-800 p-8 sm:p-12 max-w-2xl mx-auto"
++    >
++      <div class="text-5xl">🧭</div>
++      <div class="space-y-2">
++        <h3 class="text-lg font-bold text-white">Aucun récit publié pour l'instant</h3>
++        <p class="text-xs text-slate-400 leading-relaxed">
++          Les conservateurs et auteurs du territoire préparent actuellement de nouveaux parcours immersifs. En attendant, explorez directement l'ensemble des photographies géolocalisées sur la carte interactive.
++        </p>
++      </div>
++      <button
++        type="button"
++        class="px-5 py-2.5 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-xs font-semibold shadow-lg shadow-sky-900/40 transition-all flex items-center gap-2 mx-auto"
++        @click="emit('explore-map')"
++      >
++        <span>🗺️</span>
++        <span>Explorer la photothèque sur la carte</span>
++      </button>
++    </div>
++  </div>
++</template>
+--- /dev/null	2026-10-31 21:29:50.115546528 +0100
++++ frontend/src/App.vue	2026-10-31 21:55:03.822109089 +0100
+@@ -0,0 +1,402 @@
++<script setup lang="ts">
++import { ref, onMounted, onUnmounted } from 'vue'
++import { photoApi, setAuthToken, hasAuthToken } from './services/api'
++import PhotoAdminCatalog from './components/admin/PhotoAdminCatalog.vue'
++import StorymapAdminCatalog from './components/admin/StorymapAdminCatalog.vue'
++import PublicMapViewer from './components/public/PublicMapViewer.vue'
++import StorymapReader from './components/public/StorymapReader.vue'
++import StorymapPublicCatalog from './components/public/StorymapPublicCatalog.vue'
++import { extractStorymapSlug, cleanStorymapUrl } from './utils/storymapReader'
++
++const currentTab = ref<'decouverte' | 'recits' | 'studio'>('decouverte')
++const studioSubTab = ref<'photos' | 'storymaps'>('photos')
++const activeStorymapSlug = ref<string | null>(null)
++
++const apiHealth = ref<{ status: string; database: string } | null>(null)
++const territory = ref<{ slug: string; name: string; center_lat: number; center_lng: number; default_zoom: number } | null>(null)
++const currentUser = ref<{ email: string; full_name?: string; role: string; territory_id?: string } | null>(null)
++const loading = ref(true)
++const error = ref<string | null>(null)
++
++// Modal de connexion
++const isLoginModalOpen = ref(false)
++const loginEmail = ref('admin@hierici.local')
++const loginPassword = ref('admin_hierici_2026')
++const loginError = ref<string | null>(null)
++const isLoggingIn = ref(false)
++
++async function authenticate() {
++  try {
++    if (hasAuthToken()) {
++      try {
++        currentUser.value = await photoApi.getMe()
++        return
++      } catch {
++        setAuthToken(null)
++      }
++    }
++
++    // Tentative d'auto-authentification avec le compte de développement local
++    const loginRes = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = loginRes.user
++  } catch (err: any) {
++    console.warn('Authentification requise pour le Studio:', err.message)
++  }
++}
++
++async function handleManualLogin() {
++  loginError.value = null
++  isLoggingIn.value = true
++
++  try {
++    const res = await photoApi.login(loginEmail.value, loginPassword.value)
++    currentUser.value = res.user
++    isLoginModalOpen.value = false
++  } catch (err: any) {
++    loginError.value = err.message || 'Identifiants invalides'
++  } finally {
++    isLoggingIn.value = false
++  }
++}
++
++function handleLogout() {
++  setAuthToken(null)
++  currentUser.value = null
++}
++
++function syncUrlState() {
++  const urlParams = new URLSearchParams(window.location.search)
++  const tab = urlParams.get('tab')
++  if (tab === 'recits') {
++    currentTab.value = 'recits'
++  } else if (tab === 'studio') {
++    currentTab.value = 'studio'
++  } else if (tab === 'carte' || tab === 'decouverte') {
++    currentTab.value = 'decouverte'
++  }
++
++  if (urlParams.has('photo') && urlParams.get('photo')) {
++    currentTab.value = 'decouverte'
++  }
++
++  const slug = extractStorymapSlug(window.location)
++  activeStorymapSlug.value = slug
++}
++
++function switchTab(tab: 'decouverte' | 'recits' | 'studio') {
++  currentTab.value = tab
++  const url = new URL(window.location.href)
++  if (tab === 'recits') {
++    url.searchParams.set('tab', 'recits')
++  } else if (tab === 'studio') {
++    url.searchParams.set('tab', 'studio')
++  } else {
++    url.searchParams.delete('tab')
++  }
++  const qs = url.searchParams.toString()
++  const newUrl = `${url.pathname}${qs ? `?${qs}` : ''}${url.hash}`
++  window.history.pushState({}, '', newUrl)
++}
++
++function handleOpenStorymap(slug: string) {
++  activeStorymapSlug.value = slug
++  const url = new URL(window.location.href)
++  url.searchParams.set('storymap', slug)
++  window.history.pushState({}, '', url.toString())
++}
++
++function handleCloseStorymap() {
++  activeStorymapSlug.value = null
++  const newUrl = cleanStorymapUrl(window.location.href)
++  window.history.pushState({}, '', newUrl)
++}
++
++onMounted(async () => {
++  syncUrlState()
++  window.addEventListener('popstate', syncUrlState)
++
++  try {
++    const [healthRes, territoryRes] = await Promise.all([
++      photoApi.getHealth().catch(() => null),
++      photoApi.getCurrentTerritory().catch(() => null),
++    ])
++
++    if (healthRes) apiHealth.value = healthRes
++    if (territoryRes) territory.value = territoryRes
++
++    // Connexion automatique initiale pour le studio
++    await authenticate()
++  } catch (e: any) {
++    error.value = "Impossible de contacter l'API backend"
++  } finally {
++    loading.value = false
++  }
++})
++
++onUnmounted(() => {
++  window.removeEventListener('popstate', syncUrlState)
++})
++</script>
++
++<template>
++  <main class="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans selection:bg-sky-500 selection:text-white">
++    <!-- En-tête Global -->
++    <header class="border-b border-slate-800 bg-slate-900/90 backdrop-blur-md sticky top-0 z-40 px-6 py-3.5 flex items-center justify-between shadow-lg">
++      <div class="flex items-center space-x-6">
++        <div class="flex items-center space-x-3 cursor-pointer" @click="currentTab = 'studio'">
++          <span class="text-2xl drop-shadow">🧭</span>
++          <div>
++            <h1 class="text-lg font-black tracking-tight text-white flex items-center gap-2">
++              <span>HierIci</span>
++              <span class="text-[10px] font-mono px-2 py-0.5 rounded bg-sky-950 text-sky-400 border border-sky-800">
++                Studio 2.0
++              </span>
++            </h1>
++            <p class="text-[11px] text-slate-400">Patrimoine géohistorique & archives territoriales</p>
++          </div>
++        </div>
++
++        <!-- Onglets de Navigation Principale -->
++        <nav class="hidden md:flex items-center space-x-1 bg-slate-950/70 p-1 rounded-xl border border-slate-800 text-xs">
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="switchTab('decouverte')"
++          >
++            <span>🗺️</span>
++            <span>Carte Découverte</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'recits' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="switchTab('recits')"
++          >
++            <span>📖</span>
++            <span>Récits & Parcours</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-1.5 rounded-lg font-medium transition-all flex items-center gap-2"
++            :class="currentTab === 'studio' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="switchTab('studio')"
++          >
++            <span>🗂️</span>
++            <span>Studio Admin</span>
++          </button>
++        </nav>
++      </div>
++
++      <!-- Informations de session & statut -->
++      <div class="flex items-center space-x-3 text-xs">
++        <!-- Badge Territoire -->
++        <span
++          v-if="territory"
++          class="hidden sm:inline-flex items-center gap-1.5 px-3 py-1 rounded-full font-medium bg-slate-800/80 text-slate-300 border border-slate-700"
++          :title="`Centre : ${territory.center_lat.toFixed(4)}, ${territory.center_lng.toFixed(4)}`"
++        >
++          📍 {{ territory.name }}
++        </span>
++
++        <!-- Badge Santé API -->
++        <span
++          class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full font-medium"
++          :class="apiHealth?.database === 'connected' ? 'bg-emerald-950/80 text-emerald-400 border border-emerald-800' : 'bg-amber-950/80 text-amber-400 border border-amber-800'"
++        >
++          <span class="w-1.5 h-1.5 rounded-full" :class="apiHealth?.database === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'"></span>
++          {{ apiHealth?.database === 'connected' ? 'API Connectée' : 'Connexion...' }}
++        </span>
++
++        <!-- Utilisateur connecté -->
++        <div v-if="currentUser" class="flex items-center gap-2 pl-2 border-l border-slate-800">
++          <div class="hidden lg:block text-right">
++            <div class="text-[11px] font-semibold text-white leading-tight">
++              {{ currentUser.full_name || currentUser.email }}
++            </div>
++            <div class="text-[10px] text-slate-400 capitalize">
++              {{ currentUser.role }}
++            </div>
++          </div>
++          <button
++            type="button"
++            class="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-slate-800 transition-colors"
++            title="Se déconnecter"
++            @click="handleLogout"
++          >
++            🚪
++          </button>
++        </div>
++        <button
++          v-else
++          type="button"
++          class="px-3 py-1 bg-slate-800 hover:bg-slate-700 border border-slate-700 text-white rounded-lg font-medium transition-colors"
++          @click="isLoginModalOpen = true"
++        >
++          Connexion
++        </button>
++      </div>
++    </header>
++
++    <!-- Navigation mobile sous l'en-tête -->
++    <div class="md:hidden border-b border-slate-800 bg-slate-900 px-4 py-2 flex items-center justify-center space-x-1.5 text-xs">
++      <button
++        type="button"
++        class="flex-1 py-1.5 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'decouverte' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="switchTab('decouverte')"
++      >
++        🗺️ Carte
++      </button>
++      <button
++        type="button"
++        class="flex-1 py-1.5 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'recits' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="switchTab('recits')"
++      >
++        📖 Récits
++      </button>
++      <button
++        type="button"
++        class="flex-1 py-1.5 text-center rounded-lg font-medium transition-colors"
++        :class="currentTab === 'studio' ? 'bg-sky-600 text-white' : 'text-slate-400 hover:text-white'"
++        @click="switchTab('studio')"
++      >
++        🗂️ Studio
++      </button>
++    </div>
++
++    <!-- Contenu Principal -->
++    <div :class="currentTab === 'decouverte' ? 'flex-1 w-full px-4 sm:px-6 py-4' : 'flex-1 max-w-7xl w-full mx-auto p-4 sm:p-6 lg:p-8'">
++      <!-- VUE STUDIO ADMIN (Story 2.3 & Story 4.2) -->
++      <section v-if="currentTab === 'studio'" class="space-y-6">
++        <!-- Sous-navigation Studio : Photothèque vs Storymaps -->
++        <div class="flex items-center gap-2 border-b border-slate-800 pb-3">
++          <button
++            type="button"
++            class="px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2"
++            :class="studioSubTab === 'photos' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="studioSubTab = 'photos'"
++          >
++            <span>📸</span>
++            <span>Photothèque</span>
++          </button>
++          <button
++            type="button"
++            class="px-4 py-2 rounded-xl text-xs font-semibold transition-all flex items-center gap-2"
++            :class="studioSubTab === 'storymaps' ? 'bg-sky-600 text-white shadow-md shadow-sky-900/40' : 'text-slate-400 hover:text-white hover:bg-slate-800/60'"
++            @click="studioSubTab = 'storymaps'"
++          >
++            <span>📖</span>
++            <span>Storymaps & Récits</span>
++          </button>
++        </div>
++
++        <PhotoAdminCatalog v-if="studioSubTab === 'photos'" />
++        <StorymapAdminCatalog
++          v-else-if="studioSubTab === 'storymaps'"
++          :territory-center="territory ? { lat: territory.center_lat, lng: territory.center_lng, zoom: territory.default_zoom } : null"
++          :territory-id="currentUser?.territory_id"
++          @view-public="handleOpenStorymap"
++        />
++      </section>
++
++      <!-- VUE CATALOGUE PUBLIC DES RÉCITS (Story 4.4) -->
++      <section v-else-if="currentTab === 'recits'" class="w-full">
++        <StorymapPublicCatalog
++          :territory-name="territory?.name"
++          :territory-slug="territory?.slug"
++          @select-storymap="handleOpenStorymap"
++          @explore-map="switchTab('decouverte')"
++        />
++      </section>
++
++      <!-- VUE DÉCOUVERTE PUBLIQUE CARTE (Story 3.1) -->
++      <section v-else-if="currentTab === 'decouverte'" class="w-full">
++        <PublicMapViewer
++          :territory-center="territory ? [territory.center_lng, territory.center_lat] : [5.93, 43.12]"
++          :default-zoom="territory?.default_zoom ?? 13"
++          :territory-name="territory?.name ?? 'Territoire'"
++          @select-photo="(id) => console.log('Photo sélectionnée:', id)"
++        />
++      </section>
++    </div>
++
++    <!-- Modale de connexion manuelle -->
++    <div
++      v-if="isLoginModalOpen"
++      class="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-sm"
++      @click.self="isLoginModalOpen = false"
++    >
++      <div class="bg-slate-900 border border-slate-700 rounded-2xl w-full max-w-sm p-6 shadow-2xl space-y-4">
++        <div class="flex items-center justify-between border-b border-slate-800 pb-3">
++          <h3 class="text-base font-bold text-white">Connexion au Studio</h3>
++          <button
++            type="button"
++            class="text-slate-400 hover:text-white"
++            @click="isLoginModalOpen = false"
++          >
++            ✕
++          </button>
++        </div>
++
++        <div v-if="loginError" class="p-2.5 rounded-lg bg-rose-950/80 border border-rose-800 text-xs text-rose-300">
++          {{ loginError }}
++        </div>
++
++        <form class="space-y-4" @submit.prevent="handleManualLogin">
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Email</label>
++            <input
++              v-model="loginEmail"
++              type="email"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div>
++            <label class="block text-xs font-medium text-slate-300 mb-1">Mot de passe</label>
++            <input
++              v-model="loginPassword"
++              type="password"
++              required
++              class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-xs text-white focus:outline-none focus:ring-2 focus:ring-sky-500"
++            />
++          </div>
++
++          <div class="flex items-center justify-end gap-2 pt-2">
++            <button
++              type="button"
++              class="px-3 py-1.5 text-xs text-slate-400 hover:text-white"
++              @click="isLoginModalOpen = false"
++            >
++              Annuler
++            </button>
++            <button
++              type="submit"
++              class="px-4 py-1.5 bg-sky-600 hover:bg-sky-500 text-white rounded-lg text-xs font-semibold shadow-md flex items-center gap-1.5"
++              :disabled="isLoggingIn"
++            >
++              <span v-if="isLoggingIn" class="w-3.5 h-3.5 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
++              <span>Connexion</span>
++            </button>
++          </div>
++        </form>
++      </div>
++    </div>
++
++    <!-- Lecteur Public de Storymap en Scrollytelling (Story 4.3) -->
++    <StorymapReader
++      v-if="activeStorymapSlug"
++      :slug="activeStorymapSlug"
++      :default-center="territory ? { lat: territory.center_lat, lng: territory.center_lng, zoom: territory.default_zoom } : null"
++      @close="handleCloseStorymap"
++    />
++
++    <!-- Pied de page -->
++    <footer class="border-t border-slate-800/80 bg-slate-950 px-6 py-4 text-center text-xs text-slate-500">
++      HierIci — Studio d'Administration & Métadonnées d'Archives (Story 2.3)
++    </footer>
++  </main>
++</template>
+--- /dev/null	2026-10-31 21:29:50.115546528 +0100
++++ frontend/tests/storymap_catalog_logic.test.mjs	2026-10-31 21:53:12.509850946 +0100
+@@ -0,0 +1,145 @@
++import assert from 'node:assert/strict'
++import { test, describe } from 'node:test'
++import {
++  estimateReadingTime,
++  formatReadingDuration,
++  hasAudioContent,
++  filterAndSortStorymaps,
++} from '../src/utils/storymapCatalog.ts'
++
++// ============================================================================
++// SUITE DE TESTS - Logique du Catalogue Public des Récits (Story 4.4)
++// ============================================================================
++
++describe('Story 4.4 - Estimation du temps de visite (estimateReadingTime & formatReadingDuration)', () => {
++  test('Calcule un temps estimé cohérent selon le nombre d\'étapes (~2.5 min/étape)', () => {
++    assert.equal(estimateReadingTime(1), 3)
++    assert.equal(estimateReadingTime(2), 5)
++    assert.equal(estimateReadingTime(4), 10)
++    assert.equal(estimateReadingTime(8), 20)
++  })
++
++  test('Gère les cas limites de nombre d\'étapes (0, négatif, NaN)', () => {
++    assert.equal(estimateReadingTime(0), 2)
++    assert.equal(estimateReadingTime(-3), 2)
++    assert.equal(estimateReadingTime(NaN), 2)
++  })
++
++  test('Formate la durée en libellé convivial', () => {
++    assert.equal(formatReadingDuration(10), '~10 min de visite')
++    assert.equal(formatReadingDuration(5), '~5 min de visite')
++    assert.equal(formatReadingDuration(0), '~2 min de visite')
++    assert.equal(formatReadingDuration(-1), '~2 min de visite')
++    assert.equal(formatReadingDuration(NaN), '~2 min de visite')
++  })
++})
++
++describe('Story 4.4 - Détection des archives sonores (hasAudioContent)', () => {
++  test('Retourne true si au moins une étape comporte un audio_url ou audio_file_path', () => {
++    const storyWithAudio = {
++      id: 's1',
++      title: 'Rade de Toulon',
++      steps: [
++        { id: 'st1', step_order: 0, title: 'Intro' },
++        { id: 'st2', step_order: 1, title: 'Arsenal', audio_url: '/media/audio.mp3' },
++      ],
++    }
++    assert.equal(hasAudioContent(storyWithAudio), true)
++  })
++
++  test('Retourne false si aucune étape ne comporte de son', () => {
++    const storyWithoutAudio = {
++      id: 's2',
++      title: 'Fort Balaguier',
++      steps: [
++        { id: 'st1', step_order: 0, title: 'Intro' },
++        { id: 'st2', step_order: 1, title: 'Tour' },
++      ],
++    }
++    assert.equal(hasAudioContent(storyWithoutAudio), false)
++  })
++
++  test('Gère les récits nuls, indéfinis ou sans étapes', () => {
++    assert.equal(hasAudioContent(null), false)
++    assert.equal(hasAudioContent(undefined), false)
++    assert.equal(hasAudioContent({ id: 's3', title: 'Vide' }), false)
++  })
++})
++
++describe('Story 4.4 - Filtrage et Tri des Récits (filterAndSortStorymaps)', () => {
++  const sampleStories = [
++    {
++      id: '1',
++      title: 'Toulon sous les bombes 1944',
++      summary: 'La libération de la rade et le débarquement de Provence.',
++      created_at: '2026-05-01T10:00:00Z',
++      steps_count: 5,
++      steps: [{ id: 'st1', audio_url: '/audio1.mp3' }],
++    },
++    {
++      id: '2',
++      title: 'L\'Arsenal Maritime à la Belle Époque',
++      summary: 'Cent ans de construction navale militaire.',
++      created_at: '2026-08-15T10:00:00Z',
++      steps_count: 8,
++      steps: [{ id: 'st2' }],
++    },
++    {
++      id: '3',
++      title: 'Balade historique à La Seyne-sur-Mer',
++      summary: 'Des chantiers navals au Fort Balaguier.',
++      created_at: '2026-02-10T10:00:00Z',
++      steps_count: 3,
++      steps: [{ id: 'st3', audio_url: '/audio3.mp3' }],
++    },
++  ]
++
++  test('Filtre par recherche textuelle insensible à la casse sur le titre et le résumé', () => {
++    const resTitle = filterAndSortStorymaps(sampleStories, { search: 'arsenal' })
++    assert.equal(resTitle.length, 1)
++    assert.equal(resTitle[0].id, '2')
++
++    const resSummary = filterAndSortStorymaps(sampleStories, { search: 'débarquement' })
++    assert.equal(resSummary.length, 1)
++    assert.equal(resSummary[0].id, '1')
++
++    const resNone = filterAndSortStorymaps(sampleStories, { search: 'inconnu-xyz' })
++    assert.equal(resNone.length, 0)
++  })
++
++  test('Filtre par présence de documents sonores (hasAudioOnly)', () => {
++    const audioOnly = filterAndSortStorymaps(sampleStories, { hasAudioOnly: true })
++    assert.equal(audioOnly.length, 2)
++    const ids = audioOnly.map((s) => s.id)
++    assert.ok(ids.includes('1'))
++    assert.ok(ids.includes('3'))
++    assert.ok(!ids.includes('2'))
++  })
++
++  test('Trie par date récente par défaut (recent)', () => {
++    const sorted = filterAndSortStorymaps(sampleStories, { sortBy: 'recent' })
++    assert.equal(sorted[0].id, '2') // 2026-08
++    assert.equal(sorted[1].id, '1') // 2026-05
++    assert.equal(sorted[2].id, '3') // 2026-02
++  })
++
++  test('Trie par nombre de chapitres décroissant (steps)', () => {
++    const sorted = filterAndSortStorymaps(sampleStories, { sortBy: 'steps' })
++    assert.equal(sorted[0].id, '2') // 8 chapitres
++    assert.equal(sorted[1].id, '1') // 5 chapitres
++    assert.equal(sorted[2].id, '3') // 3 chapitres
++  })
++
++  test('Trie par titre alphabétique (title)', () => {
++    const sorted = filterAndSortStorymaps(sampleStories, { sortBy: 'title' })
++    assert.equal(sorted[0].id, '3') // Balade...
++    assert.equal(sorted[1].id, '2') // L'Arsenal...
++    assert.equal(sorted[2].id, '1') // Toulon...
++  })
++
++  test('Gère les tableaux vides ou entrées invalides sans lever d\'exception', () => {
++    assert.deepEqual(filterAndSortStorymaps(null), [])
++    assert.deepEqual(filterAndSortStorymaps(undefined), [])
++    assert.deepEqual(filterAndSortStorymaps([]), [])
++  })
++})
